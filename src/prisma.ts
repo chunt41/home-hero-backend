@@ -6,17 +6,14 @@ import { PrismaPg } from "@prisma/adapter-pg";
 import * as fs from "fs";
 import * as path from "path";
 
-dotenv.config();
+if (process.env.NODE_ENV !== "production") {
+  dotenv.config();
+}
 
 if (!process.env.DATABASE_URL) {
   throw new Error("DATABASE_URL is not set in the environment");
 }
 
-/**
- * DEV-ONLY SSL workaround (Fix B)
- * ⚠️ Remove when you move to proper CA trust
- */
-process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 
 // Load Supabase CA (safe even if unused later)
 const ca = fs.readFileSync(
