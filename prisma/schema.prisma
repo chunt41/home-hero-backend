@@ -1,0 +1,362 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id                          Int                   @id @default(autoincrement())
+  role                        UserRole
+  name                        String
+  email                       String                @unique
+  passwordHash                String
+  phone                       String?
+  location                    String?
+  createdAt                   DateTime              @default(now())
+  isSuspended                 Boolean               @default(false)
+  suspendedAt                 DateTime?
+  suspendedReason             String?
+  adminActions                AdminAction[]         @relation("AdminActions")
+  bids                        Bid[]                 @relation("UserBids")
+  blocksReceived              Block[]               @relation("UserBlocksBlocked")
+  blocksGiven                 Block[]               @relation("UserBlocksBlocker")
+  favoriteJobs                FavoriteJob[]         @relation("FavoriteJobUser")
+  favoriteProvidersAsConsumer FavoriteProvider[]    @relation("FavoriteProviderConsumer")
+  favoriteProvidersAsProvider FavoriteProvider[]    @relation("FavoriteProviderProvider")
+  jobs                        Job[]                 @relation("UserJobs")
+  hiddenJobs                  Job[]                 @relation("HiddenJobsByAdmin")
+  hiddenMessages              Message[]             @relation("HiddenMessagesByAdmin")
+  messagesSent                Message[]
+  notifications               Notification[]
+  providerProfile             ProviderProfile?
+  reportsHandled              Report[]              @relation("ReportHandledByAdmin")
+  reportsGiven                Report[]              @relation("ReportReporter")
+  reportsAgainst              Report[]              @relation("ReportTargetUser")
+  reviewsGiven                Review[]              @relation("ConsumerReviews")
+  reviewsReceived             Review[]              @relation("ProviderReviews")
+  subscription                Subscription?
+  subscriptionPayments        SubscriptionPayment[]
+  messageReadStates           JobMessageReadState[]
+}
+
+model Job {
+  id          Int                   @id @default(autoincrement())
+  consumerId  Int
+  title       String
+  description String
+  budgetMin   Int?
+  budgetMax   Int?
+  status      JobStatus             @default(OPEN)
+  location    String?
+  createdAt   DateTime              @default(now())
+  hiddenAt    DateTime?
+  hiddenById  Int?
+  isHidden    Boolean               @default(false)
+  bids        Bid[]
+  favorites   FavoriteJob[]         @relation("FavoriteJobJob")
+  consumer    User                  @relation("UserJobs", fields: [consumerId], references: [id])
+  hiddenBy    User?                 @relation("HiddenJobsByAdmin", fields: [hiddenById], references: [id])
+  attachments JobAttachment[]
+  photos      JobPhoto[]
+  messages    Message[]
+  reports     Report[]              @relation("ReportTargetJob")
+  review      Review?
+  readStates  JobMessageReadState[]
+}
+
+model JobPhoto {
+  id    Int    @id @default(autoincrement())
+  jobId Int
+  url   String
+  job   Job    @relation(fields: [jobId], references: [id])
+}
+
+model Bid {
+  id         Int       @id @default(autoincrement())
+  jobId      Int
+  providerId Int
+  amount     Int
+  message    String
+  status     BidStatus @default(PENDING)
+  createdAt  DateTime  @default(now())
+  job        Job       @relation(fields: [jobId], references: [id])
+  provider   User      @relation("UserBids", fields: [providerId], references: [id])
+}
+
+model Message {
+  id         Int       @id @default(autoincrement())
+  senderId   Int
+  text       String
+  createdAt  DateTime  @default(now())
+  jobId      Int
+  hiddenAt   DateTime?
+  hiddenById Int?
+  isHidden   Boolean   @default(false)
+  hiddenBy   User?     @relation("HiddenMessagesByAdmin", fields: [hiddenById], references: [id])
+  job        Job       @relation(fields: [jobId], references: [id])
+  sender     User      @relation(fields: [senderId], references: [id])
+  reports    Report[]  @relation("ReportTargetMessage")
+}
+
+model ProviderProfile {
+  id          Int        @id @default(autoincrement())
+  providerId  Int        @unique
+  experience  String?
+  specialties String?
+  rating      Float?
+  reviewCount Int?
+  provider    User       @relation(fields: [providerId], references: [id])
+  categories  Category[] @relation("CategoryToProviderProfile")
+}
+
+model Subscription {
+  id        Int                   @id @default(autoincrement())
+  userId    Int                   @unique
+  tier      SubscriptionTier      @default(FREE)
+  renewsAt  DateTime?
+  createdAt DateTime              @default(now())
+  user      User                  @relation(fields: [userId], references: [id])
+  payments  SubscriptionPayment[]
+}
+
+model Notification {
+  id        Int      @id @default(autoincrement())
+  userId    Int
+  type      String
+  content   String
+  read      Boolean  @default(false)
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id])
+}
+
+model Review {
+  id         Int      @id @default(autoincrement())
+  jobId      Int      @unique
+  consumerId Int
+  providerId Int
+  rating     Int
+  comment    String?
+  createdAt  DateTime @default(now())
+  consumer   User     @relation("ConsumerReviews", fields: [consumerId], references: [id])
+  job        Job      @relation(fields: [jobId], references: [id])
+  provider   User     @relation("ProviderReviews", fields: [providerId], references: [id])
+}
+
+model FavoriteProvider {
+  id         Int      @id @default(autoincrement())
+  consumerId Int
+  providerId Int
+  createdAt  DateTime @default(now())
+  consumer   User     @relation("FavoriteProviderConsumer", fields: [consumerId], references: [id])
+  provider   User     @relation("FavoriteProviderProvider", fields: [providerId], references: [id])
+
+  @@unique([consumerId, providerId])
+}
+
+model FavoriteJob {
+  id        Int      @id @default(autoincrement())
+  userId    Int
+  jobId     Int
+  createdAt DateTime @default(now())
+  job       Job      @relation("FavoriteJobJob", fields: [jobId], references: [id])
+  user      User     @relation("FavoriteJobUser", fields: [userId], references: [id])
+
+  @@unique([userId, jobId])
+}
+
+model SubscriptionPayment {
+  id             Int              @id @default(autoincrement())
+  userId         Int
+  subscriptionId Int?
+  tier           SubscriptionTier
+  amount         Int
+  status         PaymentStatus    @default(SUCCEEDED)
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+  subscription   Subscription?    @relation(fields: [subscriptionId], references: [id])
+  user           User             @relation(fields: [userId], references: [id])
+}
+
+model JobAttachment {
+  id        Int      @id @default(autoincrement())
+  jobId     Int
+  url       String
+  type      String?
+  createdAt DateTime @default(now())
+  job       Job      @relation(fields: [jobId], references: [id])
+}
+
+model Category {
+  id               Int               @id @default(autoincrement())
+  name             String
+  slug             String            @unique
+  createdAt        DateTime          @default(now())
+  providerProfiles ProviderProfile[] @relation("CategoryToProviderProfile")
+}
+
+model Block {
+  id        Int      @id @default(autoincrement())
+  blockerId Int
+  blockedId Int
+  createdAt DateTime @default(now())
+  blocked   User     @relation("UserBlocksBlocked", fields: [blockedId], references: [id])
+  blocker   User     @relation("UserBlocksBlocker", fields: [blockerId], references: [id])
+
+  @@unique([blockerId, blockedId])
+}
+
+model Report {
+  id               Int              @id @default(autoincrement())
+  reporterId       Int
+  targetUserId     Int?
+  targetJobId      Int?
+  targetMessageId  Int?
+  targetType       ReportTargetType
+  reason           String
+  details          String?
+  createdAt        DateTime         @default(now())
+  status           ReportStatus     @default(OPEN)
+  adminNotes       String?
+  handledAt        DateTime?
+  handledByAdminId Int?
+  adminActions     AdminAction[]    @relation("AdminActionReport")
+  handledByAdmin   User?            @relation("ReportHandledByAdmin", fields: [handledByAdminId], references: [id])
+  reporter         User             @relation("ReportReporter", fields: [reporterId], references: [id])
+  targetJob        Job?             @relation("ReportTargetJob", fields: [targetJobId], references: [id])
+  targetMessage    Message?         @relation("ReportTargetMessage", fields: [targetMessageId], references: [id])
+  targetUser       User?            @relation("ReportTargetUser", fields: [targetUserId], references: [id])
+
+  @@index([targetType, targetUserId])
+  @@index([targetType, targetJobId])
+  @@index([targetType, targetMessageId])
+}
+
+model AdminAction {
+  id        Int             @id @default(autoincrement())
+  adminId   Int
+  type      AdminActionType
+  reportId  Int?
+  entityId  Int?
+  notes     String?
+  createdAt DateTime        @default(now())
+  admin     User            @relation("AdminActions", fields: [adminId], references: [id])
+  report    Report?         @relation("AdminActionReport", fields: [reportId], references: [id])
+
+  @@index([adminId, createdAt])
+  @@index([type, createdAt])
+  @@index([reportId])
+}
+
+enum UserRole {
+  CONSUMER
+  PROVIDER
+  ADMIN
+}
+
+enum JobStatus {
+  OPEN
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+enum BidStatus {
+  PENDING
+  ACCEPTED
+  DECLINED
+}
+
+enum SubscriptionTier {
+  FREE
+  BASIC
+  PRO
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+}
+
+enum ReportTargetType {
+  USER
+  JOB
+  MESSAGE
+}
+
+enum ReportStatus {
+  OPEN
+  IN_REVIEW
+  RESOLVED
+  DISMISSED
+}
+
+enum AdminActionType {
+  REPORT_STATUS_CHANGED
+  USER_SUSPENDED
+  USER_UNSUSPENDED
+  JOB_HIDDEN
+  JOB_UNHIDDEN
+  MESSAGE_HIDDEN
+  MESSAGE_UNHIDDEN
+  ADMIN_IMPERSONATION_STARTED
+  ADMIN_IMPERSONATION_STOPPED
+
+}
+
+model JobMessageReadState {
+  id         Int      @id @default(autoincrement())
+  jobId      Int
+  userId     Int
+  lastReadAt DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  job  Job  @relation(fields: [jobId], references: [id])
+  user User @relation(fields: [userId], references: [id])
+
+  @@unique([jobId, userId])
+  @@index([userId, lastReadAt])
+  @@index([jobId, lastReadAt])
+}
+
+model WebhookEndpoint {
+  id        Int      @id @default(autoincrement())
+  url       String
+  secret    String   // used to sign payloads (HMAC)
+  enabled   Boolean  @default(true)
+  events    String[] // list of event names this endpoint subscribes to
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  deliveries WebhookDelivery[]
+
+  @@index([enabled, createdAt])
+}
+
+enum WebhookDeliveryStatus {
+  PENDING
+  PROCESSING
+  SUCCESS
+  FAILED
+}
+
+
+model WebhookDelivery {
+  id          Int                   @id @default(autoincrement())
+  endpointId  Int
+  endpoint    WebhookEndpoint       @relation(fields: [endpointId], references: [id], onDelete: Cascade)
+
+  event       String
+  payload     Json
+  status      WebhookDeliveryStatus @default(PENDING)
+  attempts    Int                   @default(0)
+  lastError   String?
+  nextAttempt DateTime?
+  createdAt   DateTime              @default(now())
+  updatedAt   DateTime              @updatedAt
+
+  @@index([status, nextAttempt])
+  @@index([endpointId, createdAt])
+}
