@@ -491,7 +491,7 @@ const processed = new Set<string>(); // replace with DB table in real usage
 app.get("/health", (_req: Request, res: Response) => {
   res.json({
     ok: true,
-    service: "gogetter-backend",
+    service: "home-hero-backend",
     env: process.env.NODE_ENV ?? "development",
     time: new Date().toISOString(),
   });
@@ -6015,12 +6015,10 @@ async function startWorkersOnce() {
   console.log("[webhooks] worker started at", webhookWorkerStartedAt.toISOString());
 }
 
-
-
-startWorkersOnce().catch((e) => {
-  console.error("[startup] failed to start workers:", e);
-});
-
+// Worker moved to dedicated Railway worker service
+// startWorkersOnce().catch((e) => {
+//   console.error("[startup] failed to start workers:", e);
+// });
 
 const server = app.listen(PORT, () => {
   console.log(`GoGetter API listening on port ${PORT}`);
@@ -6030,12 +6028,6 @@ async function shutdown(signal: string) {
   console.log(`[shutdown] received ${signal}`);
 
   try {
-    // stop worker loop
-    if (stopWebhookWorker) {
-      stopWebhookWorker();
-      stopWebhookWorker = null;
-      console.log("[shutdown] webhook worker stopped");
-    }
 
     // stop accepting new HTTP requests
     await new Promise<void>((resolve) => server.close(() => resolve()));

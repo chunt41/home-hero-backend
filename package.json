@@ -9,7 +9,8 @@
     "build": "tsc -p tsconfig.json",
     "listen": "node dist/server.js",
     "start": "npm run build && npm run listen",
-    "migrate:deploy": "prisma migrate deploy"
+    "migrate:deploy": "prisma migrate deploy",
+    "worker": "node dist/worker.js"
   },
 
   "dependencies": {
