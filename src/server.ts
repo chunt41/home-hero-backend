@@ -497,6 +497,25 @@ app.get("/health", (_req: Request, res: Response) => {
   });
 });
 
+
+app.get("/health/db", async (_req: Request, res: Response) => {
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    return res.status(200).json({
+      ok: true,
+      db: "up",
+      time: new Date().toISOString(),
+    });
+  } catch (e: any) {
+    return res.status(503).json({
+      ok: false,
+      db: "down",
+      error: e?.message ?? String(e),
+      time: new Date().toISOString(),
+    });
+  }
+});
+
 app.get("/ready", async (_req: Request, res: Response) => {
   try {
     await prisma.$queryRaw`SELECT 1`;
