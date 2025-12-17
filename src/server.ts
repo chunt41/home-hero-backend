@@ -5958,6 +5958,7 @@ const WEBHOOK_MAX_ATTEMPTS = Number(process.env.WEBHOOK_MAX_ATTEMPTS ?? 5);
 //   event=webhook.test (partial match)
 //   take=50 (max 100)
 //   cursor=123 (delivery id)
+// GET /admin/webhooks/deliveries
 app.get("/admin/webhooks/deliveries", authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
     if (!requireAdmin(req, res)) return;
@@ -5983,7 +5984,7 @@ app.get("/admin/webhooks/deliveries", authMiddleware, async (req: AuthRequest, r
       where,
       take,
       ...(hasCursor ? { skip: 1, cursor: { id: cursor as number } } : {}),
-      orderBy: { id: "desc" }, // stable cursor ordering
+      orderBy: { id: "desc" },
       include: {
         endpoint: {
           select: {
@@ -5991,7 +5992,7 @@ app.get("/admin/webhooks/deliveries", authMiddleware, async (req: AuthRequest, r
             url: true,
             events: true,
             enabled: true,
-            name: true, // if your model has it; remove if not
+            // ❌ removed: name (doesn't exist in your schema)
           },
         },
       },
@@ -6007,21 +6008,19 @@ app.get("/admin/webhooks/deliveries", authMiddleware, async (req: AuthRequest, r
         attempts: d.attempts,
         lastError: d.lastError,
 
-        // ✅ observability fields you added
-        lastStatusCode: (d as any).lastStatusCode ?? null,
-        lastAttemptAt: (d as any).lastAttemptAt ?? null,
-        deliveredAt: (d as any).deliveredAt ?? null,
+        // ✅ observability fields (no any-casts needed)
+        lastStatusCode: d.lastStatusCode ?? null,
+        lastAttemptAt: d.lastAttemptAt ?? null,
+        deliveredAt: d.deliveredAt ?? null,
         nextAttempt: d.nextAttempt ?? null,
 
         endpoint: {
           id: d.endpoint.id,
           url: d.endpoint.url,
-          enabled: (d.endpoint as any).enabled ?? true,
-          name: (d.endpoint as any).name ?? null,
+          enabled: d.endpoint.enabled,
           subscribedEvents: d.endpoint.events,
         },
 
-        // 👇 Event context helpers (optional but VERY useful)
         context: {
           jobId: payload?.jobId ?? payload?.job?.id ?? null,
           jobTitle: payload?.title ?? payload?.job?.title ?? null,
@@ -6066,7 +6065,7 @@ app.get("/admin/webhooks/deliveries/:id", authMiddleware, async (req: AuthReques
             url: true,
             events: true,
             enabled: true,
-            name: true, // remove if not in your schema
+            // ❌ removed: name (doesn't exist in your schema)
           },
         },
         attemptLogs: {
@@ -6089,16 +6088,15 @@ app.get("/admin/webhooks/deliveries/:id", authMiddleware, async (req: AuthReques
       attempts: delivery.attempts,
       lastError: delivery.lastError,
 
-      lastStatusCode: (delivery as any).lastStatusCode ?? null,
-      lastAttemptAt: (delivery as any).lastAttemptAt ?? null,
-      deliveredAt: (delivery as any).deliveredAt ?? null,
+      lastStatusCode: delivery.lastStatusCode ?? null,
+      lastAttemptAt: delivery.lastAttemptAt ?? null,
+      deliveredAt: delivery.deliveredAt ?? null,
       nextAttempt: delivery.nextAttempt ?? null,
 
       endpoint: {
         id: delivery.endpoint.id,
         url: delivery.endpoint.url,
-        enabled: (delivery.endpoint as any).enabled ?? true,
-        name: (delivery.endpoint as any).name ?? null,
+        enabled: delivery.endpoint.enabled,
         subscribedEvents: delivery.endpoint.events,
       },
 
@@ -6112,7 +6110,6 @@ app.get("/admin/webhooks/deliveries/:id", authMiddleware, async (req: AuthReques
       createdAt: delivery.createdAt,
       updatedAt: delivery.updatedAt,
 
-      // ✅ the good stuff
       attemptLogs: delivery.attemptLogs,
     });
   } catch (err) {
