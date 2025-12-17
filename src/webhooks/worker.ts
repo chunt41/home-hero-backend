@@ -37,31 +37,34 @@ async function postWithTimeout(url: string, body: string, headers: Record<string
     });
 
     const text = await res.text().catch(() => "");
-    return { ok: res.ok, status: res.status, responseText: text };
+    return {
+      ok: res.ok,
+      status: res.status,
+      responseText: text,
+      retryAfter: res.headers.get("retry-after"), // ✅ add this
+    };
   } finally {
     clearTimeout(timer);
   }
 }
 
-
+// In PROCESSING, nextAttempt is used as the lease-expiration timestamp.
 async function requeueStaleProcessing() {
   const now = new Date();
 
-  // Any PROCESSING row whose lease time has passed should go back to PENDING
-  // so it can be claimed again.
   await prisma.webhookDelivery.updateMany({
     where: {
       status: WebhookDeliveryStatus.PROCESSING,
-      nextAttempt: { lte: now }, // you're using nextAttempt as the lease timestamp
+      nextAttempt: { lte: now }, // lease expired
     },
     data: {
       status: WebhookDeliveryStatus.PENDING,
-      // set it eligible immediately
-      nextAttempt: now,
+      nextAttempt: now, // eligible immediately
       lastError: "Requeued after processing lease expired",
     },
   });
 }
+
 
 
 /**
@@ -111,6 +114,94 @@ async function claimBatch() {
   });
 }
 
+function isPermanentHttp(status: number) {
+  // Permanent client/config problems (don’t retry)
+  return (
+    status === 400 ||
+    status === 401 ||
+    status === 403 ||
+    status === 404 ||
+    status === 410 ||
+    status === 422
+  );
+}
+
+async function failPermanent(deliveryId: number, err: string) {
+  await prisma.webhookDelivery.update({
+    where: { id: deliveryId },
+    data: {
+      status: WebhookDeliveryStatus.FAILED,
+      lastError: err.slice(0, 2000),
+      nextAttempt: null,
+    },
+  });
+}
+
+function parseRetryAfterMs(retryAfterRaw: string | null): number | null {
+  if (!retryAfterRaw) return null;
+
+  // Retry-After can be seconds or an HTTP-date
+  const asInt = Number(retryAfterRaw);
+  if (Number.isFinite(asInt) && asInt >= 0) {
+    return asInt * 1000;
+  }
+
+  const asDate = Date.parse(retryAfterRaw);
+  if (!Number.isNaN(asDate)) {
+    const ms = asDate - Date.now();
+    return ms > 0 ? ms : 0;
+  }
+
+  return null;
+}
+
+async function startAttempt(
+  deliveryId: number,
+  attemptNumber: number,
+  meta?: { endpointId?: number; endpointUrl?: string; event?: string }
+) {
+  return prisma.webhookDeliveryAttempt.create({
+    data: {
+      deliveryId,
+      attemptNumber,
+      endpointId: meta?.endpointId ?? null,
+      endpointUrl: meta?.endpointUrl ?? null,
+      event: meta?.event ?? null,
+    },
+    select: { id: true, startedAt: true },
+  });
+}
+
+
+async function finishAttempt(
+  attemptId: number,
+  startedAt: Date,
+  data: {
+    ok?: boolean | null;
+    statusCode?: number | null;
+    error?: string | null;
+    responseSnippet?: string | null;
+    retryAfter?: string | null;
+  }
+) {
+  const finishedAt = new Date();
+  const durationMs = finishedAt.getTime() - startedAt.getTime();
+
+  return prisma.webhookDeliveryAttempt.update({
+    where: { id: attemptId },
+    data: {
+      finishedAt,
+      durationMs,
+      ok: data.ok ?? null,
+      statusCode: data.statusCode ?? null,
+      error: data.error?.slice(0, 2000) ?? null,
+      responseSnippet: data.responseSnippet?.slice(0, 500) ?? null,
+      retryAfter: data.retryAfter ?? null,
+    },
+  });
+}
+
+
 async function handleOne(delivery: any) {
   const { endpoint } = delivery;
 
@@ -129,6 +220,14 @@ async function handleOne(delivery: any) {
     );
     return;
   }
+
+  const attemptNumber = delivery.attempts ?? 1;
+  const attempt = await startAttempt(delivery.id, attemptNumber, {
+    endpointId: endpoint?.id,
+    endpointUrl: endpoint?.url,
+    event: delivery.event,
+  });
+
 
   const payloadString = JSON.stringify(delivery.payload ?? {});
   const timestamp = Date.now().toString();
@@ -151,9 +250,20 @@ async function handleOne(delivery: any) {
         data: {
           status: WebhookDeliveryStatus.SUCCESS,
           lastError: null,
+          lastStatusCode: result.status,
+          deliveredAt: new Date(),
+          lastAttemptAt: new Date(),
           nextAttempt: null,
         },
       });
+
+      await finishAttempt(attempt.id, attempt.startedAt, {
+        ok: true,
+        statusCode: result.status,
+        responseSnippet: result.responseText ?? "",
+        retryAfter: result.retryAfter ?? null,
+      });
+
 
       console.log(
         `[webhooks] SUCCESS delivery=${delivery.id} endpoint=${endpoint.id} event=${delivery.event} status=${result.status}`
@@ -161,13 +271,47 @@ async function handleOne(delivery: any) {
       return;
     }
 
-    const err = `HTTP ${result.status}: ${result.responseText?.slice(0, 500) ?? ""}`;
+    const bodySnippet = result.responseText?.slice(0, 500) ?? "";
+    const err = `HTTP ${result.status}: ${bodySnippet}`;
+
+    const permanent = isPermanentHttp(result.status);
 
     console.warn(
-      `[webhooks] FAIL delivery=${delivery.id} endpoint=${endpoint.id} event=${delivery.event} err=${err}`
+      `[webhooks] FAIL delivery=${delivery.id} endpoint=${endpoint.id} event=${delivery.event} status=${result.status} permanent=${permanent} err=${err}`
     );
 
-    await failAndReschedule(delivery.id, delivery.attempts, err);
+    await prisma.webhookDelivery.update({
+      where: { id: delivery.id },
+      data: {
+        lastStatusCode: result.status,
+        lastAttemptAt: new Date(),
+      },
+    });
+
+    await finishAttempt(attempt.id, attempt.startedAt, {
+      ok: false,
+      statusCode: result.status,
+      error: `HTTP ${result.status}`,
+      responseSnippet: result.responseText ?? "",
+      retryAfter: result.retryAfter ?? null,
+    });
+
+
+    if (permanent) {
+      await failPermanent(delivery.id, err);
+      return;
+    }
+
+    let overrideDelayMs: number | undefined;
+
+    if (result.status === 429 || result.status === 503) {
+      const ra = parseRetryAfterMs(result.retryAfter ?? null);
+      if (ra !== null) overrideDelayMs = ra;
+    }
+
+    await failAndReschedule(delivery.id, delivery.attempts, err, overrideDelayMs);
+    return;
+
   } catch (e: any) {
     const err = e?.name === "AbortError" ? "Request timeout" : (e?.message ?? "Unknown error");
 
@@ -175,34 +319,71 @@ async function handleOne(delivery: any) {
       `[webhooks] FAIL delivery=${delivery.id} endpoint=${endpoint.id} event=${delivery.event} err=${err}`
     );
 
+    const permanent =
+      /Failed to parse URL/i.test(err) ||
+      /Invalid URL/i.test(err);
+
+    await finishAttempt(attempt.id, attempt.startedAt, {
+      ok: false,
+      statusCode: null,
+      error: err,
+      responseSnippet: null,
+      retryAfter: null,
+    });
+
+
+    await prisma.webhookDelivery.update({
+      where: { id: delivery.id },
+      data: {
+        lastStatusCode: null,
+        lastAttemptAt: new Date(),
+      },
+    });
+
+
+    if (permanent) {
+      await failPermanent(delivery.id, err);
+      return;
+    }
+
     await failAndReschedule(delivery.id, delivery.attempts, err);
+    return;
   }
 }
 
-async function failAndReschedule(deliveryId: number, attempts: number, lastError: string) {
-  const now = new Date();
+async function failAndReschedule(
+  deliveryId: number,
+  currentAttempts: number,
+  err: string,
+  overrideDelayMs?: number
+) {
+  const attemptsUsed = currentAttempts ?? 1;
 
-  if (attempts >= MAX_ATTEMPTS) {
+  if (attemptsUsed >= MAX_ATTEMPTS) {
     await prisma.webhookDelivery.update({
       where: { id: deliveryId },
       data: {
         status: WebhookDeliveryStatus.FAILED,
-        lastError,
+        lastError: err.slice(0, 2000),
         nextAttempt: null,
       },
     });
     return;
   }
 
-  const backoffMs = computeBackoffMs(attempts);
-  const nextAttempt = new Date(now.getTime() + backoffMs);
+  const delayMs =
+    typeof overrideDelayMs === "number"
+      ? overrideDelayMs
+      : computeBackoffMs(attemptsUsed + 1);
+
+  const nextAttemptAt = new Date(Date.now() + Math.max(0, delayMs));
 
   await prisma.webhookDelivery.update({
     where: { id: deliveryId },
     data: {
       status: WebhookDeliveryStatus.PENDING,
-      lastError,
-      nextAttempt,
+      lastError: err.slice(0, 2000),
+      nextAttempt: nextAttemptAt,
     },
   });
 }

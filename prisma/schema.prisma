@@ -303,7 +303,6 @@ enum AdminActionType {
   MESSAGE_UNHIDDEN
   ADMIN_IMPERSONATION_STARTED
   ADMIN_IMPERSONATION_STOPPED
-
 }
 
 model JobMessageReadState {
@@ -324,7 +323,7 @@ model JobMessageReadState {
 model WebhookEndpoint {
   id        Int      @id @default(autoincrement())
   url       String
-  secret    String   // used to sign payloads (HMAC)
+  secret    String // used to sign payloads (HMAC)
   enabled   Boolean  @default(true)
   events    String[] // list of event names this endpoint subscribes to
   createdAt DateTime @default(now())
@@ -342,11 +341,10 @@ enum WebhookDeliveryStatus {
   FAILED
 }
 
-
 model WebhookDelivery {
-  id          Int                   @id @default(autoincrement())
-  endpointId  Int
-  endpoint    WebhookEndpoint       @relation(fields: [endpointId], references: [id], onDelete: Cascade)
+  id         Int             @id @default(autoincrement())
+  endpointId Int
+  endpoint   WebhookEndpoint @relation(fields: [endpointId], references: [id], onDelete: Cascade)
 
   event       String
   payload     Json
@@ -357,6 +355,40 @@ model WebhookDelivery {
   createdAt   DateTime              @default(now())
   updatedAt   DateTime              @updatedAt
 
+  lastStatusCode Int?
+  deliveredAt    DateTime?
+  lastAttemptAt  DateTime?
+  attemptLogs    WebhookDeliveryAttempt[]
+
   @@index([status, nextAttempt])
   @@index([endpointId, createdAt])
+}
+
+model WebhookDeliveryAttempt {
+  id         Int             @id @default(autoincrement())
+  deliveryId Int
+  delivery   WebhookDelivery @relation(fields: [deliveryId], references: [id], onDelete: Cascade)
+
+  attemptNumber Int
+
+  // ✅ add these
+  endpointId  Int?
+  endpointUrl String?
+  event       String?
+
+  startedAt  DateTime  @default(now())
+  finishedAt DateTime?
+  durationMs Int?
+
+  ok              Boolean?
+  statusCode      Int?
+  error           String?
+  responseSnippet String?
+  retryAfter      String?
+
+  createdAt DateTime @default(now())
+
+  @@index([deliveryId, attemptNumber])
+  @@index([deliveryId, createdAt]) // ✅ add this (for UI lists)
+  @@index([startedAt])
 }

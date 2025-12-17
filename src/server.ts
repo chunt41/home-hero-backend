@@ -1,4 +1,4 @@
-import * as cors from "cors";
+import cors from "cors";
 import * as dotenv from "dotenv";
 import * as bcrypt from "bcryptjs";
 import * as jwt from "jsonwebtoken";
@@ -88,6 +88,14 @@ const allowedOrigins =
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
+
+app.use((err: any, _req: Request, res: Response, _next: any) => {
+  if (err?.message === "CORS blocked") {
+    return res.status(403).json({ ok: false, error: "CORS blocked" });
+  }
+  return res.status(500).json({ ok: false, error: "Server error" });
+});
+
 
 app.use(
   cors({
