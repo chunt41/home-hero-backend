@@ -6357,7 +6357,7 @@ app.get("/admin/webhooks/ui", async (_req, res) => {
           escapeHtml(d.lastStatusCode ?? "") + " " +
           escapeHtml(short(d.lastError ?? "")) +
         "</td>" +
-        "<td class='mono'>" + escapeHtml(d.endpoint?.id ?? "") + "</td>";
+        "<td class='mono'>" + escapeHtml(d.endpoint?.id ?? d.endpointId ?? "") + "</td>";
 
       tr.addEventListener("click", function () {
         fetchDeliveryDetail(d.id);
