@@ -6139,6 +6139,252 @@ app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
   });
 });
 
+// GET /admin/webhooks/ui
+// Lightweight admin dashboard (no separate frontend).
+// It expects an Admin JWT in localStorage under "adminToken".
+app.get("/admin/webhooks/ui", async (_req, res) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  return res.send(`<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Webhooks Admin</title>
+  <style>
+    body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 16px; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: end; }
+    label { display: flex; flex-direction: column; gap: 6px; font-size: 12px; }
+    input, select, button, textarea { padding: 8px; font-size: 14px; }
+    button { cursor: pointer; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 16px; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 12px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; border-bottom: 1px solid #eee; padding: 8px; font-size: 13px; vertical-align: top; }
+    tr:hover { background: #fafafa; }
+    .muted { color: #666; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; border: 1px solid #ddd; }
+    .ok { border-color: #9ae6b4; }
+    .bad { border-color: #feb2b2; }
+    pre { white-space: pre-wrap; word-break: break-word; font-size: 12px; background: #f7f7f7; padding: 10px; border-radius: 8px; }
+  </style>
+</head>
+<body>
+  <h2>Webhooks Admin</h2>
+
+  <div class="card">
+    <div class="row">
+      <label>
+        Admin Token (JWT)
+        <input id="token" placeholder="paste admin token here" style="min-width:420px" />
+      </label>
+
+      <label>
+        Status
+        <select id="status">
+          <option value="">(any)</option>
+          <option value="PENDING">PENDING</option>
+          <option value="PROCESSING">PROCESSING</option>
+          <option value="SUCCESS">SUCCESS</option>
+          <option value="FAILED">FAILED</option>
+        </select>
+      </label>
+
+      <label>
+        Endpoint ID
+        <input id="endpointId" placeholder="e.g. 9" style="width:120px" />
+      </label>
+
+      <label>
+        Event contains
+        <input id="event" placeholder="e.g. webhook.test" style="width:220px" />
+      </label>
+
+      <button id="saveToken">Save Token</button>
+      <button id="refresh">Refresh</button>
+      <button id="loadMore">Load more</button>
+    </div>
+
+    <p class="muted" style="margin:10px 0 0;">
+      Tip: token is stored locally in your browser. Requests send <span class="mono">Authorization: Bearer &lt;token&gt;</span>.
+    </p>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h3 style="margin-top:0;">Deliveries</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Event</th>
+            <th>Status</th>
+            <th>Attempts</th>
+            <th>Last</th>
+            <th>Endpoint</th>
+          </tr>
+        </thead>
+        <tbody id="deliveries"></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h3 style="margin-top:0;">Delivery details</h3>
+      <div id="detail" class="muted">Click a delivery on the left.</div>
+    </div>
+  </div>
+
+<script>
+  const tokenEl = document.getElementById("token");
+  const statusEl = document.getElementById("status");
+  const endpointIdEl = document.getElementById("endpointId");
+  const eventEl = document.getElementById("event");
+  const deliveriesEl = document.getElementById("deliveries");
+  const detailEl = document.getElementById("detail");
+
+  let nextCursor = null;
+
+  function getToken() {
+    return tokenEl.value.trim();
+  }
+
+  function authHeaders() {
+    const t = getToken();
+    return {
+      "Content-Type": "application/json",
+      "Authorization": "Bearer " + t
+    };
+  }
+
+  function qs(params) {
+    const u = new URLSearchParams();
+    Object.entries(params).forEach(([k,v]) => {
+      if (v !== null && v !== undefined && String(v).length) u.set(k, String(v));
+    });
+    const s = u.toString();
+    return s ? "?" + s : "";
+  }
+
+  async function fetchDeliveries({ reset } = { reset: false }) {
+    if (reset) {
+      deliveriesEl.innerHTML = "";
+      nextCursor = null;
+      detailEl.innerHTML = "<div class='muted'>Click a delivery on the left.</div>";
+    }
+
+    const params = {
+      take: 50,
+      cursor: nextCursor,
+      status: statusEl.value,
+      endpointId: endpointIdEl.value.trim(),
+      event: eventEl.value.trim()
+    };
+
+    const r = await fetch("/admin/webhooks/deliveries" + qs(params), {
+      headers: authHeaders()
+    });
+
+    if (!r.ok) {
+      const t = await r.text();
+      alert("Failed to load deliveries: " + r.status + "\\n" + t);
+      return;
+    }
+
+    const data = await r.json();
+    const items = data.items || data.deliveries || [];
+    nextCursor = data.nextCursor ?? null;
+
+    for (const d of items) {
+      const tr = document.createElement("tr");
+      tr.style.cursor = "pointer";
+      tr.innerHTML = \`
+        <td class="mono">\${d.id}</td>
+        <td>\${escapeHtml(d.event)}</td>
+        <td>\${statusPill(d.status)}</td>
+        <td class="mono">\${d.attempts ?? ""}</td>
+        <td class="mono">\${(d.lastStatusCode ?? "")} \${escapeHtml(short(d.lastError ?? ""))}</td>
+        <td class="mono">\${d.endpoint?.id ?? ""}</td>
+      \`;
+      tr.addEventListener("click", () => fetchDeliveryDetail(d.id));
+      deliveriesEl.appendChild(tr);
+    }
+  }
+
+  async function fetchDeliveryDetail(id) {
+    const r = await fetch("/admin/webhooks/deliveries/" + id, { headers: authHeaders() });
+    if (!r.ok) {
+      const t = await r.text();
+      alert("Failed to load detail: " + r.status + "\\n" + t);
+      return;
+    }
+    const d = await r.json();
+
+    const attempts = d.attemptLogs || [];
+    const attemptsHtml = attempts.map(a => \`
+      <div style="border-top:1px solid #eee; padding-top:8px; margin-top:8px;">
+        <div>
+          <span class="mono">#\${a.attemptNumber ?? ""}</span>
+          \${a.ok ? "<span class='pill ok'>ok</span>" : "<span class='pill bad'>fail</span>"}
+          <span class="mono">status=\${a.statusCode ?? ""}</span>
+          <span class="mono">dur=\${a.durationMs ?? ""}ms</span>
+        </div>
+        <div class="muted mono">\${escapeHtml(a.error ?? "")}</div>
+        \${a.responseSnippet ? "<pre>" + escapeHtml(a.responseSnippet) + "</pre>" : ""}
+      </div>
+    \`).join("");
+
+    detailEl.innerHTML = \`
+      <div class="mono"><b>delivery</b> #\${d.id}</div>
+      <div class="muted">event: <span class="mono">\${escapeHtml(d.event)}</span></div>
+      <div class="muted">status: \${statusPill(d.status)} attempts: <span class="mono">\${d.attempts}</span></div>
+      <div class="muted">endpoint: <span class="mono">#\${d.endpoint?.id}</span> <span class="mono">\${escapeHtml(d.endpoint?.url ?? "")}</span></div>
+      <div class="muted">last: <span class="mono">\${d.lastStatusCode ?? ""}</span> <span class="mono">\${escapeHtml(d.lastError ?? "")}</span></div>
+
+      <h4>Attempts</h4>
+      \${attemptsHtml || "<div class='muted'>No attempts logged.</div>"}
+
+      <h4>Payload</h4>
+      <pre>\${escapeHtml(JSON.stringify(d.payload ?? {}, null, 2))}</pre>
+    \`;
+  }
+
+  function short(s) {
+    return s.length > 60 ? s.slice(0, 60) + "…" : s;
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, (c) => ({
+      "&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;","'":"&#039;"
+    }[c]));
+  }
+
+  function statusPill(status) {
+    const cls = (status === "SUCCESS") ? "ok" : (status === "FAILED") ? "bad" : "";
+    return "<span class='pill " + cls + "'>" + escapeHtml(status) + "</span>";
+  }
+
+  // token persistence
+  const saved = localStorage.getItem("adminToken");
+  if (saved) tokenEl.value = saved;
+
+  document.getElementById("saveToken").addEventListener("click", () => {
+    localStorage.setItem("adminToken", getToken());
+    alert("Saved.");
+  });
+
+  document.getElementById("refresh").addEventListener("click", () => fetchDeliveries({ reset: true }));
+  document.getElementById("loadMore").addEventListener("click", () => {
+    if (!nextCursor) return alert("No more.");
+    fetchDeliveries({ reset: false });
+  });
+
+  // initial load
+  fetchDeliveries({ reset: true });
+</script>
+</body>
+</html>`);
+});
+
 
 // --- Start server + worker (start-once + graceful shutdown) ---
 
