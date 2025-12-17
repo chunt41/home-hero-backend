@@ -6331,7 +6331,7 @@ app.get("/admin/webhooks/ui", async (_req, res) => {
     if (!r.ok) {
       const text = await r.text();
       console.error("Deliveries fetch failed:", r.status, text);
-      alert("Failed to load deliveries: " + r.status + "\n" + text);
+      alert("Failed to load deliveries: " + r.status + "\\n" + text);
       return;
     }
 
