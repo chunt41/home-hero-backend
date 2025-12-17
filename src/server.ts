@@ -6336,8 +6336,11 @@ app.get("/admin/webhooks/ui", async (_req, res) => {
     }
 
     const data = await r.json();
-    const items = data.items || [];
-    nextCursor = data.nextCursor ?? null;
+
+    // ✅ backend returns an ARRAY, but older code expected { items: [...] }
+    const items = Array.isArray(data) ? data : (data.items || []);
+    nextCursor = Array.isArray(data) ? null : (data.nextCursor ?? null);
+
 
     console.log("Loaded deliveries:", items.length);
 
