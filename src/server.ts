@@ -79,6 +79,7 @@ if (process.env.NODE_ENV !== "production") {
 }
 
 const app = express();
+app.set("etag", false);
 const PORT = env.PORT;
 const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-change-me";
 
@@ -5960,6 +5961,10 @@ const WEBHOOK_MAX_ATTEMPTS = Number(process.env.WEBHOOK_MAX_ATTEMPTS ?? 5);
 //   cursor=123 (delivery id)
 // GET /admin/webhooks/deliveries
 app.get("/admin/webhooks/deliveries", authMiddleware, async (req: AuthRequest, res: Response) => {
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
+  res.setHeader("Surrogate-Control", "no-store");
   try {
     if (!requireAdmin(req, res)) return;
 
@@ -6242,16 +6247,28 @@ app.get("/admin/webhooks/ui", async (_req, res) => {
   let nextCursor = null;
 
   function getToken() {
-    return tokenEl.value.trim();
+    const typed = tokenEl.value.trim();
+    if (typed) return typed;
+    return (localStorage.getItem("adminToken") || "").trim();
   }
+
 
   function authHeaders() {
     const t = getToken();
-    return {
-      "Content-Type": "application/json",
-      "Authorization": "Bearer " + t
-    };
+    const h = { "Content-Type": "application/json" };
+    if (t) h["Authorization"] = "Bearer " + t; // only send if token exists
+    return h;
   }
+
+  function requireTokenOrAlert() {
+    const t = getToken();
+    if (!t) {
+      alert("Paste your admin token first, then click Save Token and Refresh.");
+      return false;
+    }
+    return true;
+  }
+
 
   function qs(params) {
     const u = new URLSearchParams();
@@ -6262,7 +6279,15 @@ app.get("/admin/webhooks/ui", async (_req, res) => {
     return s ? "?" + s : "";
   }
 
-  async function fetchDeliveries({ reset } = { reset: false }) {
+  async function fetchDeliveries(opts) {
+    const reset = opts && opts.reset === true;
+
+    const token = getToken();
+    if (!token) {
+      alert("Paste your admin token first, click Save Token, then click Refresh.");
+      return;
+    }
+
     if (reset) {
       deliveriesEl.innerHTML = "";
       nextCursor = null;
@@ -6272,77 +6297,59 @@ app.get("/admin/webhooks/ui", async (_req, res) => {
     const params = {
       take: 50,
       cursor: nextCursor,
-      status: statusEl.value,
-      endpointId: endpointIdEl.value.trim(),
-      event: eventEl.value.trim()
+      status: statusEl.value || undefined,
+      endpointId: endpointIdEl.value.trim() || undefined,
+      event: eventEl.value.trim() || undefined,
     };
 
-    const r = await fetch("/admin/webhooks/deliveries" + qs(params), {
-      headers: authHeaders()
+    const url = "/admin/webhooks/deliveries" + qs(params);
+
+    const r = await fetch(url, {
+      method: "GET",
+      cache: "no-store",
+      headers: {
+        "Authorization": "Bearer " + token,
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+      },
     });
 
+    // Never try to parse JSON on 304
+    if (r.status === 304) return;
+
     if (!r.ok) {
-      const t = await r.text();
-      alert("Failed to load deliveries: " + r.status + "\\n" + t);
+      const text = await r.text();
+      console.error("Deliveries fetch failed:", r.status, text);
+      alert("Failed to load deliveries: " + r.status + "\n" + text);
       return;
     }
 
     const data = await r.json();
-    const items = data.items || data.deliveries || [];
+    const items = data.items || [];
     nextCursor = data.nextCursor ?? null;
+
+    console.log("Loaded deliveries:", items.length);
 
     for (const d of items) {
       const tr = document.createElement("tr");
       tr.style.cursor = "pointer";
-      tr.innerHTML = \`
-        <td class="mono">\${d.id}</td>
-        <td>\${escapeHtml(d.event)}</td>
-        <td>\${statusPill(d.status)}</td>
-        <td class="mono">\${d.attempts ?? ""}</td>
-        <td class="mono">\${(d.lastStatusCode ?? "")} \${escapeHtml(short(d.lastError ?? ""))}</td>
-        <td class="mono">\${d.endpoint?.id ?? ""}</td>
-      \`;
-      tr.addEventListener("click", () => fetchDeliveryDetail(d.id));
+      tr.innerHTML =
+        "<td class='mono'>" + escapeHtml(d.id) + "</td>" +
+        "<td>" + escapeHtml(d.event) + "</td>" +
+        "<td>" + statusPill(d.status) + "</td>" +
+        "<td class='mono'>" + escapeHtml(d.attempts ?? "") + "</td>" +
+        "<td class='mono'>" +
+          escapeHtml(d.lastStatusCode ?? "") + " " +
+          escapeHtml(short(d.lastError ?? "")) +
+        "</td>" +
+        "<td class='mono'>" + escapeHtml(d.endpoint?.id ?? "") + "</td>";
+
+      tr.addEventListener("click", function () {
+        fetchDeliveryDetail(d.id);
+      });
+
       deliveriesEl.appendChild(tr);
     }
-  }
-
-  async function fetchDeliveryDetail(id) {
-    const r = await fetch("/admin/webhooks/deliveries/" + id, { headers: authHeaders() });
-    if (!r.ok) {
-      const t = await r.text();
-      alert("Failed to load detail: " + r.status + "\\n" + t);
-      return;
-    }
-    const d = await r.json();
-
-    const attempts = d.attemptLogs || [];
-    const attemptsHtml = attempts.map(a => \`
-      <div style="border-top:1px solid #eee; padding-top:8px; margin-top:8px;">
-        <div>
-          <span class="mono">#\${a.attemptNumber ?? ""}</span>
-          \${a.ok ? "<span class='pill ok'>ok</span>" : "<span class='pill bad'>fail</span>"}
-          <span class="mono">status=\${a.statusCode ?? ""}</span>
-          <span class="mono">dur=\${a.durationMs ?? ""}ms</span>
-        </div>
-        <div class="muted mono">\${escapeHtml(a.error ?? "")}</div>
-        \${a.responseSnippet ? "<pre>" + escapeHtml(a.responseSnippet) + "</pre>" : ""}
-      </div>
-    \`).join("");
-
-    detailEl.innerHTML = \`
-      <div class="mono"><b>delivery</b> #\${d.id}</div>
-      <div class="muted">event: <span class="mono">\${escapeHtml(d.event)}</span></div>
-      <div class="muted">status: \${statusPill(d.status)} attempts: <span class="mono">\${d.attempts}</span></div>
-      <div class="muted">endpoint: <span class="mono">#\${d.endpoint?.id}</span> <span class="mono">\${escapeHtml(d.endpoint?.url ?? "")}</span></div>
-      <div class="muted">last: <span class="mono">\${d.lastStatusCode ?? ""}</span> <span class="mono">\${escapeHtml(d.lastError ?? "")}</span></div>
-
-      <h4>Attempts</h4>
-      \${attemptsHtml || "<div class='muted'>No attempts logged.</div>"}
-
-      <h4>Payload</h4>
-      <pre>\${escapeHtml(JSON.stringify(d.payload ?? {}, null, 2))}</pre>
-    \`;
   }
 
   function short(s) {
@@ -6351,9 +6358,14 @@ app.get("/admin/webhooks/ui", async (_req, res) => {
 
   function escapeHtml(s) {
     return String(s).replace(/[&<>"']/g, (c) => ({
-      "&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;","'":"&#039;"
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",
+      "'": "&#039;",
     }[c]));
   }
+
 
   function statusPill(status) {
     const cls = (status === "SUCCESS") ? "ok" : (status === "FAILED") ? "bad" : "";
@@ -6376,7 +6388,11 @@ app.get("/admin/webhooks/ui", async (_req, res) => {
   });
 
   // initial load
-  fetchDeliveries({ reset: true });
+  // initial load only if token already saved
+  if (saved) {
+    fetchDeliveries({ reset: true });
+  }
+
 </script>
 </body>
 </html>`);
