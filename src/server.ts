@@ -5951,60 +5951,174 @@ const DELIVERY_TIMEOUT_MS = Number(process.env.WEBHOOK_DELIVERY_TIMEOUT_MS ?? 50
 const WEBHOOK_MAX_ATTEMPTS = Number(process.env.WEBHOOK_MAX_ATTEMPTS ?? 5);
 
 // GET /admin/webhooks/deliveries
+// Supports filters + cursor pagination
+// Query params:
+//   status=FAILED|PENDING|PROCESSING|SUCCESS
+//   endpointId=9
+//   event=webhook.test (partial match)
+//   take=50 (max 100)
+//   cursor=123 (delivery id)
 app.get("/admin/webhooks/deliveries", authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
     if (!requireAdmin(req, res)) return;
 
+    const takeRaw = Number(req.query.take ?? 50);
+    const take = Number.isFinite(takeRaw) ? Math.min(Math.max(takeRaw, 1), 100) : 50;
+
+    const cursorRaw = req.query.cursor;
+    const cursor = cursorRaw !== undefined ? Number(cursorRaw) : undefined;
+    const hasCursor = Number.isFinite(cursor);
+
+    const status = typeof req.query.status === "string" ? req.query.status : undefined;
+    const endpointIdRaw = typeof req.query.endpointId === "string" ? req.query.endpointId : undefined;
+    const endpointId = endpointIdRaw ? Number(endpointIdRaw) : undefined;
+    const event = typeof req.query.event === "string" ? req.query.event : undefined;
+
+    const where: any = {};
+    if (status) where.status = status;
+    if (Number.isFinite(endpointId)) where.endpointId = endpointId;
+    if (event) where.event = { contains: event, mode: "insensitive" };
+
     const deliveries = await prisma.webhookDelivery.findMany({
-      orderBy: { createdAt: "desc" },
-      take: 50,
+      where,
+      take,
+      ...(hasCursor ? { skip: 1, cursor: { id: cursor as number } } : {}),
+      orderBy: { id: "desc" }, // stable cursor ordering
       include: {
         endpoint: {
           select: {
             id: true,
             url: true,
             events: true,
+            enabled: true,
+            name: true, // if your model has it; remove if not
           },
         },
       },
     });
 
+    const items = deliveries.map((d) => {
+      const payload = d.payload as any;
+
+      return {
+        id: d.id,
+        event: d.event,
+        status: d.status,
+        attempts: d.attempts,
+        lastError: d.lastError,
+
+        // ✅ observability fields you added
+        lastStatusCode: (d as any).lastStatusCode ?? null,
+        lastAttemptAt: (d as any).lastAttemptAt ?? null,
+        deliveredAt: (d as any).deliveredAt ?? null,
+        nextAttempt: d.nextAttempt ?? null,
+
+        endpoint: {
+          id: d.endpoint.id,
+          url: d.endpoint.url,
+          enabled: (d.endpoint as any).enabled ?? true,
+          name: (d.endpoint as any).name ?? null,
+          subscribedEvents: d.endpoint.events,
+        },
+
+        // 👇 Event context helpers (optional but VERY useful)
+        context: {
+          jobId: payload?.jobId ?? payload?.job?.id ?? null,
+          jobTitle: payload?.title ?? payload?.job?.title ?? null,
+          userId: payload?.userId ?? payload?.consumerId ?? payload?.providerId ?? null,
+        },
+
+        payload,
+        createdAt: d.createdAt,
+        updatedAt: d.updatedAt,
+      };
+    });
+
     return res.json({
-      deliveries: deliveries.map((d) => {
-        const payload = d.payload as any;
-
-        return {
-          id: d.id,
-          event: d.event,
-          status: d.status,
-          attempts: d.attempts,
-          lastError: d.lastError,
-          endpoint: {
-            id: d.endpoint.id,
-            url: d.endpoint.url,
-            subscribedEvents: d.endpoint.events,
-          },
-
-          // 👇 Event context helpers (optional but VERY useful)
-          context: {
-            jobId: payload?.jobId ?? payload?.job?.id ?? null,
-            jobTitle: payload?.title ?? payload?.job?.title ?? null,
-            userId:
-              payload?.userId ??
-              payload?.consumerId ??
-              payload?.providerId ??
-              null,
-          },
-
-          payload, // full raw payload for inspection/debugging
-          createdAt: d.createdAt,
-        };
-      }),
+      items,
+      nextCursor: items.length === take ? items[items.length - 1].id : null,
     });
   } catch (err) {
     console.error("List webhook deliveries error:", err);
     return res.status(500).json({
       error: "Internal server error listing webhook deliveries.",
+    });
+  }
+});
+
+// GET /admin/webhooks/deliveries/:id
+// Returns the delivery + endpoint + attemptLogs (latest 200)
+app.get("/admin/webhooks/deliveries/:id", authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    if (!requireAdmin(req, res)) return;
+
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      return res.status(400).json({ error: "Invalid delivery id." });
+    }
+
+    const delivery = await prisma.webhookDelivery.findUnique({
+      where: { id },
+      include: {
+        endpoint: {
+          select: {
+            id: true,
+            url: true,
+            events: true,
+            enabled: true,
+            name: true, // remove if not in your schema
+          },
+        },
+        attemptLogs: {
+          orderBy: [{ attemptNumber: "asc" }, { startedAt: "asc" }],
+          take: 200,
+        },
+      },
+    });
+
+    if (!delivery) {
+      return res.status(404).json({ error: "Webhook delivery not found." });
+    }
+
+    const payload = delivery.payload as any;
+
+    return res.json({
+      id: delivery.id,
+      event: delivery.event,
+      status: delivery.status,
+      attempts: delivery.attempts,
+      lastError: delivery.lastError,
+
+      lastStatusCode: (delivery as any).lastStatusCode ?? null,
+      lastAttemptAt: (delivery as any).lastAttemptAt ?? null,
+      deliveredAt: (delivery as any).deliveredAt ?? null,
+      nextAttempt: delivery.nextAttempt ?? null,
+
+      endpoint: {
+        id: delivery.endpoint.id,
+        url: delivery.endpoint.url,
+        enabled: (delivery.endpoint as any).enabled ?? true,
+        name: (delivery.endpoint as any).name ?? null,
+        subscribedEvents: delivery.endpoint.events,
+      },
+
+      context: {
+        jobId: payload?.jobId ?? payload?.job?.id ?? null,
+        jobTitle: payload?.title ?? payload?.job?.title ?? null,
+        userId: payload?.userId ?? payload?.consumerId ?? payload?.providerId ?? null,
+      },
+
+      payload,
+      createdAt: delivery.createdAt,
+      updatedAt: delivery.updatedAt,
+
+      // ✅ the good stuff
+      attemptLogs: delivery.attemptLogs,
+    });
+  } catch (err) {
+    console.error("Get webhook delivery error:", err);
+    return res.status(500).json({
+      error: "Internal server error fetching webhook delivery.",
     });
   }
 });
