@@ -6237,46 +6237,58 @@ app.get("/admin/webhooks/ui", async (_req, res) => {
   </div>
 
 <script>
+  // ✅ quick sanity check: if you don't see this, script isn't running
+  console.log("[admin webhooks ui] script loaded");
+
   const tokenEl = document.getElementById("token");
   const statusEl = document.getElementById("status");
   const endpointIdEl = document.getElementById("endpointId");
   const eventEl = document.getElementById("event");
-  const deliveriesEl = document.getElementById("deliveries");
+  const deliveriesEl = document.getElementById("deliveries"); // TBODY
   const detailEl = document.getElementById("detail");
 
   let nextCursor = null;
 
   function getToken() {
-    const typed = tokenEl.value.trim();
+    const typed = (tokenEl.value || "").trim();
     if (typed) return typed;
     return (localStorage.getItem("adminToken") || "").trim();
   }
 
-
-  function authHeaders() {
-    const t = getToken();
-    const h = { "Content-Type": "application/json" };
-    if (t) h["Authorization"] = "Bearer " + t; // only send if token exists
-    return h;
-  }
-
-  function requireTokenOrAlert() {
-    const t = getToken();
-    if (!t) {
-      alert("Paste your admin token first, then click Save Token and Refresh.");
-      return false;
-    }
-    return true;
-  }
-
-
   function qs(params) {
     const u = new URLSearchParams();
-    Object.entries(params).forEach(([k,v]) => {
+    Object.entries(params).forEach(([k, v]) => {
       if (v !== null && v !== undefined && String(v).length) u.set(k, String(v));
     });
     const s = u.toString();
     return s ? "?" + s : "";
+  }
+
+  function short(s) {
+    s = String(s || "");
+    return s.length > 60 ? s.slice(0, 60) + "…" : s;
+  }
+
+  // ✅ FIXED: this version will not crash parsing
+  function escapeHtml(s) {
+    return String(s ?? "").replace(/[&<>"']/g, (c) => ({
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",
+      "'": "&#039;",
+    }[c]));
+  }
+
+  function statusPill(status) {
+    const cls = (status === "SUCCESS") ? "ok" : (status === "FAILED") ? "bad" : "";
+    return "<span class='pill " + cls + "'>" + escapeHtml(status) + "</span>";
+  }
+
+  async function fetchDeliveryDetail(id) {
+    // If you already have this elsewhere, you can remove this stub.
+    // Leaving as no-op so clicks won't throw.
+    detailEl.innerHTML = "<div class='muted'>Detail loading not implemented in this snippet.</div>";
   }
 
   async function fetchDeliveries(opts) {
@@ -6298,8 +6310,8 @@ app.get("/admin/webhooks/ui", async (_req, res) => {
       take: 50,
       cursor: nextCursor,
       status: statusEl.value || undefined,
-      endpointId: endpointIdEl.value.trim() || undefined,
-      event: eventEl.value.trim() || undefined,
+      endpointId: (endpointIdEl.value || "").trim() || undefined,
+      event: (eventEl.value || "").trim() || undefined,
     };
 
     const url = "/admin/webhooks/deliveries" + qs(params);
@@ -6314,7 +6326,6 @@ app.get("/admin/webhooks/ui", async (_req, res) => {
       },
     });
 
-    // Never try to parse JSON on 304
     if (r.status === 304) return;
 
     if (!r.ok) {
@@ -6333,6 +6344,7 @@ app.get("/admin/webhooks/ui", async (_req, res) => {
     for (const d of items) {
       const tr = document.createElement("tr");
       tr.style.cursor = "pointer";
+
       tr.innerHTML =
         "<td class='mono'>" + escapeHtml(d.id) + "</td>" +
         "<td>" + escapeHtml(d.event) + "</td>" +
@@ -6352,32 +6364,12 @@ app.get("/admin/webhooks/ui", async (_req, res) => {
     }
   }
 
-  function short(s) {
-    return s.length > 60 ? s.slice(0, 60) + "…" : s;
-  }
-
-  function escapeHtml(s) {
-    return String(s).replace(/[&<>"']/g, (c) => ({
-      "&": "&amp;",
-      "<": "&lt;",
-      ">": "&gt;",
-      '"': "&quot;",
-      "'": "&#039;",
-    }[c]));
-  }
-
-
-  function statusPill(status) {
-    const cls = (status === "SUCCESS") ? "ok" : (status === "FAILED") ? "bad" : "";
-    return "<span class='pill " + cls + "'>" + escapeHtml(status) + "</span>";
-  }
-
   // token persistence
   const saved = localStorage.getItem("adminToken");
   if (saved) tokenEl.value = saved;
 
   document.getElementById("saveToken").addEventListener("click", () => {
-    localStorage.setItem("adminToken", getToken());
+    localStorage.setItem("adminToken", (tokenEl.value || "").trim());
     alert("Saved.");
   });
 
@@ -6387,13 +6379,9 @@ app.get("/admin/webhooks/ui", async (_req, res) => {
     fetchDeliveries({ reset: false });
   });
 
-  // initial load
-  // initial load only if token already saved
-  if (saved) {
-    fetchDeliveries({ reset: true });
-  }
-
+  if (saved) fetchDeliveries({ reset: true });
 </script>
+
 </body>
 </html>`);
 });
