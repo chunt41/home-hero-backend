@@ -1516,18 +1516,16 @@ app.get(
         where: {
           jobId,
           provider: {
-            ...userWhereVisible, // ✅ hide suspended providers for non-admin
+            ...userWhereVisible,
           },
         },
         orderBy: { createdAt: "desc" },
         include: {
-          provider: {
-            include: {
-              providerProfile: true,
-            },
-          },
+          provider: { include: { providerProfile: true } },
+          counter: true, // ✅ add this (requires your CounterOffer relation)
         },
       });
+
 
       // Is this job favorited by the current user?
       // (Owner is consumer, but leaving generic is fine)
@@ -1557,6 +1555,18 @@ app.get(
             rating: b.provider.providerProfile?.rating ?? null,
             reviewCount: b.provider.providerProfile?.reviewCount ?? 0,
           },
+          counter: b.counter
+          ? {
+              id: b.counter.id,
+              minAmount: b.counter.minAmount,
+              maxAmount: b.counter.maxAmount,
+              amount: b.counter.amount,
+              message: b.counter.message,
+              status: b.counter.status,
+              createdAt: b.counter.createdAt,
+            }
+          : null,
+
         }))
       );
     } catch (err) {
