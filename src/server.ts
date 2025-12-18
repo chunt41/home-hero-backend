@@ -6286,10 +6286,115 @@ app.get("/admin/webhooks/ui", async (_req, res) => {
   }
 
   async function fetchDeliveryDetail(id) {
-    // If you already have this elsewhere, you can remove this stub.
-    // Leaving as no-op so clicks won't throw.
-    detailEl.innerHTML = "<div class='muted'>Detail loading not implemented in this snippet.</div>";
+  const token = getToken();
+  if (!token) {
+    alert("Paste your admin token first, click Save Token, then click Refresh.");
+    return;
   }
+
+  detailEl.innerHTML = "<div class='muted'>Loading detail…</div>";
+
+  const r = await fetch("/admin/webhooks/deliveries/" + encodeURIComponent(id), {
+    method: "GET",
+    cache: "no-store",
+    headers: {
+      "Authorization": "Bearer " + token,
+      "Cache-Control": "no-cache",
+      "Pragma": "no-cache",
+    },
+  });
+
+  if (r.status === 304) return;
+
+  if (!r.ok) {
+    const text = await r.text();
+    console.error("Delivery detail fetch failed:", r.status, text);
+    detailEl.innerHTML =
+      "<div class='muted'>Failed to load detail (" + r.status + ")</div>" +
+      "<pre>" + escapeHtml(text) + "</pre>";
+    return;
+  }
+
+  const d = await r.json();
+
+  const endpointLine =
+    (d.endpoint?.id ?? "") +
+    (d.endpoint?.url ? (" — " + d.endpoint.url) : "") +
+    (d.endpoint?.enabled === false ? " (disabled)" : "");
+
+  const contextLine = [
+    d.context?.jobId ? ("jobId: " + d.context.jobId) : null,
+    d.context?.jobTitle ? ("title: " + d.context.jobTitle) : null,
+    d.context?.userId ? ("userId: " + d.context.userId) : null,
+  ].filter(Boolean).join(" | ");
+
+  const attempts = Array.isArray(d.attemptLogs) ? d.attemptLogs : [];
+
+  const attemptRows = attempts.length
+    ? (
+      "<table style='width:100%;border-collapse:collapse;margin-top:8px'>" +
+        "<thead><tr>" +
+          "<th style='text-align:left;border-bottom:1px solid #eee;padding:6px;font-size:12px'>Attempt</th>" +
+          "<th style='text-align:left;border-bottom:1px solid #eee;padding:6px;font-size:12px'>Started</th>" +
+          "<th style='text-align:left;border-bottom:1px solid #eee;padding:6px;font-size:12px'>Status</th>" +
+          "<th style='text-align:left;border-bottom:1px solid #eee;padding:6px;font-size:12px'>Code</th>" +
+          "<th style='text-align:left;border-bottom:1px solid #eee;padding:6px;font-size:12px'>Error</th>" +
+        "</tr></thead><tbody>" +
+        attempts.map((a) => (
+          "<tr>" +
+            "<td class='mono' style='border-bottom:1px solid #f3f3f3;padding:6px'>" + escapeHtml(a.attemptNumber ?? "") + "</td>" +
+            "<td class='mono' style='border-bottom:1px solid #f3f3f3;padding:6px'>" + escapeHtml(a.startedAt ?? "") + "</td>" +
+            "<td style='border-bottom:1px solid #f3f3f3;padding:6px'>" + escapeHtml(a.status ?? "") + "</td>" +
+            "<td class='mono' style='border-bottom:1px solid #f3f3f3;padding:6px'>" + escapeHtml(a.statusCode ?? "") + "</td>" +
+            "<td class='mono' style='border-bottom:1px solid #f3f3f3;padding:6px'>" + escapeHtml(short(a.error ?? "")) + "</td>" +
+          "</tr>"
+        )).join("") +
+        "</tbody></table>"
+      )
+    : "<div class='muted'>No attempt logs.</div>";
+
+  detailEl.innerHTML =
+    "<div style='display:flex;flex-direction:column;gap:10px'>" +
+
+      "<div>" +
+        "<div><strong>Delivery</strong> <span class='mono'>#" + escapeHtml(d.id) + "</span></div>" +
+        "<div class='muted'>" + escapeHtml(d.createdAt ?? "") + "</div>" +
+      "</div>" +
+
+      "<div>" +
+        "<div><strong>Event:</strong> " + escapeHtml(d.event ?? "") + "</div>" +
+        "<div><strong>Status:</strong> " + statusPill(d.status ?? "") + "</div>" +
+        "<div><strong>Attempts:</strong> <span class='mono'>" + escapeHtml(d.attempts ?? "") + "</span></div>" +
+        "<div><strong>Last:</strong> <span class='mono'>" +
+          escapeHtml(d.lastStatusCode ?? "") + "</span> " +
+          "<span class='mono'>" + escapeHtml(short(d.lastError ?? "")) + "</span>" +
+        "</div>" +
+      "</div>" +
+
+      "<div>" +
+        "<div><strong>Endpoint:</strong> <span class='mono'>" + escapeHtml(endpointLine) + "</span></div>" +
+        (d.endpoint?.subscribedEvents
+          ? "<div class='muted'>Subscribed: " + escapeHtml(String(d.endpoint.subscribedEvents)) + "</div>"
+          : "") +
+      "</div>" +
+
+      (contextLine
+        ? "<div><strong>Context:</strong> <span class='mono'>" + escapeHtml(contextLine) + "</span></div>"
+        : "") +
+
+      "<div>" +
+        "<div><strong>Attempt logs</strong></div>" +
+        attemptRows +
+      "</div>" +
+
+      "<div>" +
+        "<div><strong>Payload</strong></div>" +
+        "<pre>" + escapeHtml(JSON.stringify(d.payload ?? {}, null, 2)) + "</pre>" +
+      "</div>" +
+
+    "</div>";
+}
+
 
   async function fetchDeliveries(opts) {
     const reset = opts && opts.reset === true;
