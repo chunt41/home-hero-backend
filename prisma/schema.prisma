@@ -83,6 +83,8 @@ model Bid {
   createdAt  DateTime  @default(now())
   job        Job       @relation(fields: [jobId], references: [id])
   provider   User      @relation("UserBids", fields: [providerId], references: [id])
+
+  counter    CounterOffer?
 }
 
 model Message {
@@ -381,4 +383,28 @@ enum WebhookDeliveryStatus {
   SUCCESS
   FAILED
   PROCESSING
+}
+
+enum CounterStatus {
+  PENDING
+  ACCEPTED
+  DECLINED
+}
+
+model CounterOffer {
+  id        Int          @id @default(autoincrement())
+  bidId     Int          @unique
+  bid       Bid          @relation(fields: [bidId], references: [id], onDelete: Cascade)
+
+  // Range support
+  minAmount Int?
+  maxAmount Int?
+
+  // Canonical single amount (use max or exact)
+  amount    Int
+  message   String
+
+  status    CounterStatus @default(PENDING)
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
 }
