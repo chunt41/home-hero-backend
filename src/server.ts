@@ -1391,14 +1391,33 @@ app.post("/jobs/:jobId/bids", authMiddleware, bidLimiter, async (req: AuthReques
       });
     }
 
-    const bid = await prisma.bid.create({
-      data: {
-        amount: numericAmount,
-        message: messageText,
+    const existing = await prisma.bid.findFirst({
+      where: {
         jobId,
         providerId: req.user.userId,
       },
+      orderBy: { createdAt: "desc" },
+      select: { id: true },
     });
+
+    const bid = existing
+      ? await prisma.bid.update({
+          where: { id: existing.id },
+          data: {
+            amount: numericAmount,
+            message: messageText,
+            // status: "PENDING", // optional: reset status if you want updates to re-pend
+          },
+        })
+      : await prisma.bid.create({
+          data: {
+            amount: numericAmount,
+            message: messageText,
+            jobId,
+            providerId: req.user.userId,
+          },
+        });
+
 
     // 🔔 Notify the job owner (consumer)
     await createNotification({
@@ -1751,14 +1770,16 @@ app.get(
           jobId: job.id,
           providerId: req.user.userId,
         },
+        orderBy: { createdAt: "desc" }, // ✅ always newest
         select: {
           id: true,
           amount: true,
           message: true,
           createdAt: true,
-          status: true, // ✅ key fix: include status so ACCEPTED is visible
+          status: true,
         },
       });
+
 
       return res.json({
         job,

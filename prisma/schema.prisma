@@ -27,6 +27,7 @@ model User {
   favoriteProvidersAsProvider FavoriteProvider[]    @relation("FavoriteProviderProvider")
   jobs                        Job[]                 @relation("UserJobs")
   hiddenJobs                  Job[]                 @relation("HiddenJobsByAdmin")
+  messageReadStates           JobMessageReadState[]
   hiddenMessages              Message[]             @relation("HiddenMessagesByAdmin")
   messagesSent                Message[]
   notifications               Notification[]
@@ -38,7 +39,6 @@ model User {
   reviewsReceived             Review[]              @relation("ProviderReviews")
   subscription                Subscription?
   subscriptionPayments        SubscriptionPayment[]
-  messageReadStates           JobMessageReadState[]
 }
 
 model Job {
@@ -59,11 +59,11 @@ model Job {
   consumer    User                  @relation("UserJobs", fields: [consumerId], references: [id])
   hiddenBy    User?                 @relation("HiddenJobsByAdmin", fields: [hiddenById], references: [id])
   attachments JobAttachment[]
+  readStates  JobMessageReadState[]
   photos      JobPhoto[]
   messages    Message[]
   reports     Report[]              @relation("ReportTargetJob")
   review      Review?
-  readStates  JobMessageReadState[]
 }
 
 model JobPhoto {
@@ -249,6 +249,77 @@ model AdminAction {
   @@index([reportId])
 }
 
+model JobMessageReadState {
+  id         Int      @id @default(autoincrement())
+  jobId      Int
+  userId     Int
+  lastReadAt DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  job        Job      @relation(fields: [jobId], references: [id])
+  user       User     @relation(fields: [userId], references: [id])
+
+  @@unique([jobId, userId])
+  @@index([userId, lastReadAt])
+  @@index([jobId, lastReadAt])
+}
+
+model WebhookEndpoint {
+  id         Int               @id @default(autoincrement())
+  url        String
+  secret     String
+  enabled    Boolean           @default(true)
+  events     String[]
+  createdAt  DateTime          @default(now())
+  updatedAt  DateTime          @updatedAt
+  deliveries WebhookDelivery[]
+
+  @@index([enabled, createdAt])
+}
+
+model WebhookDelivery {
+  id             Int                      @id @default(autoincrement())
+  endpointId     Int
+  event          String
+  payload        Json
+  status         WebhookDeliveryStatus    @default(PENDING)
+  attempts       Int                      @default(0)
+  lastError      String?
+  nextAttempt    DateTime?
+  createdAt      DateTime                 @default(now())
+  updatedAt      DateTime                 @updatedAt
+  deliveredAt    DateTime?
+  lastAttemptAt  DateTime?
+  lastStatusCode Int?
+  endpoint       WebhookEndpoint          @relation(fields: [endpointId], references: [id], onDelete: Cascade)
+  attemptLogs    WebhookDeliveryAttempt[]
+
+  @@index([status, nextAttempt])
+  @@index([endpointId, createdAt])
+}
+
+model WebhookDeliveryAttempt {
+  id              Int             @id @default(autoincrement())
+  deliveryId      Int
+  attemptNumber   Int
+  startedAt       DateTime        @default(now())
+  finishedAt      DateTime?
+  durationMs      Int?
+  ok              Boolean?
+  statusCode      Int?
+  error           String?
+  responseSnippet String?
+  retryAfter      String?
+  createdAt       DateTime        @default(now())
+  endpointId      Int?
+  endpointUrl     String?
+  event           String?
+  delivery        WebhookDelivery @relation(fields: [deliveryId], references: [id], onDelete: Cascade)
+
+  @@index([deliveryId, attemptNumber])
+  @@index([deliveryId, createdAt])
+  @@index([startedAt])
+}
+
 enum UserRole {
   CONSUMER
   PROVIDER
@@ -305,90 +376,9 @@ enum AdminActionType {
   ADMIN_IMPERSONATION_STOPPED
 }
 
-model JobMessageReadState {
-  id         Int      @id @default(autoincrement())
-  jobId      Int
-  userId     Int
-  lastReadAt DateTime @default(now())
-  updatedAt  DateTime @updatedAt
-
-  job  Job  @relation(fields: [jobId], references: [id])
-  user User @relation(fields: [userId], references: [id])
-
-  @@unique([jobId, userId])
-  @@index([userId, lastReadAt])
-  @@index([jobId, lastReadAt])
-}
-
-model WebhookEndpoint {
-  id        Int      @id @default(autoincrement())
-  url       String
-  secret    String // used to sign payloads (HMAC)
-  enabled   Boolean  @default(true)
-  events    String[] // list of event names this endpoint subscribes to
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  deliveries WebhookDelivery[]
-
-  @@index([enabled, createdAt])
-}
-
 enum WebhookDeliveryStatus {
   PENDING
-  PROCESSING
   SUCCESS
   FAILED
-}
-
-model WebhookDelivery {
-  id         Int             @id @default(autoincrement())
-  endpointId Int
-  endpoint   WebhookEndpoint @relation(fields: [endpointId], references: [id], onDelete: Cascade)
-
-  event       String
-  payload     Json
-  status      WebhookDeliveryStatus @default(PENDING)
-  attempts    Int                   @default(0)
-  lastError   String?
-  nextAttempt DateTime?
-  createdAt   DateTime              @default(now())
-  updatedAt   DateTime              @updatedAt
-
-  lastStatusCode Int?
-  deliveredAt    DateTime?
-  lastAttemptAt  DateTime?
-  attemptLogs    WebhookDeliveryAttempt[]
-
-  @@index([status, nextAttempt])
-  @@index([endpointId, createdAt])
-}
-
-model WebhookDeliveryAttempt {
-  id         Int             @id @default(autoincrement())
-  deliveryId Int
-  delivery   WebhookDelivery @relation(fields: [deliveryId], references: [id], onDelete: Cascade)
-
-  attemptNumber Int
-
-  // ✅ add these
-  endpointId  Int?
-  endpointUrl String?
-  event       String?
-
-  startedAt  DateTime  @default(now())
-  finishedAt DateTime?
-  durationMs Int?
-
-  ok              Boolean?
-  statusCode      Int?
-  error           String?
-  responseSnippet String?
-  retryAfter      String?
-
-  createdAt DateTime @default(now())
-
-  @@index([deliveryId, attemptNumber])
-  @@index([deliveryId, createdAt]) // ✅ add this (for UI lists)
-  @@index([startedAt])
+  PROCESSING
 }
