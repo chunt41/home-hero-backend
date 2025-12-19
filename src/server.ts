@@ -2549,6 +2549,69 @@ app.get("/me/inbox", authMiddleware, async (req: AuthRequest, res: Response) => 
   }
 });
 
+// POST /jobs/:jobId/messages/read → mark thread as read for current user
+app.post(
+  "/jobs/:jobId/messages/read",
+  authMiddleware,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      if (!req.user) return res.status(401).json({ error: "Not authenticated" });
+
+      const jobId = Number(req.params.jobId);
+      if (!Number.isFinite(jobId)) {
+        return res.status(400).json({ error: "Invalid job id." });
+      }
+
+      const { jobWhereVisible } = visibilityFilters(req);
+
+      const me = req.user.userId;
+
+      // Role-based access:
+      // - Admin: any visible job
+      // - Consumer: jobs they own
+      // - Provider: jobs they have bid on
+      const roleWhere = isAdmin(req)
+        ? {}
+        : req.user.role === "CONSUMER"
+          ? { consumerId: me }
+          : req.user.role === "PROVIDER"
+            ? { bids: { some: { providerId: me } } }
+            : null;
+
+      if (!isAdmin(req) && !roleWhere) {
+        return res.status(403).json({ error: "Unsupported role for marking read." });
+      }
+
+      const job = await prisma.job.findFirst({
+        where: {
+          ...jobWhereVisible,
+          id: jobId,
+          ...(roleWhere ?? {}),
+        },
+        select: { id: true },
+      });
+
+      if (!job) {
+        return res.status(404).json({ error: "Job not found or not accessible." });
+      }
+
+      const now = new Date();
+
+      const state = await prisma.jobMessageReadState.upsert({
+        where: { jobId_userId: { jobId, userId: me } }, // ✅ matches @@unique([jobId, userId])
+        update: { lastReadAt: now },
+        create: { jobId, userId: me, lastReadAt: now },
+        select: { jobId: true, userId: true, lastReadAt: true, updatedAt: true },
+      });
+
+      return res.json({ ok: true, state });
+    } catch (err) {
+      console.error("POST /jobs/:jobId/messages/read error:", err);
+      return res.status(500).json({ error: "Internal server error while marking read." });
+    }
+  }
+);
+
 // GET /me/inbox/unread-total → total unread messages across all job threads for current user
 app.get("/me/inbox/unread-total", authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
