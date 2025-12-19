@@ -1590,18 +1590,30 @@ app.post("/bids/:bidId/counter", authMiddleware, async (req: AuthRequest, res: R
 
     const bid = await prisma.bid.findUnique({
       where: { id: bidId },
-      include: { job: { select: { id: true, consumerId: true, status: true, title: true } } },
+      include: {
+        counter: true, // ✅ REQUIRED
+        job: { select: { id: true, consumerId: true, status: true, title: true } },
+      },
     });
 
     if (!bid) return res.status(404).json({ error: "Bid not found." });
 
-    // Must own the job
     if (bid.job.consumerId !== req.user.userId) {
       return res.status(403).json({ error: "You do not own this job." });
     }
 
     if (bid.job.status !== "OPEN") {
       return res.status(400).json({ error: `Job is not open. Current status: ${bid.job.status}.` });
+    }
+
+    if (bid.counter && bid.counter.status === "ACCEPTED") {
+      return res.status(400).json({ error: "Counter was already accepted and cannot be changed." });
+    }
+
+    if (bid.status !== "PENDING") {
+      return res.status(400).json({
+        error: `Cannot counter a bid that is not pending. Current bid status: ${bid.status}.`,
+      });
     }
 
     const { amount, minAmount, maxAmount, message } = req.body as {
@@ -1613,7 +1625,6 @@ app.post("/bids/:bidId/counter", authMiddleware, async (req: AuthRequest, res: R
 
     const messageText = typeof message === "string" ? message.trim() : "";
 
-    // Validate exact vs range
     let canonicalAmount: number;
     let min: number | null = null;
     let max: number | null = null;
@@ -1626,7 +1637,7 @@ app.post("/bids/:bidId/counter", authMiddleware, async (req: AuthRequest, res: R
       }
       min = mn;
       max = mx;
-      canonicalAmount = mx; // canonical = max
+      canonicalAmount = mx;
     } else {
       const a = Number(amount);
       if (amount == null || Number.isNaN(a) || a <= 0) {
@@ -1635,7 +1646,6 @@ app.post("/bids/:bidId/counter", authMiddleware, async (req: AuthRequest, res: R
       canonicalAmount = a;
     }
 
-    // Upsert counter (one per bid)
     const counter = await prisma.counterOffer.upsert({
       where: { bidId: bid.id },
       create: {
@@ -1651,12 +1661,9 @@ app.post("/bids/:bidId/counter", authMiddleware, async (req: AuthRequest, res: R
         maxAmount: max,
         amount: canonicalAmount,
         message: messageText,
-        status: "PENDING", // reset to pending if they edit it
+        status: "PENDING",
       },
     });
-
-    // Optional notifications/webhooks here (recommended)
-    // notify provider: NEW_COUNTER
 
     return res.status(201).json({ counter });
   } catch (err) {
@@ -1675,17 +1682,19 @@ app.post("/bids/:bidId/counter/accept", authMiddleware, async (req: AuthRequest,
 
     const bid = await prisma.bid.findUnique({
       where: { id: bidId },
-      include: { counter: true, job: { select: { id: true, title: true } } },
+      include: { counter: true, job: { select: { id: true, title: true, status: true } } },
     });
     if (!bid) return res.status(404).json({ error: "Bid not found." });
 
-    if (bid.providerId !== req.user.userId) {
-      return res.status(403).json({ error: "You do not own this bid." });
-    }
-
+    if (bid.providerId !== req.user.userId) return res.status(403).json({ error: "You do not own this bid." });
     if (!bid.counter) return res.status(404).json({ error: "No counter offer exists for this bid." });
+
     if (bid.counter.status !== "PENDING") {
       return res.status(400).json({ error: `Counter is not pending. Current status: ${bid.counter.status}.` });
+    }
+
+    if (bid.job.status !== "OPEN") {
+      return res.status(400).json({ error: `Job is not open. Current status: ${bid.job.status}.` });
     }
 
     const rangeText =
@@ -1699,14 +1708,14 @@ app.post("/bids/:bidId/counter/accept", authMiddleware, async (req: AuthRequest,
         data: { status: "ACCEPTED" },
       });
 
-      const newMessage =
-        (bid.message?.trim() ? `${bid.message.trim()}\n` : "") + rangeText;
+      const newMessage = (bid.message?.trim() ? `${bid.message.trim()}\n` : "") + rangeText;
 
       return tx.bid.update({
         where: { id: bid.id },
         data: {
           amount: bid.counter!.amount,
           message: newMessage,
+          status: "ACCEPTED", // ✅ IMPORTANT
         },
         select: { id: true, amount: true, message: true, status: true },
       });
@@ -1740,6 +1749,12 @@ app.post("/bids/:bidId/counter/decline", authMiddleware, async (req: AuthRequest
       where: { bidId: bid.id },
       data: { status: "DECLINED" },
     });
+
+    if (bid.counter.status !== "PENDING") {
+      return res.status(400).json({
+        error: `Counter is not pending. Current status: ${bid.counter.status}.`,
+      });
+    }
 
     return res.json({ counter });
   } catch (err) {
@@ -1967,8 +1982,6 @@ app.get(
           },
         },
       });
-
-
 
       return res.json({
         job,
