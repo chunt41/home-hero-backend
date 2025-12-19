@@ -81,11 +81,15 @@ model Bid {
   message    String
   status     BidStatus @default(PENDING)
   createdAt  DateTime  @default(now())
+
   job        Job       @relation(fields: [jobId], references: [id])
   provider   User      @relation("UserBids", fields: [providerId], references: [id])
 
   counter    CounterOffer?
+
+  @@unique([jobId, providerId]) // ✅ ADD THIS
 }
+
 
 model Message {
   id         Int       @id @default(autoincrement())
