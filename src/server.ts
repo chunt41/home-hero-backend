@@ -1578,190 +1578,314 @@ app.get(
   }
 );
 
-app.post("/bids/:bidId/counter", authMiddleware, async (req: AuthRequest, res: Response) => {
-  try {
-    if (!req.user) return res.status(401).json({ error: "Not authenticated" });
-    if (req.user.role !== "CONSUMER") {
-      return res.status(403).json({ error: "Only consumers can counter bids." });
-    }
-
-    const bidId = Number(req.params.bidId);
-    if (Number.isNaN(bidId)) return res.status(400).json({ error: "Invalid bidId parameter" });
-
-    const bid = await prisma.bid.findUnique({
-      where: { id: bidId },
-      include: {
-        counter: true, // ✅ REQUIRED
-        job: { select: { id: true, consumerId: true, status: true, title: true } },
-      },
-    });
-
-    if (!bid) return res.status(404).json({ error: "Bid not found." });
-
-    if (bid.job.consumerId !== req.user.userId) {
-      return res.status(403).json({ error: "You do not own this job." });
-    }
-
-    if (bid.job.status !== "OPEN") {
-      return res.status(400).json({ error: `Job is not open. Current status: ${bid.job.status}.` });
-    }
-
-    if (bid.counter && bid.counter.status === "ACCEPTED") {
-      return res.status(400).json({ error: "Counter was already accepted and cannot be changed." });
-    }
-
-    if (bid.status !== "PENDING") {
-      return res.status(400).json({
-        error: `Cannot counter a bid that is not pending. Current bid status: ${bid.status}.`,
-      });
-    }
-
-    const { amount, minAmount, maxAmount, message } = req.body as {
-      amount?: number;
-      minAmount?: number;
-      maxAmount?: number;
-      message?: string;
-    };
-
-    const messageText = typeof message === "string" ? message.trim() : "";
-
-    let canonicalAmount: number;
-    let min: number | null = null;
-    let max: number | null = null;
-
-    if (minAmount != null || maxAmount != null) {
-      const mn = Number(minAmount);
-      const mx = Number(maxAmount);
-      if (Number.isNaN(mn) || Number.isNaN(mx) || mn <= 0 || mx <= 0 || mn >= mx) {
-        return res.status(400).json({ error: "minAmount/maxAmount must be positive and minAmount < maxAmount." });
+app.post(
+  "/bids/:bidId/counter",
+  authMiddleware,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      if (!req.user) return res.status(401).json({ error: "Not authenticated" });
+      if (req.user.role !== "CONSUMER") {
+        return res.status(403).json({ error: "Only consumers can counter bids." });
       }
-      min = mn;
-      max = mx;
-      canonicalAmount = mx;
-    } else {
-      const a = Number(amount);
-      if (amount == null || Number.isNaN(a) || a <= 0) {
-        return res.status(400).json({ error: "amount must be a positive number." });
+
+      const bidId = Number(req.params.bidId);
+      if (!Number.isFinite(bidId)) {
+        return res.status(400).json({ error: "Invalid bidId parameter" });
       }
-      canonicalAmount = a;
-    }
 
-    const counter = await prisma.counterOffer.upsert({
-      where: { bidId: bid.id },
-      create: {
-        bidId: bid.id,
-        minAmount: min,
-        maxAmount: max,
-        amount: canonicalAmount,
-        message: messageText,
-        status: "PENDING",
-      },
-      update: {
-        minAmount: min,
-        maxAmount: max,
-        amount: canonicalAmount,
-        message: messageText,
-        status: "PENDING",
-      },
-    });
-
-    return res.status(201).json({ counter });
-  } catch (err) {
-    console.error("POST /bids/:bidId/counter error:", err);
-    return res.status(500).json({ error: "Internal server error while countering bid." });
-  }
-});
-
-app.post("/bids/:bidId/counter/accept", authMiddleware, async (req: AuthRequest, res: Response) => {
-  try {
-    if (!req.user) return res.status(401).json({ error: "Not authenticated" });
-    if (req.user.role !== "PROVIDER") return res.status(403).json({ error: "Only providers can accept counters." });
-
-    const bidId = Number(req.params.bidId);
-    if (Number.isNaN(bidId)) return res.status(400).json({ error: "Invalid bidId parameter" });
-
-    const bid = await prisma.bid.findUnique({
-      where: { id: bidId },
-      include: { counter: true, job: { select: { id: true, title: true, status: true } } },
-    });
-    if (!bid) return res.status(404).json({ error: "Bid not found." });
-
-    if (bid.providerId !== req.user.userId) return res.status(403).json({ error: "You do not own this bid." });
-    if (!bid.counter) return res.status(404).json({ error: "No counter offer exists for this bid." });
-
-    if (bid.counter.status !== "PENDING") {
-      return res.status(400).json({ error: `Counter is not pending. Current status: ${bid.counter.status}.` });
-    }
-
-    if (bid.job.status !== "OPEN") {
-      return res.status(400).json({ error: `Job is not open. Current status: ${bid.job.status}.` });
-    }
-
-    const rangeText =
-      bid.counter.minAmount != null && bid.counter.maxAmount != null
-        ? `Counter accepted: $${bid.counter.minAmount}-${bid.counter.maxAmount}`
-        : `Counter accepted: $${bid.counter.amount}`;
-
-    const updated = await prisma.$transaction(async (tx) => {
-      await tx.counterOffer.update({
-        where: { bidId: bid.id },
-        data: { status: "ACCEPTED" },
-      });
-
-      const newMessage = (bid.message?.trim() ? `${bid.message.trim()}\n` : "") + rangeText;
-
-      return tx.bid.update({
-        where: { id: bid.id },
-        data: {
-          amount: bid.counter!.amount,
-          message: newMessage,
-          status: "ACCEPTED", // ✅ IMPORTANT
+      const bid = await prisma.bid.findUnique({
+        where: { id: bidId },
+        include: {
+          counter: true, // ✅ needed for "already accepted" guard
+          job: { select: { id: true, consumerId: true, status: true, title: true } },
         },
-        select: { id: true, amount: true, message: true, status: true },
       });
-    });
 
-    return res.json({ bid: updated });
-  } catch (err) {
-    console.error("POST /bids/:bidId/counter/accept error:", err);
-    return res.status(500).json({ error: "Internal server error while accepting counter." });
-  }
-});
+      if (!bid) return res.status(404).json({ error: "Bid not found." });
 
-app.post("/bids/:bidId/counter/decline", authMiddleware, async (req: AuthRequest, res: Response) => {
-  try {
-    if (!req.user) return res.status(401).json({ error: "Not authenticated" });
-    if (req.user.role !== "PROVIDER") return res.status(403).json({ error: "Only providers can decline counters." });
+      // Must own the job
+      if (bid.job.consumerId !== req.user.userId) {
+        return res.status(403).json({ error: "You do not own this job." });
+      }
 
-    const bidId = Number(req.params.bidId);
-    if (Number.isNaN(bidId)) return res.status(400).json({ error: "Invalid bidId parameter" });
+      // Job must be open
+      if (bid.job.status !== "OPEN") {
+        return res.status(400).json({
+          error: `Job is not open. Current status: ${bid.job.status}.`,
+        });
+      }
 
-    const bid = await prisma.bid.findUnique({
-      where: { id: bidId },
-      include: { counter: true },
-    });
-    if (!bid) return res.status(404).json({ error: "Bid not found." });
+      // Optional: block changing counter after accepted
+      if (bid.counter && bid.counter.status === "ACCEPTED") {
+        return res.status(400).json({
+          error: "Counter was already accepted and cannot be changed.",
+        });
+      }
 
-    if (bid.providerId !== req.user.userId) return res.status(403).json({ error: "You do not own this bid." });
-    if (!bid.counter) return res.status(404).json({ error: "No counter offer exists for this bid." });
+      // Only counter pending bids (recommended)
+      if (bid.status !== "PENDING") {
+        return res.status(400).json({
+          error: `Cannot counter a bid that is not pending. Current bid status: ${bid.status}.`,
+        });
+      }
 
-    const counter = await prisma.counterOffer.update({
-      where: { bidId: bid.id },
-      data: { status: "DECLINED" },
-    });
+      const { amount, minAmount, maxAmount, message } = req.body as {
+        amount?: number;
+        minAmount?: number;
+        maxAmount?: number;
+        message?: string;
+      };
 
-    if (bid.counter.status !== "PENDING") {
-      return res.status(400).json({
-        error: `Counter is not pending. Current status: ${bid.counter.status}.`,
+      const messageText = typeof message === "string" ? message.trim() : "";
+
+      // ---- Validate exact vs range ----
+      let canonicalAmount: number;
+      let min: number | null = null;
+      let max: number | null = null;
+
+      const hasRange = minAmount != null || maxAmount != null;
+
+      if (hasRange) {
+        const mn = Number(minAmount);
+        const mx = Number(maxAmount);
+
+        if (!Number.isFinite(mn) || !Number.isFinite(mx)) {
+          return res.status(400).json({ error: "minAmount and maxAmount must be numbers." });
+        }
+        if (mn <= 0 || mx <= 0) {
+          return res.status(400).json({ error: "minAmount/maxAmount must be positive." });
+        }
+        if (mn >= mx) {
+          return res.status(400).json({ error: "minAmount must be less than maxAmount." });
+        }
+
+        min = Math.round(mn);
+        max = Math.round(mx);
+        canonicalAmount = max; // canonical = max for range
+      } else {
+        const a = Number(amount);
+
+        if (amount == null || !Number.isFinite(a) || a <= 0) {
+          return res.status(400).json({ error: "amount must be a positive number." });
+        }
+
+        canonicalAmount = Math.round(a);
+      }
+
+      // Upsert counter (one per bid)
+      const counter = await prisma.counterOffer.upsert({
+        where: { bidId: bid.id },
+        create: {
+          bidId: bid.id,
+          minAmount: min,
+          maxAmount: max,
+          amount: canonicalAmount,
+          message: messageText,
+          status: "PENDING",
+        },
+        update: {
+          minAmount: min,
+          maxAmount: max,
+          amount: canonicalAmount,
+          message: messageText,
+          status: "PENDING", // reset pending on edit
+        },
       });
+
+      return res.status(201).json({
+        counter: {
+          id: counter.id,
+          bidId: counter.bidId,
+          minAmount: counter.minAmount,
+          maxAmount: counter.maxAmount,
+          amount: counter.amount,
+          message: counter.message,
+          status: counter.status,
+          createdAt: counter.createdAt,
+          updatedAt: counter.updatedAt,
+        },
+      });
+    } catch (err) {
+      console.error("POST /bids/:bidId/counter error:", err);
+      return res
+        .status(500)
+        .json({ error: "Internal server error while countering bid." });
     }
-
-    return res.json({ counter });
-  } catch (err) {
-    console.error("POST /bids/:bidId/counter/decline error:", err);
-    return res.status(500).json({ error: "Internal server error while declining counter." });
   }
-});
+);
+
+app.post(
+  "/bids/:bidId/counter/accept",
+  authMiddleware,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      if (!req.user) return res.status(401).json({ error: "Not authenticated" });
+      if (req.user.role !== "PROVIDER") {
+        return res.status(403).json({ error: "Only providers can accept counters." });
+      }
+
+      const bidId = Number(req.params.bidId);
+      if (!Number.isFinite(bidId)) {
+        return res.status(400).json({ error: "Invalid bidId parameter" });
+      }
+
+      const bid = await prisma.bid.findUnique({
+        where: { id: bidId },
+        include: {
+          counter: true,
+          job: { select: { id: true, status: true, title: true, consumerId: true } },
+        },
+      });
+
+      if (!bid) return res.status(404).json({ error: "Bid not found." });
+      if (bid.providerId !== req.user.userId) {
+        return res.status(403).json({ error: "You do not own this bid." });
+      }
+
+      if (bid.job.status !== "OPEN") {
+        return res.status(400).json({
+          error: `Job is not open. Current status: ${bid.job.status}.`,
+        });
+      }
+
+      if (!bid.counter) {
+        return res.status(404).json({ error: "No counter offer exists for this bid." });
+      }
+
+      if (bid.counter.status !== "PENDING") {
+        return res.status(400).json({
+          error: `Counter is not pending. Current status: ${bid.counter.status}.`,
+        });
+      }
+
+      // Optional: prevent accepting a non-pending bid
+      if (bid.status !== "PENDING") {
+        return res.status(400).json({
+          error: `Cannot accept counter for a bid that is not pending. Current bid status: ${bid.status}.`,
+        });
+      }
+
+      const rangeText =
+        bid.counter.minAmount != null && bid.counter.maxAmount != null
+          ? `Counter accepted: $${bid.counter.minAmount}-${bid.counter.maxAmount}`
+          : `Counter accepted: $${bid.counter.amount}`;
+
+      const updated = await prisma.$transaction(async (tx) => {
+        await tx.counterOffer.update({
+          where: { bidId: bid.id },
+          data: { status: "ACCEPTED" },
+        });
+
+        const newMessage =
+          (bid.message?.trim() ? `${bid.message.trim()}\n` : "") + rangeText;
+
+        const updatedBid = await tx.bid.update({
+          where: { id: bid.id },
+          data: {
+            amount: bid.counter!.amount,
+            message: newMessage,
+            status: "ACCEPTED", // ✅ ensures provider side shows ACCEPTED
+          },
+          select: {
+            id: true,
+            jobId: true,
+            providerId: true,
+            amount: true,
+            message: true,
+            status: true,
+            createdAt: true,
+          },
+        });
+
+        // OPTIONAL: if you want counter acceptance to “lock in” immediately, you could:
+        // - decline other bids on this job
+        // - change job status
+        // But many apps do that when the CONSUMER accepts a bid, not here.
+
+        return updatedBid;
+      });
+
+      return res.json({ bid: updated });
+    } catch (err) {
+      console.error("POST /bids/:bidId/counter/accept error:", err);
+      return res
+        .status(500)
+        .json({ error: "Internal server error while accepting counter." });
+    }
+  }
+);
+
+app.post(
+  "/bids/:bidId/counter/decline",
+  authMiddleware,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      if (!req.user) return res.status(401).json({ error: "Not authenticated" });
+      if (req.user.role !== "PROVIDER") {
+        return res.status(403).json({ error: "Only providers can decline counters." });
+      }
+
+      const bidId = Number(req.params.bidId);
+      if (!Number.isFinite(bidId)) {
+        return res.status(400).json({ error: "Invalid bidId parameter" });
+      }
+
+      const bid = await prisma.bid.findUnique({
+        where: { id: bidId },
+        include: {
+          counter: true,
+          job: { select: { id: true, status: true, title: true } },
+        },
+      });
+
+      if (!bid) return res.status(404).json({ error: "Bid not found." });
+      if (bid.providerId !== req.user.userId) {
+        return res.status(403).json({ error: "You do not own this bid." });
+      }
+
+      if (bid.job.status !== "OPEN") {
+        return res.status(400).json({
+          error: `Job is not open. Current status: ${bid.job.status}.`,
+        });
+      }
+
+      if (!bid.counter) {
+        return res.status(404).json({ error: "No counter offer exists for this bid." });
+      }
+
+      if (bid.counter.status !== "PENDING") {
+        return res.status(400).json({
+          error: `Counter is not pending. Current status: ${bid.counter.status}.`,
+        });
+      }
+
+      const counter = await prisma.counterOffer.update({
+        where: { bidId: bid.id },
+        data: { status: "DECLINED" },
+      });
+
+      return res.json({
+        counter: {
+          id: counter.id,
+          bidId: counter.bidId,
+          minAmount: counter.minAmount,
+          maxAmount: counter.maxAmount,
+          amount: counter.amount,
+          message: counter.message,
+          status: counter.status,
+          createdAt: counter.createdAt,
+          updatedAt: counter.updatedAt,
+        },
+      });
+    } catch (err) {
+      console.error("POST /bids/:bidId/counter/decline error:", err);
+      return res
+        .status(500)
+        .json({ error: "Internal server error while declining counter." });
+    }
+  }
+);
+
 
 // --- Consumer: My Jobs (with bid counts) ---
 // GET /consumer/jobs
