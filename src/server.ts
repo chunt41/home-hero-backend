@@ -1308,154 +1308,188 @@ app.post("/jobs/:jobId/attachments", authMiddleware, async (req: AuthRequest, re
   }
 });
 
-// --- Bids: place bid on a job (PROVIDER only) ---
+// --- Bids: place/update bid on a job (PROVIDER only) ---
 // POST /jobs/:jobId/bids
 // Body: { amount, message? }
-app.post("/jobs/:jobId/bids", authMiddleware, bidLimiter, async (req: AuthRequest, res: Response) => {
-  try {
-    if (!req.user) return res.status(401).json({ error: "Not authenticated" });
+// Notes:
+// - If provider already has a bid, this acts like "update my bid".
+// - Updates are blocked if bid is locked (non-PENDING or counter already ACCEPTED).
 
-    if (req.user.role !== "PROVIDER") {
-      return res.status(403).json({ error: "Only providers can place bids" });
-    }
+app.post(
+  "/jobs/:jobId/bids",
+  authMiddleware,
+  bidLimiter,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      if (!req.user) return res.status(401).json({ error: "Not authenticated" });
 
-    const jobId = Number(req.params.jobId);
-    if (Number.isNaN(jobId)) {
-      return res.status(400).json({ error: "Invalid jobId parameter" });
-    }
+      if (req.user.role !== "PROVIDER") {
+        return res.status(403).json({ error: "Only providers can place bids" });
+      }
 
-    const { amount, message } = req.body;
+      const jobId = Number(req.params.jobId);
+      if (Number.isNaN(jobId)) {
+        return res.status(400).json({ error: "Invalid jobId parameter" });
+      }
 
-    if (amount === undefined || amount === null) {
-      return res.status(400).json({ error: "amount is required." });
-    }
+      const { amount, message } = req.body as {
+        amount?: number;
+        message?: string;
+      };
 
-    const numericAmount = Number(amount);
-    if (Number.isNaN(numericAmount) || numericAmount <= 0) {
-      return res.status(400).json({ error: "amount must be a positive number." });
-    }
+      if (amount === undefined || amount === null) {
+        return res.status(400).json({ error: "amount is required." });
+      }
 
-    // Bid.message is required in schema → always persist a string
-    const messageText =
-      typeof message === "string" && message.trim().length > 0 ? message.trim() : "";
+      const numericAmount = Number(amount);
+      if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
+        return res.status(400).json({ error: "amount must be a positive number." });
+      }
 
-    // Subscription check (your existing logic)
-    const subscription = await prisma.subscription.findUnique({
-      where: { userId: req.user.userId },
-      select: { tier: true },
-    });
-    const tier = subscription?.tier || "FREE";
+      // Bid.message is required in schema → always persist a string
+      const messageText =
+        typeof message === "string" && message.trim().length > 0 ? message.trim() : "";
 
-    if (tier === "FREE") {
-      const thirtyDaysAgo = new Date();
-      thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+      // Subscription check (your existing logic)
+      const subscription = await prisma.subscription.findUnique({
+        where: { userId: req.user.userId },
+        select: { tier: true },
+      });
+      const tier = subscription?.tier || "FREE";
 
-      const bidsLast30 = await prisma.bid.count({
+      if (tier === "FREE") {
+        const thirtyDaysAgo = new Date();
+        thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+        const bidsLast30 = await prisma.bid.count({
+          where: {
+            providerId: req.user.userId,
+            createdAt: { gte: thirtyDaysAgo },
+          },
+        });
+
+        if (bidsLast30 >= 5) {
+          return res.status(403).json({
+            error:
+              "You have reached your free tier limit of 5 bids per 30 days. Upgrade your subscription for unlimited bidding.",
+            bidsUsed: bidsLast30,
+            limit: 5,
+            tier,
+            remainingBids: 0,
+          });
+        }
+      }
+
+      // IMPORTANT: include consumerId so we can notify the correct user
+      const job = await prisma.job.findUnique({
+        where: { id: jobId },
+        select: { id: true, title: true, status: true, consumerId: true },
+      });
+
+      if (!job) return res.status(404).json({ error: "Job not found." });
+
+      // Block check (existing behavior)
+      const blocked = await isBlockedBetween(req.user.userId, job.consumerId);
+      if (blocked) {
+        return res.status(403).json({
+          error: "You cannot place a bid on this job because one of you has blocked the other.",
+        });
+      }
+
+      if (job.status !== "OPEN") {
+        return res.status(400).json({
+          error: `This job is not open for new bids. Current status: ${job.status}.`,
+        });
+      }
+
+      // Find provider's most recent bid for this job (if any)
+      const existing = await prisma.bid.findFirst({
         where: {
+          jobId,
           providerId: req.user.userId,
-          createdAt: { gte: thirtyDaysAgo },
+        },
+        orderBy: { createdAt: "desc" },
+        select: {
+          id: true,
+          status: true,
+          counter: {
+            select: { status: true },
+          },
         },
       });
 
-      if (bidsLast30 >= 5) {
-        return res.status(403).json({
-          error:
-            "You have reached your free tier limit of 5 bids per 30 days. Upgrade your subscription for unlimited bidding.",
-          bidsUsed: bidsLast30,
-          limit: 5,
-          tier,
-          remainingBids: 0,
-        });
+      // ✅ If updating an existing bid, enforce "bid locked" rules
+      if (existing) {
+        if (existing.status !== "PENDING") {
+          return res.status(400).json({
+            error: `Bid cannot be edited because it is ${existing.status}.`,
+          });
+        }
+
+        if (existing.counter && existing.counter.status === "ACCEPTED") {
+          return res.status(400).json({
+            error: "Bid cannot be edited because the counter offer was accepted.",
+          });
+        }
       }
-    }
 
-    // IMPORTANT: include consumerId so we can notify the correct user
-    const job = await prisma.job.findUnique({
-      where: { id: jobId },
-      select: { id: true, title: true, status: true, consumerId: true },
-    });
+      const bid = existing
+        ? await prisma.bid.update({
+            where: { id: existing.id },
+            data: {
+              amount: numericAmount,
+              message: messageText,
+              // status: "PENDING", // keep as-is; already PENDING here
+            },
+          })
+        : await prisma.bid.create({
+            data: {
+              amount: numericAmount,
+              message: messageText,
+              jobId,
+              providerId: req.user.userId,
+            },
+          });
 
-    if (!job) return res.status(404).json({ error: "Job not found." });
-
-    // Block check (existing behavior)
-    const blocked = await isBlockedBetween(req.user.userId, job.consumerId);
-    if (blocked) {
-      return res.status(403).json({
-        error: "You cannot place a bid on this job because one of you has blocked the other.",
+      // 🔔 Notify the job owner (consumer)
+      await createNotification({
+        userId: job.consumerId,
+        type: "NEW_BID",
+        content: `New bid (#${bid.id}) on your job "${job.title}".`,
       });
-    }
 
-    if (job.status !== "OPEN") {
-      return res.status(400).json({
-        error: `This job is not open for new bids. Current status: ${job.status}.`,
+      // ✅ Webhook: bid placed (you can later split into bid.updated vs bid.placed)
+      await enqueueWebhookEvent({
+        eventType: "bid.placed",
+        payload: {
+          bidId: bid.id,
+          jobId: bid.jobId,
+          providerId: bid.providerId,
+          consumerId: job.consumerId,
+          amount: bid.amount,
+          message: bid.message,
+          createdAt: bid.createdAt,
+          jobTitle: job.title,
+          jobStatus: job.status,
+          providerTier: tier,
+        },
       });
-    }
 
-    const existing = await prisma.bid.findFirst({
-      where: {
-        jobId,
-        providerId: req.user.userId,
-      },
-      orderBy: { createdAt: "desc" },
-      select: { id: true },
-    });
-
-    const bid = existing
-      ? await prisma.bid.update({
-          where: { id: existing.id },
-          data: {
-            amount: numericAmount,
-            message: messageText,
-            // status: "PENDING", // optional: reset status if you want updates to re-pend
-          },
-        })
-      : await prisma.bid.create({
-          data: {
-            amount: numericAmount,
-            message: messageText,
-            jobId,
-            providerId: req.user.userId,
-          },
-        });
-
-
-    // 🔔 Notify the job owner (consumer)
-    await createNotification({
-      userId: job.consumerId,
-      type: "NEW_BID",
-      content: `New bid (#${bid.id}) on your job "${job.title}".`,
-    });
-
-    // ✅ Webhook: bid placed (after bid + notification succeed)
-    await enqueueWebhookEvent({
-      eventType: "bid.placed",
-      payload: {
-        bidId: bid.id,
-        jobId: bid.jobId,
-        providerId: bid.providerId,
-        consumerId: job.consumerId,
+      return res.status(existing ? 200 : 201).json({
+        id: bid.id,
         amount: bid.amount,
         message: bid.message,
+        jobId: bid.jobId,
+        providerId: bid.providerId,
         createdAt: bid.createdAt,
-        jobTitle: job.title,
-        jobStatus: job.status,
-        providerTier: tier,
-      },
-    });
-
-    return res.status(201).json({
-      id: bid.id,
-      amount: bid.amount,
-      message: bid.message,
-      jobId: bid.jobId,
-      providerId: bid.providerId,
-      createdAt: bid.createdAt,
-    });
-  } catch (err) {
-    console.error("Place bid error:", err);
-    return res.status(500).json({ error: "Internal server error while placing bid." });
+      });
+    } catch (err) {
+      console.error("Place bid error:", err);
+      return res.status(500).json({ error: "Internal server error while placing bid." });
+    }
   }
-});
+);
+
 
 // GET /jobs/:jobId/bids → consumer sees all bids on their job
 app.get(
