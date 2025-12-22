@@ -2858,6 +2858,54 @@ app.get("/me/inbox/threads", authMiddleware, async (req: AuthRequest, res: Respo
   }
 });
 
+// GET /jobs/:id/messages/read-states
+// Returns read states for participants in this job thread.
+// Consumer/provider/admin visibility respected via authMiddleware + visibilityFilters.
+app.get("/jobs/:id/messages/read-states", authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    if (!req.user) return res.status(401).json({ error: "Not authenticated" });
+
+    const jobId = Number(req.params.id);
+    if (!Number.isFinite(jobId)) return res.status(400).json({ error: "Invalid job id." });
+
+    const { jobWhereVisible } = visibilityFilters(req);
+    const me = req.user.userId;
+
+    // Ensure the user can see this job
+    const job = await prisma.job.findFirst({
+      where: { id: jobId, ...jobWhereVisible },
+      select: { id: true, consumerId: true },
+    });
+
+    if (!job) return res.status(404).json({ error: "Job not found." });
+
+    // Non-admin must be a participant (consumer OR provider who bid)
+    if (!isAdmin(req)) {
+      if (req.user.role === "CONSUMER") {
+        if (job.consumerId !== me) return res.status(403).json({ error: "Not allowed." });
+      } else if (req.user.role === "PROVIDER") {
+        const hasBid = await prisma.bid.findFirst({
+          where: { jobId, providerId: me },
+          select: { id: true },
+        });
+        if (!hasBid) return res.status(403).json({ error: "Not allowed." });
+      } else {
+        return res.status(403).json({ error: "Not allowed." });
+      }
+    }
+
+    const states = await prisma.jobMessageReadState.findMany({
+      where: { jobId },
+      select: { userId: true, lastReadAt: true },
+    });
+
+    return res.json({ states });
+  } catch (err) {
+    console.error("GET /jobs/:id/messages/read-states error:", err);
+    return res.status(500).json({ error: "Internal server error while fetching read states." });
+  }
+});
+
 
 // GET /me/reviews → if I'm a provider, see my own reviews + summary
 app.get("/me/reviews", authMiddleware, async (req: AuthRequest, res: Response) => {
