@@ -1966,20 +1966,13 @@ app.get("/consumer/jobs", authMiddleware, async (req: AuthRequest, res: Response
 // GET /consumer/jobs/:jobId
 app.get("/consumer/jobs/:jobId", authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
-    if (!req.user) {
-      return res.status(401).json({ error: "Not authenticated" });
-    }
-
+    if (!req.user) return res.status(401).json({ error: "Not authenticated" });
     if (req.user.role !== "CONSUMER") {
       return res.status(403).json({ error: "Only consumers can view this resource." });
     }
 
-    const jobIdParam = req.params.jobId;
-    const jobId = Number(jobIdParam);
-
-    if (Number.isNaN(jobId)) {
-      return res.status(400).json({ error: "Invalid jobId parameter" });
-    }
+    const jobId = Number(req.params.jobId);
+    if (Number.isNaN(jobId)) return res.status(400).json({ error: "Invalid jobId parameter" });
 
     const job = await prisma.job.findUnique({
       where: { id: jobId },
@@ -1987,9 +1980,10 @@ app.get("/consumer/jobs/:jobId", authMiddleware, async (req: AuthRequest, res: R
         _count: { select: { bids: true } },
         attachments: true,
 
-        // ✅ Add this: pull the awarded (ACCEPTED) bid + provider summary
+        // ✅ awarded (ACCEPTED) bid + provider summary
         bids: {
           where: { status: "ACCEPTED" },
+          orderBy: { createdAt: "desc" }, // ✅ deterministic
           take: 1,
           include: {
             provider: { include: { providerProfile: true } },
@@ -1998,17 +1992,14 @@ app.get("/consumer/jobs/:jobId", authMiddleware, async (req: AuthRequest, res: R
       },
     });
 
+    if (!job) return res.status(404).json({ error: "Job not found." });
 
-    if (!job) {
-      return res.status(404).json({ error: "Job not found." });
-    }
-
-    // Ensure this job belongs to the current consumer
     if (job.consumerId !== req.user.userId) {
-      return res.status(403).json({
-        error: "You do not have permission to view this job.",
-      });
+      return res.status(403).json({ error: "You do not have permission to view this job." });
     }
+
+    // ✅ FIX: actually read the included accepted bid
+    const awarded = job.bids?.[0] ?? null;
 
     return res.json({
       id: job.id,
@@ -2027,7 +2018,6 @@ app.get("/consumer/jobs/:jobId", authMiddleware, async (req: AuthRequest, res: R
         createdAt: a.createdAt,
       })),
 
-      // ✅ New field
       awardedBid: awarded
         ? {
             id: awarded.id,
@@ -2046,9 +2036,7 @@ app.get("/consumer/jobs/:jobId", authMiddleware, async (req: AuthRequest, res: R
     });
   } catch (err) {
     console.error("Consumer Job Details error:", err);
-    return res
-      .status(500)
-      .json({ error: "Internal server error while fetching job details." });
+    return res.status(500).json({ error: "Internal server error while fetching job details." });
   }
 });
 
