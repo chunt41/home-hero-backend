@@ -1984,12 +1984,20 @@ app.get("/consumer/jobs/:jobId", authMiddleware, async (req: AuthRequest, res: R
     const job = await prisma.job.findUnique({
       where: { id: jobId },
       include: {
-        _count: {
-          select: { bids: true },
-        },
+        _count: { select: { bids: true } },
         attachments: true,
+
+        // ✅ Add this: pull the awarded (ACCEPTED) bid + provider summary
+        bids: {
+          where: { status: "ACCEPTED" },
+          take: 1,
+          include: {
+            provider: { include: { providerProfile: true } },
+          },
+        },
       },
     });
+
 
     if (!job) {
       return res.status(404).json({ error: "Job not found." });
@@ -2018,6 +2026,23 @@ app.get("/consumer/jobs/:jobId", authMiddleware, async (req: AuthRequest, res: R
         type: a.type,
         createdAt: a.createdAt,
       })),
+
+      // ✅ New field
+      awardedBid: awarded
+        ? {
+            id: awarded.id,
+            amount: awarded.amount,
+            message: awarded.message,
+            createdAt: awarded.createdAt,
+            provider: {
+              id: awarded.provider.id,
+              name: awarded.provider.name,
+              location: awarded.provider.location,
+              rating: awarded.provider.providerProfile?.rating ?? null,
+              reviewCount: awarded.provider.providerProfile?.reviewCount ?? 0,
+            },
+          }
+        : null,
     });
   } catch (err) {
     console.error("Consumer Job Details error:", err);
