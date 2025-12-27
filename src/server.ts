@@ -128,7 +128,14 @@ app.use(
 
 
 import adminWebhooksRouter from "./routes/adminWebhooks";
+import paymentsRouter from "./routes/payments";
+import adRevenueRouter from "./routes/adRevenue";
+import payoutsRouter from "./routes/payouts";
+
 app.use("/admin", adminWebhooksRouter);
+app.use("/payments", paymentsRouter);
+app.use("/ad-revenue", adRevenueRouter);
+app.use("/payouts", payoutsRouter);
 
 
 
@@ -2092,6 +2099,58 @@ app.get("/provider/bids", authMiddleware, async (req: AuthRequest, res: Response
   }
 });
 
+// DEBUG: temporary endpoints to inspect provider data locally (no auth)
+app.get("/debug/provider-bids", async (req, res) => {
+  try {
+    const providerId = Number(req.query.providerId) || 1;
+    const bids = await prisma.bid.findMany({
+      where: { providerId },
+      orderBy: { createdAt: "desc" },
+      include: {
+        job: {
+          select: {
+            id: true,
+            title: true,
+            status: true,
+            createdAt: true,
+            consumer: { select: { id: true, name: true } },
+          },
+        },
+        counter: true,
+      },
+    });
+
+    return res.json(bids);
+  } catch (err) {
+    console.error("/debug/provider-bids error:", err);
+    return res.status(500).json({ error: "Failed to fetch debug provider bids." });
+  }
+});
+
+app.get("/debug/provider-job", async (req, res) => {
+  try {
+    const jobId = Number(req.query.jobId);
+    if (Number.isNaN(jobId)) return res.status(400).json({ error: "Invalid jobId" });
+
+    const job = await prisma.job.findUnique({
+      where: { id: jobId },
+      select: {
+        id: true,
+        title: true,
+        status: true,
+        createdAt: true,
+        consumer: { select: { id: true, name: true } },
+      },
+    });
+
+    if (!job) return res.status(404).json({ error: "Job not found" });
+    return res.json(job);
+  } catch (err) {
+    console.error("/debug/provider-job error:", err);
+    return res.status(500).json({ error: "Failed to fetch debug job." });
+  }
+});
+
 // --- Provider: Job Details (optionally with this provider's bid) ---
 // GET /provider/jobs/:jobId
 app.get(
@@ -2123,6 +2182,9 @@ app.get(
           location: true,
           status: true,
           createdAt: true,
+          consumer: {
+            select: { id: true, name: true },
+          },
         },
       });
 
