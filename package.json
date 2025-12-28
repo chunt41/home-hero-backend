@@ -3,12 +3,15 @@
   "version": "1.0.0",
   "main": "index.js",
   "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "postinstall": "prisma generate",
     "build": "tsc -p tsconfig.json",
     "listen": "prisma migrate deploy && node dist/server.js",
-    "start": "npm run build && npm run listen",
+    "start": "npm run listen",
     "migrate:deploy": "prisma migrate deploy",
     "worker": "node dist/worker.js"
   },

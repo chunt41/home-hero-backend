@@ -4,6 +4,17 @@
 import "dotenv/config";
 import { defineConfig } from "prisma/config";
 
+const databaseUrl =
+  process.env.DATABASE_URL ??
+  process.env.DATABASE_PRIVATE_URL ??
+  process.env.RAILWAY_DATABASE_URL;
+
+if (!databaseUrl || !databaseUrl.trim()) {
+  throw new Error(
+    "Prisma migrations require a database URL. Set DATABASE_URL (or DATABASE_PRIVATE_URL) in the environment."
+  );
+}
+
 export default defineConfig({
   schema: "prisma/schema.prisma",
   migrations: {
@@ -11,7 +22,7 @@ export default defineConfig({
     seed: "node --use-system-ca prisma/seed.cjs",
   },
   datasource: {
-    url: process.env.DATABASE_URL!,
+    url: databaseUrl,
   },
 });
 
