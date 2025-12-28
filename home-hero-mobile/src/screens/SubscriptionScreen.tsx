@@ -13,6 +13,7 @@ import { useFocusEffect, useRouter } from "expo-router";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { useSubscription } from "../hooks/useSubscription";
 import { StripeCheckoutModal } from "../components/StripeCheckoutModal";
+import { getErrorMessage } from "../lib/getErrorMessage";
 
 export default function SubscriptionScreen() {
   const router = useRouter();
@@ -22,7 +23,6 @@ export default function SubscriptionScreen() {
     loading,
     error,
     fetchSubscription,
-    upgradeTier,
     downgradeTier,
     tierFeatures,
   } = useSubscription();
@@ -38,6 +38,12 @@ export default function SubscriptionScreen() {
   };
 
   const handleDowngrade = (tier: "FREE" | "BASIC") => {
+    // Backend currently only supports downgrading to FREE.
+    if (tier !== "FREE") {
+      Alert.alert("Not available", "Downgrading to BASIC is not supported yet.");
+      return;
+    }
+
     Alert.alert(
       `Downgrade to ${tier}`,
       `You will lose premium features. Continue?`,
@@ -52,7 +58,7 @@ export default function SubscriptionScreen() {
               Alert.alert("Success!", `Downgraded to ${tier} plan`);
               fetchSubscription();
             } catch (err: any) {
-              Alert.alert("Error", err);
+              Alert.alert("Error", getErrorMessage(err, "Failed to downgrade"));
             }
           },
         },
@@ -79,15 +85,20 @@ export default function SubscriptionScreen() {
   const getButtonTextAndAction = (
     tier: "FREE" | "BASIC" | "PRO",
     currentTier: "FREE" | "BASIC" | "PRO"
-  ): { text: string; isUpgrade: boolean } => {
+  ): { text: string; isUpgrade: boolean } | null => {
     const tierHierarchy = getTierHierarchy(tier);
     const currentHierarchy = getTierHierarchy(currentTier);
 
     if (tierHierarchy > currentHierarchy) {
       return { text: "Upgrade", isUpgrade: true };
-    } else {
+    }
+
+    // Only allow downgrading to FREE for now.
+    if (tier === "FREE" && currentTier !== "FREE") {
       return { text: "Downgrade", isUpgrade: false };
     }
+
+    return null;
   };
 
   const renderTierCard = (
@@ -179,7 +190,9 @@ export default function SubscriptionScreen() {
           <MaterialCommunityIcons name="chevron-left" size={28} color="#38bdf8" />
         </Pressable>
         <Text style={styles.headerTitle}>Subscription Plans</Text>
-        <View style={{ width: 28 }} />
+        <Pressable onPress={fetchSubscription} hitSlop={10}>
+          <MaterialCommunityIcons name="refresh" size={22} color="#38bdf8" />
+        </Pressable>
       </View>
 
       {error && (

@@ -1,14 +1,4 @@
-import { useState, useCallback, useEffect } from "react";
-import { api } from "../lib/apiClient";
-
-export type SubscriptionInfo = {
-  userId: number;
-  role: string;
-  tier: "FREE" | "BASIC" | "PRO";
-  bidLimitPer30Days: number | null;
-  bidsUsedLast30Days: number | null;
-  remainingBids: number | null;
-};
+import { useSubscriptionContext, type SubscriptionInfo } from "../context/SubscriptionContext";
 
 const TIER_FEATURES = {
   FREE: {
@@ -50,58 +40,19 @@ const TIER_FEATURES = {
 };
 
 export function useSubscription() {
-  const [subscription, setSubscription] = useState<SubscriptionInfo | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const { subscription, loading, error, fetchSubscription, downgradeToFree } =
+    useSubscriptionContext();
 
-  const fetchSubscription = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-
-    try {
-      const data = await api.get<SubscriptionInfo>("/subscription");
-      setSubscription(data);
-    } catch (err: any) {
-      setError(err?.message || "Failed to load subscription");
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  const upgradeTier = useCallback(async (tier: "BASIC" | "PRO") => {
-    try {
-      const data = await api.post<SubscriptionInfo>("/subscription/upgrade", {
-        tier,
-      });
-      setSubscription(data);
-      return true;
-    } catch (err: any) {
-      throw err?.message || "Failed to upgrade subscription";
-    }
-  }, []);
-
-  const downgradeTier = useCallback(async (tier: "FREE" | "BASIC") => {
-    try {
-      const data = await api.post<SubscriptionInfo>("/subscription/downgrade", {
-        tier,
-      });
-      setSubscription(data);
-      return true;
-    } catch (err: any) {
-      throw err?.message || "Failed to downgrade subscription";
-    }
-  }, []);
-
-  useEffect(() => {
-    fetchSubscription();
-  }, [fetchSubscription]);
+  const downgradeTier = async (tier: "FREE") => {
+    await downgradeToFree();
+    return true;
+  };
 
   return {
     subscription,
     loading,
     error,
     fetchSubscription,
-    upgradeTier,
     downgradeTier,
     tierFeatures: TIER_FEATURES,
   };

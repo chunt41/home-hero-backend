@@ -1,4 +1,5 @@
-import { View, Text, TextInput, Pressable, StyleSheet, ActivityIndicator } from "react-native";
+import { Text, TextInput, Pressable, StyleSheet, ActivityIndicator } from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
 import { Link } from "expo-router";
 import { useState } from "react";
 import { useAuth } from "../../src/context/AuthContext";
@@ -26,7 +27,7 @@ export default function LoginScreen() {
   };
 
   return (
-    <View style={styles.container}>
+    <SafeAreaView style={styles.container} edges={["top"]}>
       <Text style={styles.title}>Welcome Back</Text>
 
       {error ? <Text style={styles.error}>{error}</Text> : null}
@@ -57,7 +58,7 @@ export default function LoginScreen() {
       <Link href="/signup" style={styles.link}>
         Don’t have an account? Sign up
       </Link>
-    </View>
+    </SafeAreaView>
   );
 }
 

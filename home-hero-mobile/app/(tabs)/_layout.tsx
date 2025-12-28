@@ -45,21 +45,6 @@ export default function TabLayout() {
         }}
       />
 
-      {/* Earnings tab - visible to PROVIDER and ADMIN */}
-      <Tabs.Screen
-        name="provider/earnings"
-        options={{
-          title: "Earnings",
-          href:
-            user?.role === "PROVIDER" || user?.role === "ADMIN"
-              ? undefined
-              : null,
-          tabBarIcon: ({ color, size }) => (
-            <Ionicons name="wallet-outline" size={size} color={color} />
-          ),
-        }}
-      />
-
       {/* Consumer-facing My Jobs tab - only visible to CONSUMER role */}
       <Tabs.Screen
         name="consumer-jobs"
@@ -69,6 +54,14 @@ export default function TabLayout() {
           tabBarIcon: ({ color, size }) => (
             <Ionicons name="briefcase-outline" size={size} color={color} />
           ),
+        }}
+      />
+
+      {/* Hide provider earnings from the tab bar (still accessible via dashboard navigation) */}
+      <Tabs.Screen
+        name="provider/earnings"
+        options={{
+          href: null,
         }}
       />
 

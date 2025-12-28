@@ -1,6 +1,7 @@
 import React, { useState } from "react";
 import { View, Text, TextInput, Pressable, Alert, StyleSheet } from "react-native";
-import { http } from "../api/http";
+import { api } from "../lib/apiClient";
+import { getErrorMessage } from "../lib/getErrorMessage";
 
 type LoginResponse = {
   token: string;
@@ -20,14 +21,11 @@ export default function LoginScreen() {
     try {
       setLoading(true);
 
-      const data = await http<LoginResponse>("/auth/login", {
-        method: "POST",
-        body: { email, password },
-      });
+      const data = await api.post<LoginResponse>("/auth/login", { email, password });
 
       Alert.alert("Logged in!", `Role: ${data.user.role}\nToken starts with: ${data.token.slice(0, 16)}...`);
     } catch (e: any) {
-      Alert.alert("Login failed", e.message ?? "Unknown error");
+      Alert.alert("Login failed", getErrorMessage(e, "Unknown error"));
     } finally {
       setLoading(false);
     }

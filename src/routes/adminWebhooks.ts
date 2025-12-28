@@ -3,9 +3,236 @@ import { prisma } from "../prisma";
 import { authMiddleware } from "../middleware/authMiddleware";
 import { requireAdmin } from "../middleware/requireAdmin";
 import { WebhookDeliveryStatus } from "@prisma/client";
-
+import * as jwt from "jsonwebtoken";
 
 const router = Router();
+
+// List admin notifications (latest 50)
+router.get("/notifications", authMiddleware, requireAdmin, async (_req, res) => {
+  try {
+    const notifications = await prisma.notification.findMany({
+      where: { user: { role: "ADMIN" } },
+      orderBy: { createdAt: "desc" },
+      take: 50,
+    });
+    res.json(notifications);
+  } catch (err) {
+    console.error("Failed to fetch notifications", err);
+    res.status(500).json({ error: "Failed to fetch notifications" });
+  }
+});
+
+// List admin actions/logs (latest 50)
+router.get("/logs", authMiddleware, requireAdmin, async (_req, res) => {
+  try {
+    const logs = await prisma.adminAction.findMany({
+      orderBy: { createdAt: "desc" },
+      take: 50,
+      include: {
+        admin: { select: { id: true, name: true, email: true } },
+        report: { select: { id: true, reason: true, status: true, targetType: true } },
+      },
+    });
+    res.json(logs);
+  } catch (err) {
+    console.error("Failed to fetch logs", err);
+    res.status(500).json({ error: "Failed to fetch logs" });
+  }
+});
+
+// List users for admin management (with optional search and pagination)
+router.get("/users", authMiddleware, requireAdmin, async (req, res) => {
+  try {
+    const { q, skip = 0, take = 50 } = req.query;
+    const where: any = {};
+    if (q && typeof q === "string" && q.trim()) {
+      where.OR = [
+        { name: { contains: q, mode: "insensitive" } },
+        { email: { contains: q, mode: "insensitive" } },
+      ];
+    }
+
+    const users = await prisma.user.findMany({
+      where,
+      orderBy: { createdAt: "desc" },
+      skip: Number(skip),
+      take: Math.min(Number(take), 100),
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        role: true,
+        isSuspended: true,
+        createdAt: true,
+      },
+    });
+    res.json(users);
+  } catch (err) {
+    console.error("Failed to fetch users", err);
+    res.status(500).json({ error: "Failed to fetch users" });
+  }
+});
+
+// List flagged jobs (jobs with at least one report)
+router.get("/flagged-jobs", authMiddleware, requireAdmin, async (_req, res) => {
+  try {
+    const jobs = await prisma.job.findMany({
+      where: { reports: { some: {} } },
+      include: {
+        reports: {
+          include: {
+            reporter: { select: { id: true, name: true, email: true } },
+            handledByAdmin: { select: { id: true, name: true, email: true } },
+          },
+        },
+        consumer: { select: { id: true, name: true, email: true } },
+      },
+      orderBy: { createdAt: "desc" },
+      take: 50,
+    });
+    res.json(jobs);
+  } catch (err) {
+    console.error("Failed to fetch flagged jobs", err);
+    res.status(500).json({ error: "Failed to fetch flagged jobs" });
+  }
+});
+
+// Admin impersonate user: returns a JWT for the target user if admin
+router.post("/impersonate/:userId", authMiddleware, requireAdmin, async (req: any, res) => {
+  const userId = Number(req.params.userId);
+  if (!Number.isFinite(userId)) return res.status(400).json({ error: "Invalid userId" });
+
+  const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true, email: true, role: true } });
+  if (!user) return res.status(404).json({ error: "User not found" });
+  if (user.role === "ADMIN") return res.status(403).json({ error: "Cannot impersonate another admin" });
+
+  const secret = process.env.JWT_SECRET;
+  if (!secret) return res.status(500).json({ error: "Missing JWT_SECRET" });
+
+  const token = jwt.sign(
+    {
+      userId: user.id,
+      role: user.role,
+      impersonatedByAdminId: req.user?.userId,
+      isImpersonated: true,
+    },
+    secret,
+    { expiresIn: "1h" }
+  );
+
+  res.json({ token });
+});
+
+// Admin analytics endpoint: returns time series for users, jobs, revenue
+router.get("/analytics", authMiddleware, requireAdmin, async (req, res) => {
+  try {
+    // Last 30 days
+    const days = 30;
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const start = new Date(today);
+    start.setDate(today.getDate() - days + 1);
+
+    // Helper to format date as YYYY-MM-DD
+    const fmt = (d: Date) => d.toISOString().slice(0, 10);
+    const range = Array.from({ length: days }, (_, i) => {
+      const d = new Date(start);
+      d.setDate(start.getDate() + i);
+      return fmt(d);
+    });
+
+    // Users by day
+    const users = await prisma.user.findMany({
+      where: { createdAt: { gte: start, lte: today } },
+      select: { createdAt: true },
+      orderBy: { createdAt: "asc" },
+    });
+
+    // Jobs by day
+    const jobs = await prisma.job.findMany({
+      where: { createdAt: { gte: start, lte: today } },
+      select: { createdAt: true },
+      orderBy: { createdAt: "asc" },
+    });
+
+    // Revenue by day (sum of completed StripePayments with status SUCCEEDED)
+    const payments = await prisma.stripePayment.findMany({
+      where: {
+        status: "SUCCEEDED",
+        createdAt: { gte: start, lte: today },
+      },
+      select: { amount: true, createdAt: true },
+      orderBy: { createdAt: "asc" },
+    });
+
+    // Aggregate by day
+    const usersByDay = Object.fromEntries(range.map((d) => [d, 0]));
+    users.forEach((u) => {
+      const d = fmt(u.createdAt);
+      if (usersByDay[d] !== undefined) usersByDay[d] += 1;
+    });
+
+    const jobsByDay = Object.fromEntries(range.map((d) => [d, 0]));
+    jobs.forEach((j) => {
+      const d = fmt(j.createdAt);
+      if (jobsByDay[d] !== undefined) jobsByDay[d] += 1;
+    });
+
+    const revenueByDay = Object.fromEntries(range.map((d) => [d, 0]));
+    payments.forEach((p) => {
+      const d = fmt(p.createdAt);
+      if (revenueByDay[d] !== undefined) revenueByDay[d] += p.amount;
+    });
+
+    res.json({
+      range,
+      users: usersByDay,
+      jobs: jobsByDay,
+      revenue: revenueByDay,
+    });
+  } catch (err) {
+    console.error("Failed to fetch analytics", err);
+    res.status(500).json({ error: "Failed to fetch analytics" });
+  }
+});
+
+// Admin dashboard stats endpoint
+router.get("/stats", authMiddleware, requireAdmin, async (req, res) => {
+  try {
+    // Total users
+    const totalUsers = await prisma.user.count();
+    // Providers
+    const providers = await prisma.user.count({ where: { role: "PROVIDER" } });
+    // Consumers
+    const consumers = await prisma.user.count({ where: { role: "CONSUMER" } });
+    // Jobs completed
+    const jobsCompleted = await prisma.job.count({ where: { status: "COMPLETED" } });
+    // Revenue (sum of all completed StripePayments)
+    const revenueAgg = await prisma.stripePayment.aggregate({
+      _sum: { amount: true },
+      where: { status: "SUCCEEDED" },
+    });
+    const revenue = revenueAgg._sum.amount || 0;
+    // Flagged jobs (jobs with at least one report)
+    const flaggedJobs = await prisma.job.count({ where: { reports: { some: {} } } });
+    // Pending verifications (not implemented, set to 0)
+    const pendingVerifications = 0;
+
+    res.json({
+      totalUsers,
+      providers,
+      consumers,
+      jobsCompleted,
+      revenue,
+      flaggedJobs,
+      pendingVerifications,
+    });
+  } catch (err) {
+    console.error("Failed to fetch admin stats", err);
+    res.status(500).json({ error: "Failed to fetch admin stats" });
+  }
+});
+
 
 
 function normalizeEvents(events: unknown) {

@@ -12,7 +12,14 @@
       "distribution": "internal"
     },
     "production": {
-      "autoIncrement": true
+      "autoIncrement": true,
+      "env": {
+        "EXPO_PUBLIC_API_BASE_URL": "https://home-hero-backend-production.up.railway.app",
+        "ADMOB_ANDROID_APP_ID": "ca-app-pub-9932102016565081~3377741214",
+        "EXPO_PUBLIC_ADMOB_BANNER_UNIT_IDS": "ca-app-pub-9932102016565081/9425093050",
+        "EXPO_PUBLIC_ENABLE_INTERSTITIAL_ADS": "false",
+        "EXPO_PUBLIC_ADMOB_USE_TEST_IDS": "false"
+      }
     }
   },
   "submit": {

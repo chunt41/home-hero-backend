@@ -12,6 +12,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { useFocusEffect, useLocalSearchParams, useRouter } from "expo-router";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { useConsumerJobBids, BidForConsumer } from "../hooks/useConsumerJobBids";
+import { getErrorMessage } from "../lib/getErrorMessage";
 
 export default function ConsumerJobBidsScreen() {
   const router = useRouter();
@@ -48,7 +49,7 @@ export default function ConsumerJobBidsScreen() {
               await acceptBid(bid.id);
               Alert.alert("Success", "Bid accepted!");
             } catch (err: any) {
-              Alert.alert("Error", err);
+              Alert.alert("Error", getErrorMessage(err, "Failed to accept bid"));
             }
           },
         },
@@ -70,7 +71,7 @@ export default function ConsumerJobBidsScreen() {
               await rejectBid(bid.id);
               Alert.alert("Success", "Bid rejected");
             } catch (err: any) {
-              Alert.alert("Error", err);
+              Alert.alert("Error", getErrorMessage(err, "Failed to reject bid"));
             }
           },
         },

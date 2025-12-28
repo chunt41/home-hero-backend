@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
+  Linking,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -15,7 +16,7 @@ import { api } from "../../../src/lib/apiClient";
 type Attachment = {
   id: number;
   url: string;
-  type: string;
+  type: string | null;
   createdAt: string;
 };
 
@@ -171,6 +172,24 @@ export default function ConsumerJobDetailScreen() {
     router.push(`/messages/${jobId}`);
   }, [jobId]);
 
+  const goToAddAttachment = useCallback(() => {
+    router.push(`/consumer/add-attachment?jobId=${jobId}`);
+  }, [jobId]);
+
+  const goToLeaveReview = useCallback(() => {
+    router.push(`/consumer/leave-review?jobId=${jobId}`);
+  }, [jobId]);
+
+  const goToReportJob = useCallback(() => {
+    if (!job) return;
+    router.push(`/report?type=JOB&targetId=${job.id}`);
+  }, [job]);
+
+  const goToReportAwardedProvider = useCallback(() => {
+    if (!job?.awardedBid?.provider?.id) return;
+    router.push(`/report?type=USER&targetId=${job.awardedBid.provider.id}`);
+  }, [job]);
+
   return (
     <SafeAreaView style={styles.container} edges={["top"]}>
       <View style={styles.header}>
@@ -281,6 +300,62 @@ export default function ConsumerJobDetailScreen() {
             <Text style={styles.body}>{job.description ?? "(no description)"}</Text>
           </View>
 
+          {/* Attachments */}
+          <View style={styles.card}>
+            <Text style={styles.sectionTitle}>Attachments</Text>
+
+            {job.attachments?.length ? (
+              job.attachments.map((a) => (
+                <Pressable
+                  key={a.id}
+                  onPress={() => Linking.openURL(a.url)}
+                  style={styles.attachmentRow}
+                >
+                  <Text style={styles.attachmentText} numberOfLines={1}>
+                    {a.type ? `${a.type}: ` : ""}
+                    {a.url}
+                  </Text>
+                </Pressable>
+              ))
+            ) : (
+              <Text style={styles.bodyMuted}>No attachments yet.</Text>
+            )}
+
+            <Pressable style={styles.secondaryBtnWide} onPress={goToAddAttachment}>
+              <Text style={styles.secondaryText}>Add Attachment</Text>
+            </Pressable>
+          </View>
+
+          {/* Review */}
+          {job.status === "COMPLETED" && job.awardedBid ? (
+            <View style={styles.card}>
+              <Text style={styles.sectionTitle}>Review Provider</Text>
+              <Text style={styles.bodyMuted}>
+                Leave or update your review for the awarded provider.
+              </Text>
+              <Pressable style={styles.primaryBtn} onPress={goToLeaveReview}>
+                <Text style={styles.primaryText}>Leave Review</Text>
+              </Pressable>
+            </View>
+          ) : null}
+
+          {/* Safety */}
+          <View style={styles.card}>
+            <Text style={styles.sectionTitle}>Safety</Text>
+            <Pressable style={styles.dangerBtn} onPress={goToReportJob}>
+              <Text style={styles.dangerText}>Report Job</Text>
+            </Pressable>
+
+            {job.awardedBid ? (
+              <Pressable
+                style={[styles.dangerBtn, { marginTop: 10 }]}
+                onPress={goToReportAwardedProvider}
+              >
+                <Text style={styles.dangerText}>Report Awarded Provider</Text>
+              </Pressable>
+            ) : null}
+          </View>
+
           {/* ✅ Lifecycle actions */}
           <View style={styles.card}>
             <Text style={styles.sectionTitle}>Job Actions</Text>
@@ -376,6 +451,17 @@ const styles = StyleSheet.create({
   bodyStrong: { color: "#fff", fontSize: 16, fontWeight: "900" },
   bodyMuted: { color: "#94a3b8", fontSize: 13, lineHeight: 18 },
   metaSmall: { color: "#94a3b8", marginTop: 8, fontSize: 12 },
+
+  attachmentRow: {
+    paddingVertical: 10,
+    paddingHorizontal: 10,
+    backgroundColor: "#020617",
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "#1e293b",
+    marginTop: 10,
+  },
+  attachmentText: { color: "#e2e8f0", fontWeight: "800" },
 
   providerRow: { flexDirection: "row", alignItems: "flex-start", gap: 10, marginTop: 6 },
 

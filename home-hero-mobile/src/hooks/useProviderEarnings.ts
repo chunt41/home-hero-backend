@@ -27,9 +27,10 @@ export function useProviderEarnings() {
     setLoading(true);
     setError(null);
     try {
-      const bidsRes = await api.get<any>(`/debug/provider-bids?providerId=2`);
-      const bids: any[] = bidsRes.value ?? bidsRes ?? [];
+      const bidsRes = await api.get<any>(`/provider/bids?limit=200`);
+      const bids: any[] = Array.isArray(bidsRes) ? bidsRes : bidsRes?.items || [];
 
+      // Only count accepted bids with jobs that are COMPLETED
       const completed = bids.filter(
         (bid: any) =>
           String(bid.status).toUpperCase() === "ACCEPTED" &&

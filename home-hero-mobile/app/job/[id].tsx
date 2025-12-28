@@ -302,6 +302,16 @@ export default function ProviderJobDetailScreen() {
             </View>
           ) : null}
 
+          <View style={styles.card}>
+            <Text style={styles.sectionTitle}>Safety</Text>
+            <Pressable
+              style={styles.dangerBtn}
+              onPress={() => router.push(`/report?type=JOB&targetId=${job.id}`)}
+            >
+              <Text style={styles.dangerText}>Report Job</Text>
+            </Pressable>
+          </View>
+
           <View style={styles.actionsRow}>
             <Pressable
               style={[styles.primaryBtn, editBidDisabled && styles.btnDisabled]}
@@ -378,4 +388,13 @@ const styles = StyleSheet.create({
   btnDisabled: { opacity: 0.6 },
 
   hint: { color: "#93c5fd", marginTop: 10, fontSize: 12 },
+
+  dangerBtn: {
+    backgroundColor: "#ef4444",
+    padding: 14,
+    borderRadius: 12,
+    alignItems: "center",
+    marginTop: 10,
+  },
+  dangerText: { color: "#0b1220", fontWeight: "900" },
 });

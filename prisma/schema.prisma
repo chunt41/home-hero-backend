@@ -39,6 +39,9 @@ model User {
   reviewsReceived             Review[]              @relation("ProviderReviews")
   subscription                Subscription?
   subscriptionPayments        SubscriptionPayment[]
+  stripePayments              StripePayment[]
+  adRevenue                   AdRevenue[]
+  payouts                     Payout[]
 }
 
 model Job {
@@ -104,6 +107,7 @@ model Message {
   job        Job       @relation(fields: [jobId], references: [id])
   sender     User      @relation(fields: [senderId], references: [id])
   reports    Report[]  @relation("ReportTargetMessage")
+  attachments MessageAttachment[]
 }
 
 model ProviderProfile {
@@ -125,6 +129,7 @@ model Subscription {
   createdAt DateTime              @default(now())
   user      User                  @relation(fields: [userId], references: [id])
   payments  SubscriptionPayment[]
+  stripePayments StripePayment[]
 }
 
 model Notification {
@@ -185,13 +190,83 @@ model SubscriptionPayment {
   user           User             @relation(fields: [userId], references: [id])
 }
 
+model StripePayment {
+  id                   String           @id @default(cuid())
+  userId               Int
+  subscriptionId       Int?
+  tier                 SubscriptionTier
+  amount               Int
+  currency             String           @default("usd")
+  stripePaymentIntentId String          @unique
+  status               PaymentStatus    @default(PENDING)
+  createdAt            DateTime         @default(now())
+  updatedAt            DateTime         @updatedAt
+  subscription         Subscription?    @relation(fields: [subscriptionId], references: [id])
+  user                 User             @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model AdRevenue {
+  id         String   @id @default(cuid())
+  userId     Int
+  adFormat   String   // "banner" or "interstitial"
+  platform   String   @default("admob")
+  impressions Int     @default(0)
+  clicks     Int      @default(0)
+  revenue    Decimal  @db.Decimal(10, 4)
+  currency   String   @default("usd")
+  date       DateTime @default(now())
+  createdAt  DateTime @default(now())
+  user       User     @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@index([date])
+}
+
+model Payout {
+  id           String   @id @default(cuid())
+  userId       Int
+  type         String   // "subscription" or "ad_revenue"
+  amount       Decimal  @db.Decimal(10, 2)
+  currency     String   @default("usd")
+  status       String   @default("pending") // "pending", "processing", "completed", "failed"
+  stripePayoutId String?
+  description  String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  paidAt       DateTime?
+  user         User     @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@index([status])
+}
+
 model JobAttachment {
   id        Int      @id @default(autoincrement())
   jobId     Int
   url       String
   type      String?
+  mimeType  String?
+  filename  String?
+  sizeBytes Int?
   createdAt DateTime @default(now())
   job       Job      @relation(fields: [jobId], references: [id])
+}
+
+model MessageAttachment {
+  id        Int      @id @default(autoincrement())
+  messageId Int
+  url       String
+  mimeType  String?
+  filename  String?
+  sizeBytes Int?
+  createdAt DateTime @default(now())
+  message   Message  @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@index([messageId])
 }
 
 model Category {

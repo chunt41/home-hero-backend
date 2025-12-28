@@ -15,6 +15,8 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { useFocusEffect, useRouter } from "expo-router";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { useProviderProfile } from "../hooks/useProviderProfile";
+import { api } from "../lib/apiClient";
+import { getErrorMessage } from "../lib/getErrorMessage";
 
 const COLORS = {
   bg: "#0f172a",
@@ -53,6 +55,9 @@ export default function ProviderProfileScreen(props?: ProviderProfileScreenProps
   const [categoryModalVisible, setCategoryModalVisible] = useState(false);
   const [localSelectedCategoryIds, setLocalSelectedCategoryIds] = useState<number[]>([]);
 
+  const [isBlocked, setIsBlocked] = useState<boolean>(false);
+  const [checkingBlocked, setCheckingBlocked] = useState<boolean>(false);
+
   // Edit form state
   const [formData, setFormData] = useState({
     name: "",
@@ -69,6 +74,85 @@ export default function ProviderProfileScreen(props?: ProviderProfileScreenProps
       fetchCategories();
     }, [fetchProfile, fetchCategories])
   );
+
+  const refreshBlockedState = useCallback(async () => {
+    if (!isViewingOther) return;
+    const targetId = props?.providerId;
+    if (!targetId) return;
+
+    try {
+      setCheckingBlocked(true);
+      const blocks = await api.get<
+        { blockedUser: { id: number } }[]
+      >("/me/blocks");
+
+      const hit = Array.isArray(blocks)
+        ? blocks.some((b) => b?.blockedUser?.id === targetId)
+        : false;
+      setIsBlocked(hit);
+    } catch {
+      // ignore
+    } finally {
+      setCheckingBlocked(false);
+    }
+  }, [isViewingOther, props?.providerId]);
+
+  useFocusEffect(
+    useCallback(() => {
+      refreshBlockedState();
+    }, [refreshBlockedState])
+  );
+
+  const toggleBlock = useCallback(async () => {
+    const targetId = profile?.id;
+    if (!targetId) return;
+
+    if (isBlocked) {
+      Alert.alert(
+        "Unblock user?",
+        "They will be able to contact you again.",
+        [
+          { text: "Cancel", style: "cancel" },
+          {
+            text: "Unblock",
+            style: "destructive",
+            onPress: async () => {
+              try {
+                await api.delete(`/users/${targetId}/block`);
+                setIsBlocked(false);
+              } catch (e: any) {
+                Alert.alert(
+                  "Error",
+                  e?.message ?? "Failed to unblock user."
+                );
+              }
+            },
+          },
+        ]
+      );
+      return;
+    }
+
+    Alert.alert(
+      "Block user?",
+      "You won't receive messages or offers from this user.",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Block",
+          style: "destructive",
+          onPress: async () => {
+            try {
+              await api.post(`/users/${targetId}/block`, {});
+              setIsBlocked(true);
+            } catch (e: any) {
+              Alert.alert("Error", getErrorMessage(e, "Failed to block user."));
+            }
+          },
+        },
+      ]
+    );
+  }, [isBlocked, profile?.id]);
 
   // Initialize form when profile loads
   React.useEffect(() => {
@@ -100,7 +184,7 @@ export default function ProviderProfileScreen(props?: ProviderProfileScreenProps
       Alert.alert("Success", "Profile updated successfully");
       setEditMode(false);
     } catch (err: any) {
-      Alert.alert("Error", err.message);
+      Alert.alert("Error", getErrorMessage(err, "Failed to update profile"));
     } finally {
       setSaving(false);
     }
@@ -129,7 +213,7 @@ export default function ProviderProfileScreen(props?: ProviderProfileScreenProps
       Alert.alert("Success", "Categories updated successfully");
       setCategoryModalVisible(false);
     } catch (err: any) {
-      Alert.alert("Error", err.message);
+      Alert.alert("Error", getErrorMessage(err, "Failed to update categories"));
     } finally {
       setSaving(false);
     }
@@ -189,6 +273,31 @@ export default function ProviderProfileScreen(props?: ProviderProfileScreenProps
                 color={COLORS.accent}
               />
             </Pressable>
+
+            {isViewingOther && profile?.id ? (
+              <>
+                <Pressable
+                  onPress={() => {
+                    router.push(`/report?type=USER&targetId=${profile.id}`);
+                  }}
+                >
+                  <MaterialCommunityIcons
+                    name="flag"
+                    size={24}
+                    color={COLORS.warning}
+                  />
+                </Pressable>
+
+                <Pressable onPress={toggleBlock} disabled={checkingBlocked}>
+                  <MaterialCommunityIcons
+                    name={isBlocked ? "shield-off" : "shield"}
+                    size={24}
+                    color={isBlocked ? COLORS.danger : COLORS.accent}
+                  />
+                </Pressable>
+              </>
+            ) : null}
+
             {!isViewingOther && (
               <Pressable
                 onPress={() => {

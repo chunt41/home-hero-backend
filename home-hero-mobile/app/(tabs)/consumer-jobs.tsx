@@ -47,8 +47,9 @@ function normalizeStatus(s: string | null | undefined) {
 
 export default function ConsumerJobsScreen() {
   const { user } = useAuth();
-  const { showBannerAds, showInterstitialAds } = useAdConfig();
-  const { showAd } = useInterstitialAd();
+  const { showBannerAds, showInterstitialAds, inlineBannerEvery, showFooterBanner } =
+    useAdConfig();
+  const { showAd } = useInterstitialAd(showInterstitialAds);
 
   // Only consumers should access this screen
   if (user?.role !== "CONSUMER") {
@@ -181,10 +182,15 @@ export default function ConsumerJobsScreen() {
           </Pressable>
         )}
 
-        {/* Show banner ad every 3 items for free and basic tiers */}
-        {showBannerAds && index > 0 && index % 3 === 0 && (
-          <BannerAdComponent style={{ marginVertical: 12 }} />
-        )}
+        {showBannerAds &&
+          inlineBannerEvery &&
+          index > 0 &&
+          index % inlineBannerEvery === 0 && (
+            <BannerAdComponent
+              placement="consumer_jobs_inline"
+              style={{ marginVertical: 12 }}
+            />
+          )}
       </View>
     );
   };
@@ -269,8 +275,11 @@ export default function ConsumerJobsScreen() {
               </View>
             }
           />
-          {showBannerAds && filteredItems.length > 0 && (
-            <BannerAdComponent style={{ marginBottom: 8 }} />
+          {showBannerAds && showFooterBanner && filteredItems.length > 0 && (
+            <BannerAdComponent
+              placement="consumer_jobs_footer"
+              style={{ marginBottom: 8 }}
+            />
           )}
         </View>
       )}

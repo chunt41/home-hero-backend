@@ -82,83 +82,82 @@ export default function AnalyticsDashboardScreen() {
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>Key Metrics</Text>
 
-          <View style={styles.metricsGrid}>
-            <View style={styles.metricCard}>
-              <View style={styles.metricHeader}>
-                <MaterialCommunityIcons
-                  name="cash"
-                  size={20}
-                  color={COLORS.success}
-                />
-                <Text style={styles.metricLabel}>Total Earnings</Text>
+          <View style={styles.metricsGridRows}>
+            <View style={styles.metricsRow}>
+              <View style={styles.metricCard}>
+                <View style={styles.metricHeader}>
+                  <MaterialCommunityIcons
+                    name="cash"
+                    size={20}
+                    color={COLORS.success}
+                  />
+                  <Text style={styles.metricLabel}>Total Earnings</Text>
+                </View>
+                <Text style={styles.metricValue}>
+                  ${analytics.totalEarnings.toFixed(0)}
+                </Text>
               </View>
-              <Text style={styles.metricValue}>
-                ${analytics.totalEarnings.toFixed(0)}
-              </Text>
+              <View style={styles.metricCard}>
+                <View style={styles.metricHeader}>
+                  <MaterialCommunityIcons
+                    name="check-circle"
+                    size={20}
+                    color={COLORS.accent}
+                  />
+                  <Text style={styles.metricLabel}>Jobs Completed</Text>
+                </View>
+                <Text style={styles.metricValue}>{analytics.completedJobs}</Text>
+              </View>
+              <View style={styles.metricCard}>
+                <View style={styles.metricHeader}>
+                  <MaterialCommunityIcons
+                    name="handshake"
+                    size={20}
+                    color={COLORS.warning}
+                  />
+                  <Text style={styles.metricLabel}>Accepted Bids</Text>
+                </View>
+                <Text style={styles.metricValue}>{analytics.acceptedBids}</Text>
+              </View>
             </View>
-
-            <View style={styles.metricCard}>
-              <View style={styles.metricHeader}>
-                <MaterialCommunityIcons
-                  name="check-circle"
-                  size={20}
-                  color={COLORS.accent}
-                />
-                <Text style={styles.metricLabel}>Jobs Completed</Text>
+            <View style={styles.metricsRow}>
+              <View style={styles.metricCard}>
+                <View style={styles.metricHeader}>
+                  <MaterialCommunityIcons
+                    name="percent"
+                    size={20}
+                    color={COLORS.accent}
+                  />
+                  <Text style={styles.metricLabel}>Acceptance Rate</Text>
+                </View>
+                <Text style={styles.metricValue}>
+                  {analytics.bidAcceptanceRate}%
+                </Text>
               </View>
-              <Text style={styles.metricValue}>{analytics.completedJobs}</Text>
-            </View>
-
-            <View style={styles.metricCard}>
-              <View style={styles.metricHeader}>
-                <MaterialCommunityIcons
-                  name="handshake"
-                  size={20}
-                  color={COLORS.warning}
-                />
-                <Text style={styles.metricLabel}>Accepted Bids</Text>
+              <View style={styles.metricCard}>
+                <View style={styles.metricHeader}>
+                  <MaterialCommunityIcons
+                    name="clock-outline"
+                    size={20}
+                    color={COLORS.textMuted}
+                  />
+                  <Text style={styles.metricLabel}>Pending Bids</Text>
+                </View>
+                <Text style={styles.metricValue}>{analytics.pendingBids}</Text>
               </View>
-              <Text style={styles.metricValue}>{analytics.acceptedBids}</Text>
-            </View>
-
-            <View style={styles.metricCard}>
-              <View style={styles.metricHeader}>
-                <MaterialCommunityIcons
-                  name="percent"
-                  size={20}
-                  color={COLORS.accent}
-                />
-                <Text style={styles.metricLabel}>Acceptance Rate</Text>
+              <View style={styles.metricCard}>
+                <View style={styles.metricHeader}>
+                  <MaterialCommunityIcons
+                    name="trending-up"
+                    size={20}
+                    color={COLORS.success}
+                  />
+                  <Text style={styles.metricLabel}>Avg per Job</Text>
+                </View>
+                <Text style={styles.metricValue}>
+                  ${analytics.averageEarningsPerJob.toFixed(0)}
+                </Text>
               </View>
-              <Text style={styles.metricValue}>
-                {analytics.bidAcceptanceRate}%
-              </Text>
-            </View>
-
-            <View style={styles.metricCard}>
-              <View style={styles.metricHeader}>
-                <MaterialCommunityIcons
-                  name="clock-outline"
-                  size={20}
-                  color={COLORS.textMuted}
-                />
-                <Text style={styles.metricLabel}>Pending Bids</Text>
-              </View>
-              <Text style={styles.metricValue}>{analytics.pendingBids}</Text>
-            </View>
-
-            <View style={styles.metricCard}>
-              <View style={styles.metricHeader}>
-                <MaterialCommunityIcons
-                  name="trending-up"
-                  size={20}
-                  color={COLORS.success}
-                />
-                <Text style={styles.metricLabel}>Avg per Job</Text>
-              </View>
-              <Text style={styles.metricValue}>
-                ${analytics.averageEarningsPerJob.toFixed(0)}
-              </Text>
             </View>
           </View>
         </View>
@@ -454,10 +453,16 @@ const styles = StyleSheet.create({
   },
 
   // Metrics Grid
-  metricsGrid: {
-    flexDirection: "row",
-    flexWrap: "wrap",
+
+  metricsGridRows: {
+    flexDirection: "column",
     gap: 12,
+  },
+
+  metricsRow: {
+    flexDirection: "row",
+    gap: 12,
+    marginBottom: 0,
   },
 
   metricCard: {

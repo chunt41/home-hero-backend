@@ -1,24 +1,91 @@
 import { useCallback, useRef, useEffect } from "react";
+import { NativeModules } from "react-native";
 
 let InterstitialAd: any;
 let AdEventType: any;
 
-try {
-  const gma = require("react-native-google-mobile-ads");
-  InterstitialAd = gma.InterstitialAd;
-  AdEventType = gma.AdEventType;
-} catch (e) {
-  // Google Mobile Ads not available (e.g., in Expo Go)
-  console.log("Google Mobile Ads not available");
+function hasGoogleMobileAdsNativeModule(): boolean {
+  // When running in Expo Go / a dev client without the native module,
+  // requiring react-native-google-mobile-ads will crash. Guard first.
+  //
+  // On RN New Architecture (TurboModules), prefer __turboModuleProxy.
+  const proxy = (global as any)?.__turboModuleProxy;
+  if (typeof proxy === "function") {
+    try {
+      return Boolean(proxy("RNGoogleMobileAdsModule"));
+    } catch {
+      return false;
+    }
+  }
+
+  return Boolean((NativeModules as any)?.RNGoogleMobileAdsModule);
 }
 
-const AD_UNIT_ID = "ca-app-pub-9932102016565081/4723430710"; // Android interstitial ad unit ID
+function ensureGoogleMobileAdsLoaded(): boolean {
+  if (InterstitialAd && AdEventType) return true;
+  if (!hasGoogleMobileAdsNativeModule()) return false;
 
-export function useInterstitialAd() {
+  try {
+    const gma = require("react-native-google-mobile-ads");
+    InterstitialAd = gma.InterstitialAd;
+    AdEventType = gma.AdEventType;
+    return Boolean(InterstitialAd && AdEventType);
+  } catch {
+    return false;
+  }
+}
+
+const PROD_DEFAULT_INTERSTITIAL_UNIT_ID =
+  "ca-app-pub-9932102016565081/4723430710"; // Android interstitial ad unit ID
+const TEST_INTERSTITIAL_UNIT_ID = "ca-app-pub-3940256099942544/1033173712"; // Google-provided test ID
+
+function getInterstitialUnitId(): string {
+  const envId = (process.env.EXPO_PUBLIC_ADMOB_INTERSTITIAL_UNIT_ID ?? "").trim();
+  if (envId) return envId;
+
+  const useTestIds =
+    (process.env.EXPO_PUBLIC_ADMOB_USE_TEST_IDS ?? "").trim() === "true";
+  if (__DEV__ || useTestIds) return TEST_INTERSTITIAL_UNIT_ID;
+
+  return PROD_DEFAULT_INTERSTITIAL_UNIT_ID;
+}
+
+const AD_KEYWORDS = [
+  "tools",
+  "power tools",
+  "hand tools",
+  "hardware",
+  "home improvement",
+  "diy",
+  "workwear",
+  "boots",
+  "outdoor apparel",
+  "outdoor gear",
+  "camping",
+  "hiking",
+];
+
+export function useInterstitialAd(enabled: boolean = true) {
   const adRef = useRef<any>(null);
   const isLoadingRef = useRef(false);
+  const enabledRef = useRef(enabled);
+
+  useEffect(() => {
+    enabledRef.current = enabled;
+    if (!enabled) {
+      adRef.current = null;
+      isLoadingRef.current = false;
+    }
+  }, [enabled]);
 
   const loadAd = useCallback(async () => {
+    if (!enabledRef.current) return;
+
+    // Lazy-load Google Mobile Ads only when needed.
+    if (!ensureGoogleMobileAdsLoaded()) {
+      return;
+    }
+
     if (!InterstitialAd || isLoadingRef.current || adRef.current) {
       return;
     }
@@ -26,9 +93,12 @@ export function useInterstitialAd() {
     isLoadingRef.current = true;
 
     try {
-      const ad = InterstitialAd.createForAdRequest(AD_UNIT_ID, {
-        keywords: ["jobs", "services", "marketplace"],
+      const ad = InterstitialAd.createForAdRequest(getInterstitialUnitId(), {
+        keywords: AD_KEYWORDS,
         requestNonPersonalizedAdsOnly: false,
+        customTargeting: {
+          vertical: "tools_outdoors",
+        },
       });
 
       // Subscribe to ad events
@@ -61,7 +131,8 @@ export function useInterstitialAd() {
   }, []);
 
   const showAd = useCallback(async () => {
-    if (!InterstitialAd) {
+    if (!enabledRef.current) return;
+    if (!ensureGoogleMobileAdsLoaded() || !InterstitialAd) {
       console.log("Interstitial ads not available");
       return;
     }
@@ -81,8 +152,9 @@ export function useInterstitialAd() {
 
   // Auto-load ad on mount
   useEffect(() => {
+    if (!enabled) return;
     loadAd();
-  }, [loadAd]);
+  }, [enabled, loadAd]);
 
   return { showAd, isReady: !!adRef.current };
 }

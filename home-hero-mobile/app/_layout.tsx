@@ -1,5 +1,8 @@
+import React, { useEffect } from "react";
+import { NativeModules } from "react-native";
 import { Stack } from "expo-router";
 import { AuthProvider } from "../src/context/AuthContext";
+import { SubscriptionProvider } from "../src/context/SubscriptionContext";
 
 let StripeProvider: any = null;
 
@@ -11,21 +14,52 @@ try {
 }
 
 const STRIPE_PUBLISHABLE_KEY =
-  "pk_live_51Sinbw8MCbBWchFrU5T1o8JBARDaSNUTIc9OmP9wSQOMd43wWXcIvnWhHYhZNqs73yzlk8l6XqK8QIBNPGfTRNpr00QABmAqZL";
+  process.env.EXPO_PUBLIC_STRIPE_PUBLISHABLE_KEY?.trim() ?? "";
 
 export default function RootLayout() {
+  // Initialize Google Mobile Ads (required for reliable ad loading in dev builds).
+  useEffect(() => {
+    try {
+      // Avoid requiring the package unless the native module exists.
+      const proxy = (global as any)?.__turboModuleProxy;
+      if (typeof proxy === "function") {
+        try {
+          if (!proxy("RNGoogleMobileAdsModule")) return;
+        } catch {
+          return;
+        }
+      } else {
+        if (!(NativeModules as any)?.RNGoogleMobileAdsModule) return;
+      }
+      const gma = require("react-native-google-mobile-ads");
+      if (typeof gma?.mobileAds === "function") {
+        gma.mobileAds().initialize();
+      }
+    } catch {
+      // ignore (e.g., Expo Go or module missing)
+    }
+  }, []);
+
   const LayoutContent = (
     <AuthProvider>
-      <Stack screenOptions={{ headerShown: false }} />
+      <SubscriptionProvider>
+        <Stack screenOptions={{ headerShown: false }} />
+      </SubscriptionProvider>
     </AuthProvider>
   );
 
-  // If StripeProvider is available, wrap with it
-  if (StripeProvider) {
+  // If StripeProvider is available and we have a publishable key, wrap with it.
+  if (StripeProvider && STRIPE_PUBLISHABLE_KEY) {
     return (
       <StripeProvider publishableKey={STRIPE_PUBLISHABLE_KEY}>
         {LayoutContent}
       </StripeProvider>
+    );
+  }
+
+  if (StripeProvider && !STRIPE_PUBLISHABLE_KEY) {
+    console.warn(
+      "Stripe publishable key missing: set EXPO_PUBLIC_STRIPE_PUBLISHABLE_KEY to enable payments"
     );
   }
 

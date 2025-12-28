@@ -22,9 +22,32 @@ const pool = new Pool({
 const adapter = new PrismaPg(pool);
 const prisma = new PrismaClient({ adapter });
 
+
+const bcrypt = require("bcryptjs");
+
 async function main() {
   // sanity check: if this fails, it's purely pg/TLS, not Prisma
   await pool.query("SELECT 1");
+
+  // Seed admin user if not exists
+  const adminEmail = "sarah@example.com";
+  const adminPassword = "password123";
+  const adminName = "Sarah Admin";
+  const existing = await prisma.user.findUnique({ where: { email: adminEmail } });
+  if (!existing) {
+    const passwordHash = await bcrypt.hash(adminPassword, 10);
+    await prisma.user.create({
+      data: {
+        name: adminName,
+        email: adminEmail,
+        passwordHash,
+        role: "ADMIN",
+      },
+    });
+    console.log(`✅ Admin user created: ${adminEmail} / ${adminPassword}`);
+  } else {
+    console.log(`ℹ️  Admin user already exists: ${adminEmail}`);
+  }
 
   await prisma.webhookEndpoint.create({
     data: {

@@ -1,4 +1,4 @@
-import { API_BASE_URL } from "../config";
+import { api } from "./apiClient";
 
 export type AuthResponse =
   | { token: string }
@@ -10,29 +10,8 @@ export async function apiPost<T>(
   body: unknown,
   token?: string
 ): Promise<T> {
-  const res = await fetch(`${API_BASE_URL}${path}`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-    },
-    body: JSON.stringify(body),
-  });
-
-  const text = await res.text();
-  let data: any = null;
-  try {
-    data = text ? JSON.parse(text) : null;
-  } catch {
-    // ignore JSON parse errors
-  }
-
-  if (!res.ok) {
-    const msg =
-      (data && (data.error || data.message)) ||
-      `Request failed (${res.status})`;
-    throw new Error(msg);
-  }
-
-  return data as T;
+  // NOTE: token param is retained for backwards compatibility but is currently ignored.
+  // The canonical client reads the auth token from SecureStore.
+  void token;
+  return api.post<T>(path, body);
 }

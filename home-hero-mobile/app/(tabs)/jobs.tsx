@@ -59,8 +59,9 @@ function buildQuery(params: Record<string, string | number | null | undefined>) 
 
 export default function JobsScreen() {
   const { user } = useAuth();
-  const { showBannerAds, showInterstitialAds } = useAdConfig();
-  const { showAd } = useInterstitialAd();
+  const { showBannerAds, showInterstitialAds, inlineBannerEvery, showFooterBanner } =
+    useAdConfig();
+  const { showAd } = useInterstitialAd(showInterstitialAds);
 
   // Only providers should access this screen
   if (user?.role !== "PROVIDER") {
@@ -281,10 +282,12 @@ export default function JobsScreen() {
           </Text>
         </Pressable>
 
-        {/* Show banner ad every 3 items for free and basic tiers */}
-        {showBannerAds && index > 0 && index % 3 === 0 && (
-          <BannerAdComponent style={{ marginVertical: 12 }} />
-        )}
+        {showBannerAds &&
+          inlineBannerEvery &&
+          index > 0 &&
+          index % inlineBannerEvery === 0 && (
+            <BannerAdComponent placement="jobs_inline" style={{ marginVertical: 12 }} />
+          )}
       </View>
     );
   };
@@ -372,8 +375,8 @@ export default function JobsScreen() {
               ) : null
             }
           />
-          {showBannerAds && items.length > 0 && (
-            <BannerAdComponent style={{ marginBottom: 8 }} />
+          {showBannerAds && showFooterBanner && items.length > 0 && (
+            <BannerAdComponent placement="jobs_footer" style={{ marginBottom: 8 }} />
           )}
         </View>
       )}

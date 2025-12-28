@@ -16,32 +16,26 @@ import { formatDistanceToNow } from "date-fns";
 export default function NotificationsScreen() {
   const router = useRouter();
   const {
-    notifications,
+    items,
     loading,
     refreshing,
     error,
-    unreadCount,
-    fetchNotifications,
-    markAsRead,
-    markAllAsRead,
-    nextCursor,
+    refetch,
+    markRead,
+    markAllRead,
   } = useNotifications();
+
+  const unreadCount = items.reduce((acc, n) => acc + (n.isRead ? 0 : 1), 0);
 
   useFocusEffect(
     useCallback(() => {
-      fetchNotifications("initial");
-    }, [fetchNotifications])
+      refetch();
+    }, [refetch])
   );
 
   const onRefresh = useCallback(() => {
-    fetchNotifications("refresh");
-  }, [fetchNotifications]);
-
-  const onEndReached = useCallback(() => {
-    if (nextCursor) {
-      fetchNotifications("more");
-    }
-  }, [nextCursor, fetchNotifications]);
+    refetch();
+  }, [refetch]);
 
   const getNotificationIcon = (type: string) => {
     switch (type) {
@@ -93,7 +87,7 @@ export default function NotificationsScreen() {
         ]}
         onPress={() => {
           if (!item.isRead) {
-            markAsRead(item.id);
+            markRead(item.id);
           }
         }}
       >
@@ -126,7 +120,7 @@ export default function NotificationsScreen() {
     );
   };
 
-  const isEmpty = notifications.length === 0 && !loading;
+  const isEmpty = items.length === 0 && !loading;
 
   return (
     <SafeAreaView style={styles.container} edges={["top"]}>
@@ -135,7 +129,7 @@ export default function NotificationsScreen() {
         {unreadCount > 0 && (
           <Pressable
             style={styles.markAllBtn}
-            onPress={markAllAsRead}
+            onPress={markAllRead}
           >
             <Text style={styles.markAllBtnText}>Mark All as Read</Text>
           </Pressable>
@@ -156,7 +150,7 @@ export default function NotificationsScreen() {
           <Text style={styles.errorText}>{error}</Text>
           <Pressable
             style={styles.retryBtn}
-            onPress={() => fetchNotifications("initial")}
+            onPress={refetch}
           >
             <Text style={styles.retryText}>Retry</Text>
           </Pressable>
@@ -170,11 +164,9 @@ export default function NotificationsScreen() {
         </View>
       ) : (
         <FlatList
-          data={notifications}
+          data={items}
           keyExtractor={(item) => String(item.id)}
           renderItem={renderNotification}
-          onEndReached={onEndReached}
-          onEndReachedThreshold={0.4}
           refreshing={refreshing}
           onRefresh={onRefresh}
           contentContainerStyle={
@@ -192,13 +184,6 @@ export default function NotificationsScreen() {
                 We'll notify you when something happens
               </Text>
             </View>
-          }
-          ListFooterComponent={
-            nextCursor ? (
-              <View style={styles.footerLoader}>
-                <ActivityIndicator size="small" color="#38bdf8" />
-              </View>
-            ) : null
           }
         />
       )}

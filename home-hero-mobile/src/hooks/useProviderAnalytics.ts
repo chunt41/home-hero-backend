@@ -71,61 +71,48 @@ export function useProviderAnalytics() {
       const recentJobsList: AnalyticsData["recentJobs"] = [];
 
       for (const bid of bids.slice(0, 100)) {
-        try {
-          const jobRes = await api.get<any>(`/provider/jobs/${bid.jobId}`);
-          const job = jobRes?.job ?? jobRes;
+        const job = bid.job;
+        if (!job || !job.id) {
+          console.warn("Skipping bid with missing job object:", bid);
+          continue;
+        }
+        const bidAmount = bid.counterOffer?.amount || bid.amount || 0;
+        const isAccepted = String(bid.status || "").toUpperCase() === "ACCEPTED";
+        const isCompleted = String(job.status || "").toUpperCase() === "COMPLETED";
 
-          if (job) {
-            const bidAmount = bid.counterOffer?.amount || bid.amount || 0;
+        // Only count accepted bids with COMPLETED jobs
+        if (isAccepted && isCompleted) {
+          totalEarnings += bidAmount;
+          completedCount++;
 
-            // Track earnings
-            if (String(bid.status || "").toUpperCase() === "ACCEPTED") {
-              totalEarnings += bidAmount;
-
-              // Calculate month key for earnings by month
-              if (job.updatedAt || job.createdAt) {
-                const date = new Date(job.updatedAt || job.createdAt);
-                const monthKey = date.toLocaleString("default", {
-                  month: "short",
-                  year: "2-digit",
-                });
-                earningsMap[monthKey] =
-                  (earningsMap[monthKey] || 0) + bidAmount;
-              }
-            }
-
-            // Count completed jobs
-            if (String(job.status || "").toUpperCase() === "COMPLETED") {
-              completedCount++;
-            }
-
-            // Track categories
-            if (job.categoryName) {
-              categoryMap[job.categoryName] =
-                (categoryMap[job.categoryName] || 0) + 1;
-            } else if (job.category?.name) {
-              categoryMap[job.category.name] =
-                (categoryMap[job.category.name] || 0) + 1;
-            }
-
-            // Add to recent jobs
-            if (recentJobsList.length < 10) {
-              recentJobsList.push({
-                id: job.id,
-                title: job.title,
-                bidAmount,
-                status: job.status,
-                completedAt:
-                  String(job.status || "").toUpperCase() === "COMPLETED"
-                    ? job.updatedAt || job.createdAt
-                    : undefined,
-                categoryName: job.categoryName || job.category?.name,
-              });
-            }
+          // Calculate month key for earnings by month
+          if (job.updatedAt || job.createdAt) {
+            const date = new Date(job.updatedAt || job.createdAt);
+            const monthKey = date.toLocaleString("default", {
+              month: "short",
+              year: "2-digit",
+            });
+            earningsMap[monthKey] = (earningsMap[monthKey] || 0) + bidAmount;
           }
-        } catch (err) {
-          // Skip if individual job fetch fails
-          console.error(`Failed to fetch job ${bid.jobId}:`, err);
+        }
+
+        // Track categories (all jobs)
+        if (job.categoryName) {
+          categoryMap[job.categoryName] = (categoryMap[job.categoryName] || 0) + 1;
+        } else if (job.category?.name) {
+          categoryMap[job.category.name] = (categoryMap[job.category.name] || 0) + 1;
+        }
+
+        // Add to recent jobs (all jobs)
+        if (recentJobsList.length < 10) {
+          recentJobsList.push({
+            id: job.id,
+            title: job.title,
+            bidAmount,
+            status: job.status,
+            completedAt: isCompleted ? job.updatedAt || job.createdAt : undefined,
+            categoryName: job.categoryName || job.category?.name,
+          });
         }
       }
 

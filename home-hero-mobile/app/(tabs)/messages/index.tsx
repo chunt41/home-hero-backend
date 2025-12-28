@@ -7,6 +7,7 @@ import {
   View,
   RefreshControl,
 } from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
 import { useFocusEffect, router } from "expo-router";
 import { api } from "../../../src/lib/apiClient";
 
@@ -163,16 +164,19 @@ export default function MessagesIndexScreen() {
 
   if (loading) {
     return (
-      <View style={{ flex: 1, alignItems: "center", justifyContent: "center" }}>
+      <SafeAreaView
+        style={{ flex: 1, alignItems: "center", justifyContent: "center", backgroundColor: "#fff" }}
+        edges={["top"]}
+      >
         <ActivityIndicator />
         <Text style={{ marginTop: 8 }}>Loading inbox…</Text>
-      </View>
+      </SafeAreaView>
     );
   }
 
   if (error && threads.length === 0) {
     return (
-      <View style={{ flex: 1, padding: 16, gap: 12 }}>
+      <SafeAreaView style={{ flex: 1, padding: 16, gap: 12, backgroundColor: "#fff" }} edges={["top"]}>
         <Text style={{ fontSize: 16, fontWeight: "700" }}>Couldn’t load messages</Text>
         <Text>{error}</Text>
         <Pressable
@@ -181,12 +185,12 @@ export default function MessagesIndexScreen() {
         >
           <Text>Retry</Text>
         </Pressable>
-      </View>
+      </SafeAreaView>
     );
   }
 
   return (
-    <View style={{ flex: 1, padding: 16 }}>
+    <SafeAreaView style={{ flex: 1, padding: 16, backgroundColor: "#fff" }} edges={["top"]}>
       <FlatList
         data={threads}
         keyExtractor={(t) => String(t.job.id)}
@@ -220,6 +224,6 @@ export default function MessagesIndexScreen() {
           )
         }
       />
-    </View>
+    </SafeAreaView>
   );
 }

@@ -8,6 +8,9 @@ import type { Request, Response, NextFunction } from "express";
 import { AdminActionType } from "@prisma/client";
 import { roleRateLimit } from "./middleware/rateLimit";
 import * as crypto from "crypto";
+import multer from "multer";
+import * as fs from "fs";
+import * as path from "path";
 import fetch from "node-fetch";
 import { startWebhookWorker } from "./webhooks/worker";
 import { authMiddleware } from "./middleware/authMiddleware";
@@ -80,8 +83,13 @@ if (process.env.NODE_ENV !== "production") {
 
 const app = express();
 app.set("etag", false);
+app.set("trust proxy", true);
 const PORT = env.PORT;
 const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-change-me";
+
+app.get("/health", (_req, res) => {
+  res.json({ ok: true });
+});
 
 // --- Middlewares ---
 const allowedOrigins =
@@ -118,11 +126,90 @@ app.use(
   })
 );
 
-app.use(
-  express.json({
-    verify: (req: any, _res, buf) => {
-      req.rawBody = buf.toString("utf8");
+const jsonParser = express.json({
+  verify: (req: any, _res, buf) => {
+    req.rawBody = buf.toString("utf8");
+  },
+});
+
+// Stripe webhooks must receive the *raw* request body for signature verification.
+// If express.json() runs first, it consumes the stream and breaks verification.
+app.use((req, res, next) => {
+  if (req.originalUrl?.startsWith("/payments/webhook")) return next();
+  return jsonParser(req, res, next);
+});
+
+// --- Uploads (attachments) ---
+const UPLOADS_DIR = path.join(process.cwd(), "uploads");
+const ATTACHMENTS_DIR = path.join(UPLOADS_DIR, "attachments");
+
+try {
+  fs.mkdirSync(ATTACHMENTS_DIR, { recursive: true });
+} catch {
+  // ignore
+}
+
+const MAX_ATTACHMENT_BYTES = Number(
+  process.env.MAX_ATTACHMENT_BYTES ?? 15 * 1024 * 1024
+);
+
+function isAllowedAttachmentMime(mime: string | undefined): boolean {
+  if (!mime) return false;
+  return mime.startsWith("image/") || mime.startsWith("video/");
+}
+
+const uploadAttachment = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, ATTACHMENTS_DIR),
+    filename: (_req, file, cb) => {
+      const original = file.originalname || "file";
+      const ext = path.extname(original).slice(0, 12);
+      const safeExt = ext && ext.startsWith(".") ? ext : "";
+      cb(null, `${crypto.randomUUID()}${safeExt}`);
     },
+  }),
+  limits: {
+    fileSize: Number.isFinite(MAX_ATTACHMENT_BYTES)
+      ? MAX_ATTACHMENT_BYTES
+      : 15 * 1024 * 1024,
+  },
+  fileFilter: (_req, file, cb) => {
+    if (!isAllowedAttachmentMime(file.mimetype)) {
+      return cb(new Error("Unsupported file type. Only images and videos are allowed."));
+    }
+    cb(null, true);
+  },
+});
+
+function uploadSingleAttachment(req: any, res: any, next: any) {
+  return uploadAttachment.single("file")(req, res, (err: any) => {
+    if (!err) return next();
+
+    const msg = String(err?.message || "");
+    const code = String(err?.code || "");
+
+    if (code === "LIMIT_FILE_SIZE" || msg.includes("File too large")) {
+      return res.status(413).json({
+        error: `Attachment exceeds size limit (${MAX_ATTACHMENT_BYTES} bytes).`,
+      });
+    }
+
+    if (msg.includes("Unsupported file type")) {
+      return res.status(415).json({ error: msg });
+    }
+
+    console.error("Upload attachment middleware error:", err);
+    return res.status(400).json({
+      error: "Invalid attachment upload.",
+    });
+  });
+}
+
+app.use(
+  "/uploads",
+  express.static(UPLOADS_DIR, {
+    etag: false,
+    maxAge: "1h",
   })
 );
 
@@ -742,6 +829,18 @@ app.post("/subscription/upgrade", authMiddleware, async (req: AuthRequest, res: 
       return res.status(401).json({ error: "Not authenticated" });
     }
 
+    // NOTE: Upgrades should normally be handled via Stripe payment confirmation
+    // (see /payments/create-intent + /payments/confirm). This manual endpoint is
+    // disabled by default to prevent bypassing payments.
+    const allowManualUpgrade =
+      String(process.env.ALLOW_MANUAL_SUBSCRIPTION_UPGRADE ?? "false") === "true";
+    if (!allowManualUpgrade) {
+      return res.status(403).json({
+        error:
+          "Manual subscription upgrades are disabled. Use /payments/create-intent and /payments/confirm.",
+      });
+    }
+
     // Only providers can upgrade
     if (req.user.role !== "PROVIDER") {
       return res.status(403).json({ error: "Only providers can upgrade subscriptions." });
@@ -1314,6 +1413,104 @@ app.post("/jobs/:jobId/attachments", authMiddleware, async (req: AuthRequest, re
     });
   }
 });
+
+// POST /jobs/:jobId/attachments/upload
+// Multipart: file=<binary>
+app.post(
+  "/jobs/:jobId/attachments/upload",
+  authMiddleware,
+  uploadSingleAttachment,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      if (!req.user) {
+        return res.status(401).json({ error: "Not authenticated" });
+      }
+
+      const jobId = Number(req.params.jobId);
+      if (Number.isNaN(jobId)) {
+        return res.status(400).json({ error: "Invalid jobId" });
+      }
+
+      const file = (req as any).file as Express.Multer.File | undefined;
+      if (!file) {
+        return res.status(400).json({ error: "file is required" });
+      }
+
+      const job = await prisma.job.findUnique({
+        where: { id: jobId },
+        select: { id: true, consumerId: true, status: true, title: true, location: true },
+      });
+
+      if (!job) {
+        return res.status(404).json({ error: "Job not found" });
+      }
+
+      if (job.consumerId !== req.user.userId) {
+        return res.status(403).json({
+          error: "You may only add attachments to jobs you created.",
+        });
+      }
+
+      const publicBase =
+        (process.env.PUBLIC_BASE_URL ?? "").trim() ||
+        `${req.protocol}://${req.get("host")}`;
+
+      const url = `${publicBase}/uploads/attachments/${file.filename}`;
+      const kind = file.mimetype.startsWith("video/") ? "video" : "image";
+
+      const attach = await prisma.jobAttachment.create({
+        data: {
+          jobId,
+          url,
+          type: kind,
+          mimeType: file.mimetype,
+          filename: file.originalname || null,
+          sizeBytes: file.size || null,
+        },
+      });
+
+      await enqueueWebhookEvent({
+        eventType: "job.attachment_added",
+        payload: {
+          attachmentId: attach.id,
+          jobId: attach.jobId,
+          addedByUserId: req.user.userId,
+          url: attach.url,
+          type: attach.type,
+          mimeType: attach.mimeType,
+          filename: attach.filename,
+          sizeBytes: attach.sizeBytes,
+          createdAt: attach.createdAt,
+          job: {
+            title: job.title,
+            status: job.status,
+            location: job.location,
+          },
+        },
+      });
+
+      return res.status(201).json({
+        message: "Attachment uploaded.",
+        attachment: attach,
+        limits: { maxBytes: MAX_ATTACHMENT_BYTES },
+      });
+    } catch (err: any) {
+      const msg = String(err?.message || "");
+      if (msg.includes("File too large")) {
+        return res.status(413).json({
+          error: `Attachment exceeds size limit (${MAX_ATTACHMENT_BYTES} bytes).`,
+        });
+      }
+      if (msg.includes("Unsupported file type")) {
+        return res.status(415).json({ error: msg });
+      }
+      console.error("POST /jobs/:jobId/attachments/upload error:", err);
+      return res.status(500).json({
+        error: "Internal server error while uploading attachment.",
+      });
+    }
+  }
+);
 
 // --- Bids: place/update bid on a job (PROVIDER only) ---
 // POST /jobs/:jobId/bids
@@ -4022,7 +4219,10 @@ app.get(
         orderBy: [{ id: "desc" }],
         take,
         ...(cursorId ? { cursor: { id: cursorId }, skip: 1 } : {}),
-        include: { sender: { select: { id: true, name: true, role: true } } },
+        include: {
+          sender: { select: { id: true, name: true, role: true } },
+          attachments: true,
+        },
       });
 
       const messagesAsc = [...page].reverse();
@@ -4036,6 +4236,7 @@ app.get(
           text: m.text,
           createdAt: m.createdAt,
           sender: m.sender,
+          attachments: (m as any).attachments ?? [],
         })),
         pageInfo: {
           limit: take,
@@ -4216,7 +4417,14 @@ app.get("/jobs/:jobId/messages/unread-count", authMiddleware, async (req: AuthRe
 
 
 // POST /jobs/:jobId/messages → send a new message on a job
-app.post("/jobs/:jobId/messages", authMiddleware, async (req: AuthRequest, res: Response) => {
+// Supports:
+// - JSON: { text: string }
+// - multipart/form-data: text=<string?>, file=<image|video>
+app.post(
+  "/jobs/:jobId/messages",
+  authMiddleware,
+  uploadSingleAttachment,
+  async (req: AuthRequest, res: Response) => {
   try {
     if (!req.user) {
       return res.status(401).json({ error: "Not authenticated" });
@@ -4227,11 +4435,14 @@ app.post("/jobs/:jobId/messages", authMiddleware, async (req: AuthRequest, res: 
       return res.status(400).json({ error: "Invalid jobId in URL." });
     }
 
-    const { text } = req.body as { text?: string };
+    const bodyText = (req.body as any)?.text;
+    const textRaw = typeof bodyText === "string" ? bodyText : "";
+    const textTrim = textRaw.trim();
 
-    if (!text || !text.trim()) {
+    const file = (req as any).file as Express.Multer.File | undefined;
+    if (!textTrim && !file) {
       return res.status(400).json({
-        error: "Message text is required and cannot be empty.",
+        error: "Message text is required unless an attachment is included.",
       });
     }
 
@@ -4286,12 +4497,37 @@ app.post("/jobs/:jobId/messages", authMiddleware, async (req: AuthRequest, res: 
       }
     }
 
-    const message = await prisma.message.create({
-      data: {
-        jobId,
-        senderId,
-        text: text.trim(),
-      },
+    const messageText = textTrim || (file ? "Attachment" : "");
+
+    const publicBase =
+      (process.env.PUBLIC_BASE_URL ?? "").trim() ||
+      `${req.protocol}://${req.get("host")}`;
+
+    const created = await prisma.$transaction(async (tx) => {
+      const message = await tx.message.create({
+        data: {
+          jobId,
+          senderId,
+          text: messageText,
+        },
+      });
+
+      let attachments: any[] = [];
+      if (file) {
+        const url = `${publicBase}/uploads/attachments/${file.filename}`;
+        const a = await tx.messageAttachment.create({
+          data: {
+            messageId: message.id,
+            url,
+            mimeType: file.mimetype,
+            filename: file.originalname || null,
+            sizeBytes: file.size || null,
+          },
+        });
+        attachments = [a];
+      }
+
+      return { message, attachments };
     });
 
     // 🔔 Determine who to notify
@@ -4329,24 +4565,45 @@ app.post("/jobs/:jobId/messages", authMiddleware, async (req: AuthRequest, res: 
     await enqueueWebhookEvent({
       eventType: "message.sent",
       payload: {
-        messageId: message.id,
+        messageId: created.message.id,
         jobId,
         senderId,
-        text: message.text,
-        createdAt: message.createdAt,
+        text: created.message.text,
+        createdAt: created.message.createdAt,
         consumerId: job.consumerId,
         notifiedUserIds,
+        attachments: created.attachments.map((a) => ({
+          id: a.id,
+          url: a.url,
+          mimeType: a.mimeType,
+          filename: a.filename,
+          sizeBytes: a.sizeBytes,
+          createdAt: a.createdAt,
+        })),
       },
     });
 
-    return res.status(201).json(message);
+    return res.status(201).json({
+      ...created.message,
+      attachments: created.attachments,
+    });
   } catch (err) {
+    const msg = String((err as any)?.message || "");
+    if (msg.includes("File too large")) {
+      return res.status(413).json({
+        error: `Attachment exceeds size limit (${MAX_ATTACHMENT_BYTES} bytes).`,
+      });
+    }
+    if (msg.includes("Unsupported file type")) {
+      return res.status(415).json({ error: msg });
+    }
     console.error("Error creating message:", err);
     return res.status(500).json({
       error: "Internal server error while creating message.",
     });
   }
-});
+  }
+);
 
 // POST /reports
 // Body: { type: "USER" | "JOB" | "MESSAGE", targetId: number, reason: string, details?: string }

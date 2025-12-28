@@ -25,6 +25,37 @@ In the output, you'll find options to open the app in a
 
 You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
 
+## Ads configuration
+
+This app uses `react-native-google-mobile-ads`.
+
+- Banner ads: set `EXPO_PUBLIC_ADMOB_BANNER_UNIT_IDS` (comma-separated) to rotate between multiple banner unit IDs.
+   - Example (single unit):
+      - `EXPO_PUBLIC_ADMOB_BANNER_UNIT_IDS=ca-app-pub-9932102016565081/9425093050`
+   - Example (multiple units for more variety):
+      - `EXPO_PUBLIC_ADMOB_BANNER_UNIT_IDS=unitA,unitB,unitC`
+- Interstitial ads: globally gated by `EXPO_PUBLIC_ENABLE_INTERSTITIAL_ADS`.
+   - `false` disables interstitials entirely.
+   - `true` enables interstitials for FREE tier only.
+
+Additional env vars:
+- `EXPO_PUBLIC_ADMOB_INTERSTITIAL_UNIT_ID` (optional override for the interstitial unit).
+- `EXPO_PUBLIC_ADMOB_USE_TEST_IDS=true` forces Google test ad unit IDs.
+
+Build-time AdMob App IDs (native config):
+- Set `ADMOB_ANDROID_APP_ID` and/or `ADMOB_IOS_APP_ID` via EAS environment variables/secrets.
+- If omitted, dev/test builds fall back to Google test App IDs.
+
+Tip: if you still see repetitive ads with a single banner unit ID, that’s usually AdMob inventory/targeting. Creating multiple banner ad units (and/or enabling mediation in AdMob) is the most reliable way to increase variety.
+
+## Payments configuration
+
+This app uses `@stripe/stripe-react-native`.
+
+- Local/dev: set `EXPO_PUBLIC_STRIPE_PUBLISHABLE_KEY` in your `.env` to enable Stripe PaymentSheet.
+- Production (EAS builds): set `EXPO_PUBLIC_STRIPE_PUBLISHABLE_KEY` as an EAS project secret so it’s available on remote builders.
+   - Helper script (Windows PowerShell): `./scripts/setup-eas-production.ps1`
+
 ## Get a fresh project
 
 When you're ready, run:

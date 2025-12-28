@@ -1,11 +1,11 @@
 import {
-  View,
   Text,
   TextInput,
   Pressable,
   StyleSheet,
   ActivityIndicator,
 } from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
 import { Link } from "expo-router";
 import { useState } from "react";
 import { useAuth } from "../../src/context/AuthContext";
@@ -32,7 +32,7 @@ export default function SignupScreen() {
   };
 
   return (
-    <View style={styles.container}>
+    <SafeAreaView style={styles.container} edges={["top"]}>
       <Text style={styles.title}>Create Account</Text>
 
       {error ? <Text style={styles.error}>{error}</Text> : null}
@@ -67,7 +67,7 @@ export default function SignupScreen() {
       <Link href="/login" style={styles.link}>
         Already have an account? Log in
       </Link>
-    </View>
+    </SafeAreaView>
   );
 }
 

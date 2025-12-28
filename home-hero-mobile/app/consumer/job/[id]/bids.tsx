@@ -329,7 +329,7 @@ export default function ConsumerJobBidsScreen() {
 
         {isAwarded && job?.status !== "OPEN" ? (
           <Text style={styles.hint}>
-            Awarded and job is {job.status}. Use “Open Messages” to coordinate.
+            Awarded and job is {job?.status ?? "—"}. Use “Open Messages” to coordinate.
           </Text>
         ) : null}
       </View>
