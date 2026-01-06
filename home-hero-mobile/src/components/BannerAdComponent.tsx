@@ -51,11 +51,15 @@ const AD_KEYWORDS = [
 ];
 
 function parseUnitIds(raw: string | undefined | null): string[] {
+  const useTestIds =
+    (process.env.EXPO_PUBLIC_ADMOB_USE_TEST_IDS ?? "").trim() === "true";
+
+  // In development builds, always use Google-provided test IDs.
+  // Real AdMob units commonly return "no-fill" during development/testing.
+  if (__DEV__ || useTestIds) return [TEST_BANNER_UNIT_ID];
+
   const s = String(raw ?? "").trim();
   if (!s) {
-    const useTestIds =
-      (process.env.EXPO_PUBLIC_ADMOB_USE_TEST_IDS ?? "").trim() === "true";
-    if (__DEV__ || useTestIds) return [TEST_BANNER_UNIT_ID];
     return [PROD_DEFAULT_BANNER_UNIT_ID];
   }
   const parts = s
@@ -63,9 +67,6 @@ function parseUnitIds(raw: string | undefined | null): string[] {
     .map((x) => x.trim())
     .filter(Boolean);
   if (parts.length) return parts;
-  const useTestIds =
-    (process.env.EXPO_PUBLIC_ADMOB_USE_TEST_IDS ?? "").trim() === "true";
-  if (__DEV__ || useTestIds) return [TEST_BANNER_UNIT_ID];
   return [PROD_DEFAULT_BANNER_UNIT_ID];
 }
 

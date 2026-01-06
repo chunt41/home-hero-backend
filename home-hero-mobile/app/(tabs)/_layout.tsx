@@ -1,5 +1,5 @@
 import { Ionicons } from "@expo/vector-icons";
-import { Redirect, Tabs } from "expo-router";
+import { Redirect, Tabs, router } from "expo-router";
 import { useAuth } from "../../src/context/AuthContext";
 import { useNotificationsBadge } from "../../src/hooks/useNotificationsBadge";
 
@@ -67,6 +67,14 @@ export default function TabLayout() {
 
       <Tabs.Screen
         name="messages"
+        listeners={{
+          tabPress: (e) => {
+            // Expo Router keeps each tab's navigation state.
+            // Force the Messages tab to always land on the inbox.
+            e.preventDefault();
+            router.replace("/messages");
+          },
+        }}
         options={{
           title: "Messages",
           tabBarIcon: ({ color, size }) => (

@@ -19,11 +19,14 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useLocalSearchParams, router, useFocusEffect } from "expo-router";
 import { api } from "../../../src/lib/apiClient";
-import * as FileSystem from "expo-file-system";
+import * as FileSystem from "expo-file-system/legacy";
+import { StatusBar } from "expo-status-bar";
 
 function getImagePicker(): any | null {
   try {
-    return require("expo-image-picker");
+    const mod = require("expo-image-picker");
+    if (!mod?.launchImageLibraryAsync) return null;
+    return mod;
   } catch {
     return null;
   }
@@ -188,8 +191,12 @@ export default function JobMessagesThreadScreen() {
         return;
       }
 
+      const mediaTypes = (ImagePicker as any).MediaType
+        ? [(ImagePicker as any).MediaType.Images, (ImagePicker as any).MediaType.Videos]
+        : (ImagePicker as any).MediaTypeOptions?.All;
+
       const result = await ImagePicker.launchImageLibraryAsync({
-        mediaTypes: ImagePicker.MediaTypeOptions.All,
+        ...(mediaTypes ? { mediaTypes } : null),
         quality: 1,
       });
 
@@ -223,7 +230,15 @@ export default function JobMessagesThreadScreen() {
 
       setPendingAttachment({ uri: asset.uri, name, mimeType, sizeBytes });
     } catch (e: any) {
-      Alert.alert("Error", e?.message ?? "Failed to pick attachment.");
+      const msg = String(e?.message ?? e);
+      if (msg.includes("ExponentImagePicker")) {
+        Alert.alert(
+          "Not available",
+          "This runtime is missing the image picker native module. If you're using Expo Go, update Expo Go and run `npx expo install expo-image-picker`, then restart with `npx expo start -c`. If you're using a development build, rebuild the dev client."
+        );
+        return;
+      }
+      Alert.alert("Error", msg || "Failed to pick attachment.");
     }
   }, [maxAttachmentBytes]);
 
@@ -823,6 +838,7 @@ export default function JobMessagesThreadScreen() {
 
   return (
     <SafeAreaView style={styles.container} edges={["top", "bottom"]}>
+      <StatusBar style="light" backgroundColor="#020617" />
       <KeyboardAvoidingView
         style={{ flex: 1 }}
         behavior={Platform.OS === "ios" ? "padding" : undefined}
@@ -1107,6 +1123,8 @@ const styles = StyleSheet.create({
     backgroundColor: "#38bdf8",
     borderRadius: 12,
     paddingHorizontal: 14,
+    paddingVertical: 10,
+    minHeight: 44,
     alignItems: "center",
     justifyContent: "center",
   },

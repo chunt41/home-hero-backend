@@ -9,13 +9,15 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useLocalSearchParams, router } from "expo-router";
-import * as FileSystem from "expo-file-system";
+import * as FileSystem from "expo-file-system/legacy";
 import { api } from "../../src/lib/apiClient";
 import { getErrorMessage } from "../../src/lib/getErrorMessage";
 
 function getImagePicker(): any | null {
   try {
-    return require("expo-image-picker");
+    const mod = require("expo-image-picker");
+    if (!mod?.launchImageLibraryAsync) return null;
+    return mod;
   } catch {
     return null;
   }
@@ -67,8 +69,12 @@ export default function AddAttachmentScreen() {
         return;
       }
 
+      const mediaTypes = (ImagePicker as any).MediaType
+        ? [(ImagePicker as any).MediaType.Images, (ImagePicker as any).MediaType.Videos]
+        : (ImagePicker as any).MediaTypeOptions?.All;
+
       const result = await ImagePicker.launchImageLibraryAsync({
-        mediaTypes: ImagePicker.MediaTypeOptions.All,
+        ...(mediaTypes ? { mediaTypes } : null),
         allowsMultipleSelection: false,
         quality: 1,
       });
@@ -108,6 +114,14 @@ export default function AddAttachmentScreen() {
         kind,
       });
     } catch (e: any) {
+      const msg = String(e?.message ?? e);
+      if (msg.includes("ExponentImagePicker")) {
+        Alert.alert(
+          "Not available",
+          "This runtime is missing the image picker native module. If you're using Expo Go, update Expo Go and run `npx expo install expo-image-picker`, then restart with `npx expo start -c`. If you're using a development build, rebuild the dev client."
+        );
+        return;
+      }
       Alert.alert("Error", getErrorMessage(e, "Failed to pick media."));
     }
   };

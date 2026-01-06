@@ -38,12 +38,6 @@ export default function SubscriptionScreen() {
   };
 
   const handleDowngrade = (tier: "FREE" | "BASIC") => {
-    // Backend currently only supports downgrading to FREE.
-    if (tier !== "FREE") {
-      Alert.alert("Not available", "Downgrading to BASIC is not supported yet.");
-      return;
-    }
-
     Alert.alert(
       `Downgrade to ${tier}`,
       `You will lose premium features. Continue?`,
@@ -93,8 +87,8 @@ export default function SubscriptionScreen() {
       return { text: "Upgrade", isUpgrade: true };
     }
 
-    // Only allow downgrading to FREE for now.
-    if (tier === "FREE" && currentTier !== "FREE") {
+    // Allow downgrading to any lower tier.
+    if (tierHierarchy < currentHierarchy) {
       return { text: "Downgrade", isUpgrade: false };
     }
 

@@ -40,11 +40,11 @@ const TIER_FEATURES = {
 };
 
 export function useSubscription() {
-  const { subscription, loading, error, fetchSubscription, downgradeToFree } =
+  const { subscription, loading, error, fetchSubscription, downgradeToTier } =
     useSubscriptionContext();
 
-  const downgradeTier = async (tier: "FREE") => {
-    await downgradeToFree();
+  const downgradeTier = async (tier: "FREE" | "BASIC") => {
+    await downgradeToTier(tier);
     return true;
   };
 

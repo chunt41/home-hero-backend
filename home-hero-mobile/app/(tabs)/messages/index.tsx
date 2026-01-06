@@ -10,6 +10,7 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useFocusEffect, router } from "expo-router";
 import { api } from "../../../src/lib/apiClient";
+import { StatusBar } from "expo-status-bar";
 
 type InboxThread = {
   job: {
@@ -128,15 +129,17 @@ export default function MessagesIndexScreen() {
         style={{
           padding: 14,
           borderRadius: 12,
-          backgroundColor: "#f5f5f5",
+          backgroundColor: "#0f172a",
           flexDirection: "row",
           alignItems: "center",
           gap: 12,
         }}
       >
         <View style={{ flex: 1 }}>
-          <Text style={{ fontSize: 16, fontWeight: "700" }}>{title}</Text>
-          <Text style={{ color: "#666", marginTop: 6 }} numberOfLines={1}>
+          <Text style={{ fontSize: 16, fontWeight: "700", color: "#fff" }}>
+            {title}
+          </Text>
+          <Text style={{ color: "#94a3b8", marginTop: 6 }} numberOfLines={1}>
             {lastText}
           </Text>
         </View>
@@ -148,12 +151,12 @@ export default function MessagesIndexScreen() {
               paddingHorizontal: 8,
               height: 24,
               borderRadius: 12,
-              backgroundColor: "#111",
+              backgroundColor: "#38bdf8",
               alignItems: "center",
               justifyContent: "center",
             }}
           >
-            <Text style={{ color: "#fff", fontWeight: "700" }}>
+            <Text style={{ color: "#020617", fontWeight: "700" }}>
               {unread > 99 ? "99+" : unread}
             </Text>
           </View>
@@ -165,46 +168,56 @@ export default function MessagesIndexScreen() {
   if (loading) {
     return (
       <SafeAreaView
-        style={{ flex: 1, alignItems: "center", justifyContent: "center", backgroundColor: "#fff" }}
+        style={{ flex: 1, alignItems: "center", justifyContent: "center", backgroundColor: "#020617" }}
         edges={["top"]}
       >
+        <StatusBar style="light" backgroundColor="#020617" />
         <ActivityIndicator />
-        <Text style={{ marginTop: 8 }}>Loading inbox…</Text>
+        <Text style={{ marginTop: 8, color: "#e2e8f0" }}>Loading inbox…</Text>
       </SafeAreaView>
     );
   }
 
   if (error && threads.length === 0) {
     return (
-      <SafeAreaView style={{ flex: 1, padding: 16, gap: 12, backgroundColor: "#fff" }} edges={["top"]}>
-        <Text style={{ fontSize: 16, fontWeight: "700" }}>Couldn’t load messages</Text>
-        <Text>{error}</Text>
+      <SafeAreaView
+        style={{ flex: 1, padding: 16, gap: 12, backgroundColor: "#020617" }}
+        edges={["top"]}
+      >
+        <StatusBar style="light" backgroundColor="#020617" />
+        <Text style={{ fontSize: 16, fontWeight: "700", color: "#fff" }}>
+          Couldn’t load messages
+        </Text>
+        <Text style={{ color: "#cbd5e1" }}>{error}</Text>
         <Pressable
           onPress={fetchFirstPage}
-          style={{ padding: 12, borderRadius: 10, backgroundColor: "#eee" }}
+          style={{ padding: 12, borderRadius: 10, backgroundColor: "#1e293b" }}
         >
-          <Text>Retry</Text>
+          <Text style={{ color: "#e2e8f0", fontWeight: "800" }}>Retry</Text>
         </Pressable>
       </SafeAreaView>
     );
   }
 
   return (
-    <SafeAreaView style={{ flex: 1, padding: 16, backgroundColor: "#fff" }} edges={["top"]}>
+    <SafeAreaView style={{ flex: 1, padding: 16, backgroundColor: "#020617" }} edges={["top"]}>
+      <StatusBar style="light" backgroundColor="#020617" />
       <FlatList
         data={threads}
         keyExtractor={(t) => String(t.job.id)}
         renderItem={renderRow}
         ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
-        ListEmptyComponent={<Text style={{ color: "#666" }}>No conversations yet.</Text>}
+        ListEmptyComponent={
+          <Text style={{ color: "#94a3b8" }}>No conversations yet.</Text>
+        }
         onEndReachedThreshold={0.4}
         onEndReached={loadMore}
         ListFooterComponent={
           loadingMore ? (
             <View style={{ paddingVertical: 16, alignItems: "center" }}>
               <ActivityIndicator />
-              <Text style={{ marginTop: 8, color: "#666" }}>Loading more…</Text>
+              <Text style={{ marginTop: 8, color: "#94a3b8" }}>Loading more…</Text>
             </View>
           ) : nextCursor ? (
             <Pressable
@@ -213,11 +226,13 @@ export default function MessagesIndexScreen() {
                 marginTop: 12,
                 padding: 12,
                 borderRadius: 10,
-                backgroundColor: "#eee",
+                backgroundColor: "#1e293b",
                 alignItems: "center",
               }}
             >
-              <Text>Load more</Text>
+              <Text style={{ color: "#e2e8f0", fontWeight: "800" }}>
+                Load more
+              </Text>
             </Pressable>
           ) : (
             <View style={{ height: 12 }} />

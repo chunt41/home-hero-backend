@@ -199,6 +199,14 @@ export default function ConsumerJobsScreen() {
     <SafeAreaView style={styles.container} edges={["top"]}>
       <Text style={styles.screenTitle}>My Jobs</Text>
 
+      {/* Consumers: exactly one banner ad at the top of this screen */}
+      {showBannerAds && (
+        <BannerAdComponent
+          placement="consumer_jobs_top"
+          style={{ marginHorizontal: 16, marginBottom: 12 }}
+        />
+      )}
+
       {/* Filter pills */}
       <View style={styles.filtersWrap}>
         {FILTERS.map((f) => {
@@ -276,10 +284,7 @@ export default function ConsumerJobsScreen() {
             }
           />
           {showBannerAds && showFooterBanner && filteredItems.length > 0 && (
-            <BannerAdComponent
-              placement="consumer_jobs_footer"
-              style={{ marginBottom: 8 }}
-            />
+            <BannerAdComponent placement="consumer_jobs_footer" style={{ marginBottom: 8 }} />
           )}
         </View>
       )}

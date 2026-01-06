@@ -25,6 +25,7 @@ type SubscriptionContextValue = {
   loading: boolean;
   error: string | null;
   fetchSubscription: () => Promise<void>;
+  downgradeToTier: (tier: "FREE" | "BASIC") => Promise<void>;
   downgradeToFree: () => Promise<void>;
 };
 
@@ -74,14 +75,25 @@ export function SubscriptionProvider({ children }: { children: React.ReactNode }
     }
   }, [token]);
 
+  const downgradeToTier = useCallback(
+    async (tier: "FREE" | "BASIC") => {
+      if (!token) {
+        throw new Error("Not authenticated");
+      }
+
+      await api.post("/subscription/downgrade", { tier });
+      await fetchSubscription();
+    },
+    [token, fetchSubscription]
+  );
+
   const downgradeToFree = useCallback(async () => {
     if (!token) {
       throw new Error("Not authenticated");
     }
 
-    await api.post("/subscription/downgrade", {});
-    await fetchSubscription();
-  }, [token, fetchSubscription]);
+    await downgradeToTier("FREE");
+  }, [token, downgradeToTier]);
 
   // Refresh subscription when auth token becomes available.
   useEffect(() => {
@@ -118,9 +130,10 @@ export function SubscriptionProvider({ children }: { children: React.ReactNode }
       loading,
       error,
       fetchSubscription,
+      downgradeToTier,
       downgradeToFree,
     }),
-    [subscription, loading, error, fetchSubscription, downgradeToFree]
+    [subscription, loading, error, fetchSubscription, downgradeToTier, downgradeToFree]
   );
 
   return (

@@ -3,6 +3,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { router } from "expo-router";
 import { useAuth } from "../../src/context/AuthContext";
 import { useSubscription } from "../../src/hooks/useSubscription";
+import { StatusBar } from "expo-status-bar";
 
 export default function ProfileScreen() {
   const { logout, user } = useAuth();
@@ -11,9 +12,16 @@ export default function ProfileScreen() {
   const isProvider = user?.role === "PROVIDER";
   return (
     <SafeAreaView
-      style={{ flex: 1, justifyContent: "center", alignItems: "center", gap: 12 }}
+      style={{
+        flex: 1,
+        justifyContent: "center",
+        alignItems: "center",
+        gap: 12,
+        backgroundColor: "#020617",
+      }}
       edges={["top"]}
     >
+      <StatusBar style="light" backgroundColor="#020617" />
       {isProvider ? (
         <>
           <View style={{ alignItems: "center", gap: 6 }}>

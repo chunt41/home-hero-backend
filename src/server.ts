@@ -926,8 +926,8 @@ app.post("/subscription/upgrade", authMiddleware, async (req: AuthRequest, res: 
   }
 });
 
-// POST /subscription/downgrade  → set my tier back to FREE
-// (Optionally: you could allow body { "tier": "FREE" }, but we'll just force FREE.)
+// POST /subscription/downgrade  → downgrade my tier (FREE by default)
+// Body: { tier?: "FREE" | "BASIC" }
 app.post("/subscription/downgrade", authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
     if (!req.user) {
@@ -940,6 +940,12 @@ app.post("/subscription/downgrade", authMiddleware, async (req: AuthRequest, res
 
     const userId = req.user.userId;
 
+    const { tier: requestedTier } = req.body as { tier?: "FREE" | "BASIC" };
+    const targetTier: "FREE" | "BASIC" = requestedTier ?? "FREE";
+    if (targetTier !== "FREE" && targetTier !== "BASIC") {
+      return res.status(400).json({ error: "tier must be FREE or BASIC" });
+    }
+
     const user = await prisma.user.findUnique({
       where: { id: userId },
       include: { subscription: true },
@@ -951,10 +957,26 @@ app.post("/subscription/downgrade", authMiddleware, async (req: AuthRequest, res
 
     const previousTier = user.subscription?.tier ?? "FREE";
 
+    const tierRank: Record<"FREE" | "BASIC" | "PRO", number> = {
+      FREE: 0,
+      BASIC: 1,
+      PRO: 2,
+    };
+
+    // Prevent using this endpoint as an upgrade path (upgrades must go through Stripe).
+    if (tierRank[targetTier] >= tierRank[previousTier]) {
+      return res.status(400).json({
+        error: `Cannot change tier from ${previousTier} to ${targetTier} via downgrade endpoint.`,
+      });
+    }
+
+    const nextRenewsAt =
+      targetTier === "FREE" ? null : user.subscription?.renewsAt ?? null;
+
     const subscription = await prisma.subscription.upsert({
       where: { userId },
-      update: { tier: "FREE", renewsAt: null },
-      create: { userId, tier: "FREE", renewsAt: null },
+      update: { tier: targetTier, renewsAt: nextRenewsAt },
+      create: { userId, tier: targetTier, renewsAt: nextRenewsAt },
     });
 
     // Webhook event
@@ -963,14 +985,14 @@ app.post("/subscription/downgrade", authMiddleware, async (req: AuthRequest, res
       payload: {
         userId,
         previousTier,
-        newTier: "FREE",
+        newTier: targetTier,
         subscriptionId: subscription.id,
         renewsAt: subscription.renewsAt,
       },
     });
 
     return res.json({
-      message: "Subscription downgraded to FREE.",
+      message: `Subscription downgraded to ${targetTier}.`,
       subscription: {
         tier: subscription.tier,
         renewsAt: subscription.renewsAt,

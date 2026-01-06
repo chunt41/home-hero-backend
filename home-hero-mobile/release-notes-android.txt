@@ -1,0 +1,28 @@
+Home Hero (Android) — Version 1.0.0 (Build 2)
+Release notes (Internal Testing)
+
+What’s new
+- Browse jobs and view job details
+- Post and manage consumer jobs
+- Providers can browse jobs and submit bids
+- In-app messaging between consumers and providers
+- Attach images/videos in message threads
+- Favorites support (save jobs/providers)
+- Subscription tiers (FREE / BASIC / PRO) with upgrade/downgrade support
+
+Ads
+- No interstitial ads
+- Consumers: a single banner ad while browsing jobs
+- Providers: banner ad visibility depends on subscription tier
+
+Fixes & improvements
+- Improved Messages screen styling (dark theme consistency)
+- Improved attachment picker stability and error handling
+- Reduced Expo SDK warnings related to media picking and file info
+
+Notes for testers
+- If you see any issues with login/signup, job loading, messaging, attachments, or subscriptions, please report:
+  - what you tapped
+  - what you expected
+  - what happened instead
+  - screenshots/screen recording if possible

@@ -1,0 +1,25 @@
+# EAS Build archive excludes
+# Keep this lean to reduce upload size and speed up builds.
+
+# Local deps / caches
+node_modules
+.expo
+
+# Platform build artifacts
+android/.gradle
+android/app/build
+android/build
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*.log
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+.vscode
+
+# Misc
+src.zip
