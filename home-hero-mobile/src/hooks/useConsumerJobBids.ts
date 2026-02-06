@@ -47,7 +47,12 @@ export function useConsumerJobBids(jobId: number) {
   const acceptBid = useCallback(
     async (bidId: number) => {
       try {
-        await api.post(`/jobs/${jobId}/bids/${bidId}/accept`, {});
+        // Prefer the unified award endpoint (falls back to legacy accept endpoint if needed).
+        try {
+          await api.post(`/jobs/${jobId}/award`, { bidId });
+        } catch (_e) {
+          await api.post(`/jobs/${jobId}/bids/${bidId}/accept`, {});
+        }
         // Update local state
         setBids((prev) =>
           prev.map((b) =>

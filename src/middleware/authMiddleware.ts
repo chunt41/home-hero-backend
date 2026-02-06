@@ -26,16 +26,40 @@ export async function authMiddleware(req: Request, res: Response, next: NextFunc
       isImpersonated?: boolean;
     };
 
-    const dbUser = await prisma.user.findUnique({
-      where: { id: decoded.userId },
-      select: {
-        id: true,
-        role: true,
-        isSuspended: true,
-        suspendedAt: true,
-        suspendedReason: true,
-      },
-    });
+    const isMissingDbColumnError = (err: any): boolean => {
+      const msg = String(err?.message ?? "");
+      return msg.includes("does not exist") && msg.includes("column");
+    };
+
+    let dbUser: any;
+    try {
+      dbUser = await prisma.user.findUnique({
+        where: { id: decoded.userId },
+        select: {
+          id: true,
+          role: true,
+          isSuspended: true,
+          suspendedAt: true,
+          suspendedReason: true,
+          emailVerifiedAt: true,
+          riskScore: true,
+          restrictedUntil: true,
+        },
+      });
+    } catch (err: any) {
+      if (!isMissingDbColumnError(err)) throw err;
+      dbUser = await prisma.user.findUnique({
+        where: { id: decoded.userId },
+        select: {
+          id: true,
+          role: true,
+          isSuspended: true,
+          suspendedAt: true,
+          suspendedReason: true,
+          emailVerifiedAt: true,
+        },
+      });
+    }
 
     if (!dbUser) return res.status(401).json({ error: "User not found for token" });
 
@@ -45,6 +69,9 @@ export async function authMiddleware(req: Request, res: Response, next: NextFunc
       isSuspended: dbUser.isSuspended,
       suspendedAt: dbUser.suspendedAt,
       suspendedReason: dbUser.suspendedReason,
+      emailVerifiedAt: dbUser.emailVerifiedAt,
+      riskScore: typeof dbUser.riskScore === "number" ? dbUser.riskScore : undefined,
+      restrictedUntil: dbUser.restrictedUntil ?? undefined,
       impersonatedByAdminId: decoded.impersonatedByAdminId,
       isImpersonated: decoded.isImpersonated,
     };

@@ -3,6 +3,8 @@ node_modules
 dist/
 .env
 .env.*
+!.env.example
+!.env.prisma.example
 npm-debug.log*
 .DS_Store
 

@@ -28,8 +28,19 @@ type ProviderItem = {
   isFavorited: boolean;
   verificationStatus?: "NONE" | "PENDING" | "VERIFIED" | "REJECTED";
   isVerified?: boolean;
+  stats?: {
+    medianResponseTimeSeconds30d?: number | null;
+  } | null;
   categories: { id: number; name: string; slug: string }[];
 };
+
+function formatMedianResponseTime(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) return "";
+  if (seconds < 60) return "<1 min";
+  if (seconds < 60 * 60) return `${Math.round(seconds / 60)} min`;
+  if (seconds < 24 * 60 * 60) return `${Math.round(seconds / 3600)} hr`;
+  return `${Math.round(seconds / 86400)} day`;
+}
 
 type ProvidersResponse = {
   page: number;
@@ -227,6 +238,12 @@ export default function ProviderDiscoveryScreen() {
                   {item.rating.toFixed(1)} ({item.reviewCount})
                 </Text>
               </View>
+            )}
+
+            {typeof item.stats?.medianResponseTimeSeconds30d === "number" && (
+              <Text style={styles.responseTime} numberOfLines={1}>
+                Typically responds in {formatMedianResponseTime(item.stats.medianResponseTimeSeconds30d)}
+              </Text>
             )}
           </View>
         </View>
@@ -617,6 +634,11 @@ const styles = StyleSheet.create({
     color: "#cbd5e1",
     fontSize: 12,
     marginBottom: 10,
+  responseTime: {
+    color: "#94a3b8",
+    fontSize: 12,
+    marginTop: 2,
+  },
   },
 
   categoriesRow: {

@@ -7,6 +7,19 @@ import express = require("express");
 import type { Request, Response, NextFunction } from "express";
 import { AdminActionType } from "@prisma/client";
 import { roleRateLimit } from "./middleware/rateLimit";
+import {
+  canAccessJobAttachment,
+  resolveDiskPathInsideUploadsDir,
+  sanitizeFilenameForHeader,
+  shouldInlineContentType,
+} from "./utils/attachmentsGuard";
+import { createGetAttachmentHandler } from "./routes/attachments";
+import { createPostJobAwardHandler } from "./routes/jobAward";
+import {
+  createPostJobConfirmCompleteHandler,
+  createPostJobMarkCompleteHandler,
+} from "./routes/jobCompletion";
+import helmet from "helmet";
 import * as crypto from "crypto";
 import multer from "multer";
 import * as fs from "fs";
@@ -15,8 +28,63 @@ import fetch from "node-fetch";
 import { startWebhookWorker } from "./webhooks/worker";
 import { authMiddleware } from "./middleware/authMiddleware";
 import { env } from "./config/env";
+import { requireAttestation } from "./middleware/requireAttestation";
+import { requireVerifiedEmail } from "./middleware/requireVerifiedEmail";
+import { sendMail } from "./services/mailer";
+import { logSecurityEvent } from "./services/securityEventLogger";
+import { logger } from "./services/logger";
+import { stripe } from "./services/stripeService";
+import {
+  createProviderAddonPaymentIntentV2,
+  type LegacyProviderAddonPurchaseRequest,
+  type ProviderAddonPurchaseRequestV2,
+} from "./services/addonPurchasesV2";
+import {
+  getLeadEntitlementsFromSubscription,
+  getUsageMonthKey,
+  ensureSubscriptionUsageIsCurrent,
+  consumeLeadIfAvailable,
+} from "./services/providerEntitlements";
+import { canOpenDispute, canReviewJob } from "./services/jobFlowGuards";
+import { requestIdMiddleware, httpAccessLogMiddleware } from "./middleware/observability";
+import { initSentry, captureException, flushSentry } from "./observability/sentry";
+import { classifyJob } from "./services/jobClassifier";
+import { suggestJobPrice } from "./services/jobPriceSuggester";
+import {
+  assessJobPostRisk,
+  assessRepeatedBidMessageRisk,
+  assessRepeatedMessageRisk,
+  decideMessageModeration,
+  computeRestrictedUntil,
+  RISK_RESTRICT_THRESHOLD,
+  RISK_REVIEW_THRESHOLD,
+} from "./services/riskScoring";
+import { z } from "zod";
+import { validate, type Validated, type ValidatedRequest } from "./middleware/validate";
+import { enqueueBackgroundJob } from "./jobs/enqueue";
+import { patchAppForAsyncErrors } from "./middleware/asyncWrap";
+import { createGlobalErrorHandler } from "./middleware/globalErrorHandler";
+import { createBasicAuthForAdminUi, createRequireAdminUiEnabled } from "./routes/adminWebhooksUiGuard";
+import { computeProviderDiscoveryRanking, normalizeZipForBoost } from "./services/providerDiscoveryRanking";
+import { recomputeProviderStatsForProvider } from "./services/providerStats";
+import { getCurrentMonthKeyUtc } from "./ai/aiGateway";
 
 let webhookWorkerStartedAt: Date | null = null;
+
+function restrictedResponse(res: Response, params: { message: string; restrictedUntil?: Date | null }) {
+  return res.status(403).json({
+    error: params.message,
+    code: "RESTRICTED",
+    restrictedUntil: params.restrictedUntil ?? null,
+  });
+}
+
+function isRestrictedUser(req: AuthRequest): boolean {
+  const until = req.user?.restrictedUntil;
+  if (!until) return false;
+  const ts = new Date(until).getTime();
+  return Number.isFinite(ts) && ts > Date.now();
+}
 
 type UserRole = "CONSUMER" | "PROVIDER" | "ADMIN";
 
@@ -26,6 +94,9 @@ type AuthUser = {
   isSuspended: boolean;               // ✅ required
   suspendedAt?: Date | null;
   suspendedReason?: string | null;
+  emailVerifiedAt?: Date | null;
+  riskScore?: number;
+  restrictedUntil?: Date | null;
   impersonatedByAdminId?: number;
   isImpersonated?: boolean;
 };
@@ -82,10 +153,140 @@ if (process.env.NODE_ENV !== "production") {
 }
 
 const app = express();
+// Ensure async route errors bubble into the single global error handler.
+patchAppForAsyncErrors(app);
 app.set("etag", false);
 app.set("trust proxy", true);
 const PORT = env.PORT;
-const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-change-me";
+const JWT_SECRET = env.JWT_SECRET;
+
+// Optional error reporting (Sentry)
+initSentry().catch(() => null);
+
+// --- Baseline HTTP hardening ---
+// Enable Helmet defaults but:
+// - manage CSP ourselves (route-specific)
+// - enable HSTS in production only
+app.use(
+  helmet({
+    contentSecurityPolicy: false,
+    strictTransportSecurity: false,
+  })
+);
+
+// Global clickjacking protection (we do not embed this app in iframes).
+app.use(helmet.frameguard({ action: "deny" }));
+
+// Explicit nosniff (Helmet sets this by default; keep explicit for clarity).
+app.use(helmet.xContentTypeOptions());
+
+// Request context (req.id + X-Request-Id) and access logs
+app.use(requestIdMiddleware);
+app.use(httpAccessLogMiddleware);
+
+// --- Health endpoints ---
+app.get("/healthz", (_req, res) => res.json({ ok: true }));
+app.get("/readyz", async (_req, res) => {
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    return res.json({ ok: true, db: true });
+  } catch (e: any) {
+    logger.warn("readyz.db_unreachable", { message: String(e?.message ?? e) });
+    return res.status(503).json({ ok: false, db: false });
+  }
+});
+
+// Transitional CSP strategy:
+// - Strict CSP for API responses (safe for JSON, file streams, etc.)
+// - /admin/webhooks/ui sets its own minimal CSP to allow inlined JS/CSS for the single-file UI.
+app.use((req, res, next) => {
+  if (req.path === "/admin/webhooks/ui") return next();
+  return helmet.contentSecurityPolicy({
+    useDefaults: true,
+    directives: {
+      "default-src": ["'none'"],
+      "base-uri": ["'none'"],
+      "frame-ancestors": ["'none'"],
+      "form-action": ["'none'"],
+      "object-src": ["'none'"],
+      "img-src": ["'self'", "data:"],
+      "script-src": ["'self'"],
+      "style-src": ["'self'"],
+      "connect-src": ["'self'"],
+    },
+  })(req, res, next);
+});
+
+// Ensure Referrer-Policy is present (Helmet also sets this by default, but we keep it explicit).
+app.use(helmet.referrerPolicy({ policy: "no-referrer" }));
+
+// Ensure Permissions-Policy is present (Helmet v8 removed permissionsPolicy middleware).
+app.use((_req, res, next) => {
+  res.setHeader(
+    "Permissions-Policy",
+    "geolocation=(), camera=(), microphone=(), payment=(), usb=()"
+  );
+  return next();
+});
+
+if (process.env.NODE_ENV === "production") {
+  app.use(
+    helmet.hsts({
+      maxAge: 15552000, // 180 days
+      includeSubDomains: true,
+      preload: true,
+    })
+  );
+}
+
+// Ensure async route handler errors are forwarded to Express error middleware.
+function asyncHandler(fn: any) {
+  return (req: any, res: any, next: any) => {
+    try {
+      const maybePromise = fn(req, res, next);
+      Promise.resolve(maybePromise).catch(next);
+    } catch (e) {
+      next(e);
+    }
+  };
+}
+
+function patchExpressForAsyncErrors(appInstance: any) {
+  const methods = ["get", "post", "put", "patch", "delete", "options", "head", "all"];
+  const wrap = (h: any) => (typeof h === "function" && h.length < 4 ? asyncHandler(h) : h);
+
+  for (const m of methods) {
+    const orig = appInstance[m];
+    if (typeof orig !== "function" || (orig as any).__asyncWrapped) continue;
+
+    const wrapped = function (this: any, ...args: any[]) {
+      if (args.length === 0) return orig.apply(this, args);
+      const pathOrHandler = args[0];
+      const rest = args.slice(1).map(wrap);
+      return orig.call(this, pathOrHandler, ...rest);
+    };
+    (wrapped as any).__asyncWrapped = true;
+    appInstance[m] = wrapped;
+  }
+
+  const origUse = appInstance.use;
+  if (typeof origUse === "function" && !(origUse as any).__asyncWrapped) {
+    const wrappedUse = function (this: any, ...args: any[]) {
+      if (args.length === 0) return origUse.apply(this, args);
+
+      if (typeof args[0] === "string" || args[0] instanceof RegExp) {
+        const [path, ...handlers] = args;
+        return origUse.call(this, path, ...handlers.map(wrap));
+      }
+
+      return origUse.call(this, ...args.map(wrap));
+    };
+    (wrappedUse as any).__asyncWrapped = true;
+    appInstance.use = wrappedUse;
+  }
+}
+
+patchExpressForAsyncErrors(app);
 
 app.get("/health", (_req, res) => {
   res.json({ ok: true });
@@ -98,14 +299,6 @@ const allowedOrigins =
     .map((s) => s.trim())
     .filter(Boolean);
 
-app.use((err: any, _req: Request, res: Response, _next: any) => {
-  if (err?.message === "CORS blocked") {
-    return res.status(403).json({ ok: false, error: "CORS blocked" });
-  }
-  return res.status(500).json({ ok: false, error: "Server error" });
-});
-
-
 app.use(
   cors({
     origin: (origin, cb) => {
@@ -114,7 +307,15 @@ app.use(
 
       // dev: allow localhost automatically
       if ((process.env.NODE_ENV ?? "development") !== "production") {
-        if (origin.includes("localhost")) return cb(null, true);
+        try {
+          const u = new URL(origin);
+          const host = (u.hostname || "").toLowerCase();
+          if (host === "localhost" || host === "127.0.0.1" || host === "::1") {
+            return cb(null, true);
+          }
+        } catch {
+          // fall through
+        }
       }
 
       // production: only allow configured origins
@@ -156,6 +357,14 @@ const MAX_ATTACHMENT_BYTES = Number(
 function isAllowedAttachmentMime(mime: string | undefined): boolean {
   if (!mime) return false;
   return mime.startsWith("image/") || mime.startsWith("video/");
+}
+
+function isAllowedVerificationMime(mime: string | undefined): boolean {
+  if (!mime) return false;
+  if (mime.startsWith("image/") || mime.startsWith("video/")) return true;
+  // Common verification docs
+  if (mime === "application/pdf") return true;
+  return false;
 }
 
 const uploadAttachment = multer({
@@ -205,12 +414,77 @@ function uploadSingleAttachment(req: any, res: any, next: any) {
   });
 }
 
-app.use(
-  "/uploads",
-  express.static(UPLOADS_DIR, {
-    etag: false,
-    maxAge: "1h",
-  })
+const uploadVerificationAttachment = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, ATTACHMENTS_DIR),
+    filename: (_req, file, cb) => {
+      const original = file.originalname || "file";
+      const ext = path.extname(original).slice(0, 12);
+      const safeExt = ext && ext.startsWith(".") ? ext : "";
+      cb(null, `${crypto.randomUUID()}${safeExt}`);
+    },
+  }),
+  limits: {
+    fileSize: Number.isFinite(MAX_ATTACHMENT_BYTES)
+      ? MAX_ATTACHMENT_BYTES
+      : 15 * 1024 * 1024,
+  },
+  fileFilter: (_req, file, cb) => {
+    if (!isAllowedVerificationMime(file.mimetype)) {
+      return cb(
+        new Error(
+          "Unsupported file type. Only images, videos, and PDFs are allowed."
+        )
+      );
+    }
+    cb(null, true);
+  },
+});
+
+function uploadSingleVerificationAttachment(req: any, res: any, next: any) {
+  return uploadVerificationAttachment.single("file")(req, res, (err: any) => {
+    if (!err) return next();
+
+    const msg = String(err?.message || "");
+    const code = String(err?.code || "");
+
+    if (code === "LIMIT_FILE_SIZE" || msg.includes("File too large")) {
+      return res.status(413).json({
+        error: `Attachment exceeds size limit (${MAX_ATTACHMENT_BYTES} bytes).`,
+      });
+    }
+
+    if (msg.includes("Unsupported file type")) {
+      return res.status(415).json({ error: msg });
+    }
+
+    console.error("Upload verification attachment middleware error:", err);
+    return res.status(400).json({
+      error: "Invalid verification attachment upload.",
+    });
+  });
+}
+
+const attachmentDownloadLimiter = roleRateLimit({
+  windowMs: 60_000,
+  limits: { UNKNOWN: 0, CONSUMER: 120, PROVIDER: 180, ADMIN: 600 },
+  message: "Too many attachment downloads. Please slow down.",
+});
+
+function attachmentPublicUrl(req: Request, attachmentId: number) {
+  const publicBase =
+    (process.env.PUBLIC_BASE_URL ?? "").trim() ||
+    `${req.protocol}://${req.get("host")}`;
+  return `${publicBase}/attachments/${attachmentId}`;
+}
+
+// GET /attachments/:id
+// Streams an attachment from disk if caller is authorized (consumer owner, provider with bid, or admin).
+app.get(
+  "/attachments/:id",
+  authMiddleware,
+  attachmentDownloadLimiter,
+  createGetAttachmentHandler({ prisma: prisma as any, uploadsDir: UPLOADS_DIR })
 );
 
 
@@ -282,6 +556,24 @@ const signupLimiter = roleRateLimit({
   message: "Too many signup attempts. Try again in a minute.",
 });
 
+const verifyEmailLimiter = roleRateLimit({
+  windowMs: 60_000,
+  limits: { UNKNOWN: 10, CONSUMER: 15, PROVIDER: 15, ADMIN: 30 },
+  message: "Too many verification attempts. Try again in a minute.",
+});
+
+const forgotPasswordLimiter = roleRateLimit({
+  windowMs: 60_000,
+  limits: { UNKNOWN: 5, CONSUMER: 10, PROVIDER: 10, ADMIN: 30 },
+  message: "Too many password reset requests. Try again in a minute.",
+});
+
+const resetPasswordLimiter = roleRateLimit({
+  windowMs: 60_000,
+  limits: { UNKNOWN: 5, CONSUMER: 10, PROVIDER: 10, ADMIN: 30 },
+  message: "Too many password reset attempts. Try again in a minute.",
+});
+
 const messageLimiter = roleRateLimit({
   windowMs: 60_000,
   limits: { UNKNOWN: 0, CONSUMER: 30, PROVIDER: 45, ADMIN: 200 },
@@ -328,6 +620,7 @@ const authAllowSuspended = async (req: AuthRequest, res: Response, next: NextFun
         isSuspended: true,
         suspendedAt: true,
         suspendedReason: true,
+        emailVerifiedAt: true,
       },
     });
 
@@ -339,6 +632,7 @@ const authAllowSuspended = async (req: AuthRequest, res: Response, next: NextFun
       isSuspended: dbUser.isSuspended,
       suspendedAt: dbUser.suspendedAt,
       suspendedReason: dbUser.suspendedReason,
+      emailVerifiedAt: dbUser.emailVerifiedAt,
     };
 
     return next();
@@ -352,7 +646,7 @@ const authAllowSuspended = async (req: AuthRequest, res: Response, next: NextFun
 async function createNotification(params: {
   userId: number;
   type: string;
-  content: string;
+  content: any;
 }) {
   const { userId, type, content } = params;
   try {
@@ -368,6 +662,96 @@ async function createNotification(params: {
     // We don't throw, because we don't want a notification failure
     // to break the main action (placing a bid, sending a message, etc.)
   }
+}
+
+const upsertPushTokenSchema = {
+  body: z.object({
+    token: z.string().trim().min(8, "token is required"),
+    platform: z.string().trim().min(1).optional().nullable(),
+  }),
+};
+
+function normalizeEmail(input: unknown): string | null {
+  if (typeof input !== "string") return null;
+  const normalized = input.trim().toLowerCase();
+  if (!normalized) return null;
+  return normalized;
+}
+
+function validatePasswordPolicy(password: unknown): string | null {
+  if (typeof password !== "string") return "Password is required.";
+  const p = password;
+  if (p.length < 12) return "Password must be at least 12 characters.";
+
+  const deny = new Set(
+    [
+      "password",
+      "password123",
+      "123456789012",
+      "qwertyuiop",
+      "letmein",
+      "welcome",
+      "adminadmin",
+      "iloveyou",
+      "111111111111",
+    ].map((s) => s.toLowerCase())
+  );
+
+  const lowered = p.trim().toLowerCase();
+  if (deny.has(lowered)) return "Password is too common.";
+
+  // Quick extra guard: reject passwords containing the word "password"
+  if (lowered.includes("password")) return "Password is too common.";
+
+  return null;
+}
+
+const emailSchema = z
+  .string()
+  .trim()
+  .toLowerCase()
+  .min(1, "Email is required")
+  .email("Invalid email");
+
+const passwordSchema = z
+  .string()
+  .min(12, "Password must be at least 12 characters")
+  .superRefine((val, ctx) => {
+    const err = validatePasswordPolicy(val);
+    if (err) ctx.addIssue({ code: z.ZodIssueCode.custom, message: err });
+  });
+
+const positiveIntSchema = z.coerce
+  .number()
+  .int("Must be an integer")
+  .positive("Must be a positive integer");
+
+const idParamsSchema = z.object({ id: positiveIntSchema });
+const userIdParamsSchema = z.object({ userId: positiveIntSchema });
+const jobIdParamsSchema = z.object({ jobId: positiveIntSchema });
+const jobBidParamsSchema = z.object({ jobId: positiveIntSchema, bidId: positiveIntSchema });
+const bidIdParamsSchema = z.object({ bidId: positiveIntSchema });
+
+const subscriptionTierSchema = z.enum(["FREE", "BASIC", "PRO"]);
+const subscriptionUpgradeTierSchema = z.enum(["BASIC", "PRO"]);
+const subscriptionDowngradeTierSchema = z.enum(["FREE", "BASIC"]);
+
+function sha256Hex(input: string): string {
+  return crypto.createHash("sha256").update(input, "utf8").digest("hex");
+}
+
+function randomToken(): string {
+  // base64url without padding
+  return crypto.randomBytes(32).toString("base64url");
+}
+
+function publicAppUrl(): string {
+  return (
+    process.env.PUBLIC_APP_URL ||
+    process.env.WEB_APP_URL ||
+    // sensible dev fallback
+    "http://localhost:8081"
+  );
 }
 
 // Simple pricing function for subscription tiers (amount in cents)
@@ -448,12 +832,36 @@ function computeNextAttempt(attempts: number) {
   return new Date(Date.now() + delaySeconds * 1000);
 }
 
+function moderateReviewText(text: string | null): { ok: true; text: string | null } | { ok: false; error: string } {
+  const trimmed = text?.trim() || "";
+  if (!trimmed) return { ok: true, text: null };
+
+  // Very small stub ruleset (expand later): block obvious PII + profanity
+  const emailRegex = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i;
+  if (emailRegex.test(trimmed)) {
+    return { ok: false, error: "Review text cannot include email addresses." };
+  }
+
+  const phoneRegex = /\b(?:\+?\d{1,3}[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)\d{3}[-.\s]?\d{4}\b/;
+  if (phoneRegex.test(trimmed)) {
+    return { ok: false, error: "Review text cannot include phone numbers." };
+  }
+
+  const profanity = ["fuck", "shit", "bitch", "cunt"]; // stub
+  const profanityRegex = new RegExp(`\\b(${profanity.map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})\\b`, "i");
+  if (profanityRegex.test(trimmed)) {
+    return { ok: false, error: "Review text contains disallowed language." };
+  }
+
+  return { ok: true, text: trimmed };
+}
+
 
 // Recompute and update a provider's average rating + review count
 async function recomputeProviderRating(providerId: number) {
   // 1) Aggregate over all reviews for this provider
   const agg = await prisma.review.aggregate({
-    where: { providerId },
+    where: { revieweeUserId: providerId },
     _avg: { rating: true },
     _count: { _all: true },
   });
@@ -534,6 +942,85 @@ function requireAdmin(req: AuthRequest, res: Response): boolean {
 
   return true;
 }
+
+// GET /admin/ai-usage (admin only)
+app.get("/admin/ai-usage", authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    if (!requireAdmin(req, res)) return;
+
+    const monthKey = getCurrentMonthKeyUtc();
+    const limit = Math.max(1, Math.min(200, Number((req.query as any)?.limit ?? 50)));
+
+    const users = await prisma.user.findMany({
+      where: {
+        aiUsageMonthKey: monthKey,
+        aiTokensUsedThisMonth: { gt: 0 },
+      },
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        role: true,
+        aiMonthlyTokenLimit: true,
+        aiTokensUsedThisMonth: true,
+        aiUsageMonthKey: true,
+        subscription: { select: { tier: true } },
+      },
+      orderBy: [{ aiTokensUsedThisMonth: "desc" }, { id: "asc" }],
+      take: limit,
+    });
+
+    const totalsByTier: Record<string, { users: number; tokensUsed: number }> = {};
+    for (const u of users) {
+      const tier = String(u.subscription?.tier ?? "FREE");
+      if (!totalsByTier[tier]) totalsByTier[tier] = { users: 0, tokensUsed: 0 };
+      totalsByTier[tier].users += 1;
+      totalsByTier[tier].tokensUsed += Number(u.aiTokensUsedThisMonth ?? 0);
+    }
+
+    const cacheTtlDays = Number(process.env.AI_CACHE_TTL_DAYS ?? 30);
+    const ttlMs = Number.isFinite(cacheTtlDays) && cacheTtlDays > 0 ? cacheTtlDays * 24 * 60 * 60 * 1000 : 0;
+    const now = new Date();
+    const cacheTotal = await prisma.aiCacheEntry.count().catch(() => 0);
+    const cacheActive = ttlMs
+      ? await prisma.aiCacheEntry
+          .count({ where: { OR: [{ expiresAt: null }, { expiresAt: { gt: now } }] } })
+          .catch(() => 0)
+      : cacheTotal;
+
+    return res.json({
+      monthKey,
+      topUsers: users.map((u) => ({
+        id: u.id,
+        name: u.name,
+        email: u.email,
+        role: u.role,
+        tier: u.subscription?.tier ?? "FREE",
+        aiMonthlyTokenLimit: u.aiMonthlyTokenLimit ?? null,
+        aiTokensUsedThisMonth: u.aiTokensUsedThisMonth ?? 0,
+      })),
+      totalsByTier,
+      cache: {
+        ttlDays: ttlMs ? cacheTtlDays : null,
+        totalEntries: cacheTotal,
+        activeEntries: cacheActive,
+      },
+    });
+  } catch (err: any) {
+    const msg = String(err?.message ?? err);
+    // Deploy-safe if the migration hasn't been applied yet.
+    if ((/column/i.test(msg) || /relation/i.test(msg)) && /does not exist/i.test(msg)) {
+      return res.json({
+        monthKey: getCurrentMonthKeyUtc(),
+        enabled: false,
+        error: "AI usage tracking schema not migrated yet.",
+      });
+    }
+
+    console.error("GET /admin/ai-usage error:", err);
+    return res.status(500).json({ error: "Internal server error." });
+  }
+});
 
 
 async function logAdminAction(args: {
@@ -640,7 +1127,11 @@ app.get("/ready", async (_req: Request, res: Response) => {
 });
 
 
-app.post("/webhooks/gogetter", verifyGoGetterWebhook(process.env.GOGETTER_WEBHOOK_SECRET!), (req: any, res: any) => {
+app.post(
+  "/webhooks/gogetter",
+  validate({ body: z.any() }),
+  verifyGoGetterWebhook(process.env.GOGETTER_WEBHOOK_SECRET!),
+  (req: any, res: any) => {
   const { deliveryId, event } = req.webhook;
 
   // idempotency: safe replays
@@ -683,7 +1174,7 @@ app.get("/categories", async (req: Request, res: Response) => {
 
 
 // TEMP: seed categories (call once, then comment out/remove)
-app.post("/dev/seed-categories", async (req: Request, res: Response) => {
+app.post("/dev/seed-categories", validate({}), async (req: Request, res: Response) => {
   try {
     await seedCategories();
     return res.json({ message: "Categories seeded." });
@@ -758,51 +1249,98 @@ app.get("/me", authAllowSuspended, async (req: AuthRequest, res: Response) => {
   }
 });
 
+// POST /me/push-token  → save Expo push token for current user (best-effort)
+app.post(
+  "/me/push-token",
+  authMiddleware,
+  requireVerifiedEmail,
+  validate(upsertPushTokenSchema),
+  async (req: (AuthRequest & ValidatedRequest<typeof upsertPushTokenSchema>), res: Response) => {
+    try {
+      if (!req.user) return res.status(401).json({ error: "Not authenticated" });
+
+      const { token, platform } = req.validated.body;
+
+      try {
+        await prisma.pushToken.upsert({
+          where: { token },
+          create: {
+            token,
+            platform: platform ?? null,
+            lastSeenAt: new Date(),
+            userId: req.user.userId,
+          },
+          update: {
+            platform: platform ?? undefined,
+            lastSeenAt: new Date(),
+            userId: req.user.userId,
+          },
+        });
+      } catch (err: any) {
+        const msg = String(err?.message ?? "");
+        // Deploy-safe: ignore if migration hasn't been applied yet.
+        if (isMissingDbColumnError(err) || /relation/i.test(msg) && /does not exist/i.test(msg)) {
+          return res.json({ ok: true, stored: false });
+        }
+        throw err;
+      }
+
+      return res.json({ ok: true, stored: true });
+    } catch (err) {
+      console.error("POST /me/push-token error:", err);
+      return res.status(500).json({ error: "Internal server error while saving push token." });
+    }
+  }
+);
+
 
 // -----------------------------
 // Subscription endpoints
 // -----------------------------
 
-// --- Subscription: get my current subscription + bid usage ---
-// GET /subscription
-app.get("/subscription", authMiddleware, async (req: AuthRequest, res: Response) => {
+async function handleGetSubscription(req: AuthRequest, res: Response) {
   try {
     if (!req.user) {
       return res.status(401).json({ error: "Not authenticated" });
     }
 
-    // 1) Find the user and their subscription
     const user = await prisma.user.findUnique({
       where: { id: req.user.userId },
-      include: { subscription: true },
+      include: { subscription: true, providerProfile: true },
     });
 
     if (!user) {
       return res.status(404).json({ error: "User not found." });
     }
 
-    const tier = user.subscription?.tier || "FREE";
+    const now = new Date();
+    const monthKey = getUsageMonthKey(now);
 
-    // 2) For FREE tier, compute bids used in last 30 days
-    let bidsUsedLast30Days: number | null = null;
-    let bidLimitPer30Days: number | null = null;
-    let remainingBids: number | null = null;
+    let entitlements:
+      | ReturnType<typeof getLeadEntitlementsFromSubscription>
+      | null = null;
 
-    if (tier === "FREE" && req.user.role === "PROVIDER") {
-      const thirtyDaysAgo = new Date();
-      thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    if (req.user.role === "PROVIDER") {
+      const sub = await prisma.$transaction(async (tx) =>
+        ensureSubscriptionUsageIsCurrent(tx, req.user!.userId, now)
+      );
 
-      const bidsLast30 = await prisma.bid.count({
-        where: {
-          providerId: req.user.userId,
-          createdAt: { gte: thirtyDaysAgo },
-        },
+      entitlements = getLeadEntitlementsFromSubscription({
+        tier: sub.tier,
+        usageMonthKey: sub.usageMonthKey || monthKey,
+        leadsUsedThisMonth: sub.leadsUsedThisMonth,
+        extraLeadCreditsThisMonth: sub.extraLeadCreditsThisMonth,
       });
-
-      bidLimitPer30Days = 5;
-      bidsUsedLast30Days = bidsLast30;
-      remainingBids = Math.max(0, bidLimitPer30Days - bidsLast30);
     }
+
+    const tier = entitlements?.tier ?? user.subscription?.tier ?? "FREE";
+
+    // Backward-compat fields used by the mobile app
+    const bidLimitPer30Days = entitlements
+      ? entitlements.baseLeadLimitThisMonth + entitlements.extraLeadCreditsThisMonth
+      : null;
+    const bidsUsedLast30Days = entitlements ? entitlements.leadsUsedThisMonth : null;
+    const remainingBids = entitlements ? entitlements.remainingLeadsThisMonth : null;
 
     return res.json({
       userId: user.id,
@@ -811,6 +1349,18 @@ app.get("/subscription", authMiddleware, async (req: AuthRequest, res: Response)
       bidLimitPer30Days,
       bidsUsedLast30Days,
       remainingBids,
+      usageMonthKey: entitlements?.usageMonthKey ?? monthKey,
+      baseLeadLimitThisMonth: entitlements?.baseLeadLimitThisMonth ?? null,
+      extraLeadCreditsThisMonth: entitlements?.extraLeadCreditsThisMonth ?? null,
+      leadsUsedThisMonth: entitlements?.leadsUsedThisMonth ?? null,
+      remainingLeadsThisMonth: entitlements?.remainingLeadsThisMonth ?? null,
+      providerAddons:
+        user.providerProfile && req.user.role === "PROVIDER"
+          ? {
+              verificationBadge: user.providerProfile.verificationBadge,
+              featuredZipCodes: user.providerProfile.featuredZipCodes,
+            }
+          : null,
     });
   } catch (err) {
     console.error("GET /subscription error:", err);
@@ -818,12 +1368,120 @@ app.get("/subscription", authMiddleware, async (req: AuthRequest, res: Response)
       .status(500)
       .json({ error: "Internal server error while fetching subscription." });
   }
+}
+
+// --- Subscription: get my current subscription + bid usage ---
+// GET /subscription
+app.get("/subscription", authMiddleware, handleGetSubscription);
+
+// GET /provider/subscription (alias)
+app.get("/provider/subscription", authMiddleware, handleGetSubscription);
+
+const purchaseAddonSchema = {
+  body: z.union([
+    // New (v2) payload expected by newer mobile clients
+    z.discriminatedUnion("addonType", [
+      z.object({ addonType: z.literal("VERIFICATION_BADGE") }),
+      z.object({ addonType: z.literal("FEATURED_ZIP"), zipCode: z.string().trim().min(1).max(16) }),
+      z.object({ addonType: z.literal("LEAD_PACK"), packSize: z.coerce.number().int().positive().max(100_000) }),
+    ]),
+    // Legacy payload (backward-compat)
+    z.discriminatedUnion("type", [
+      z.object({
+        type: z.literal("EXTRA_LEADS"),
+        quantity: z.coerce.number().int().positive().max(10_000),
+      }),
+      z.object({
+        type: z.literal("VERIFICATION_BADGE"),
+      }),
+      z.object({
+        type: z.literal("FEATURED_ZIP_CODES"),
+        zipCodes: z.array(z.string().trim().min(1).max(16)).min(1).max(50),
+      }),
+    ]),
+  ]),
+};
+
+// POST /provider/addons/purchase
+// Creates a Stripe payment intent for an add-on purchase.
+// The client should call POST /payments/confirm after Stripe succeeds.
+app.post(
+  "/provider/addons/purchase",
+  authMiddleware,
+  requireVerifiedEmail,
+  requireAttestation,
+  validate(purchaseAddonSchema),
+  async (req: AuthRequest & { validated: Validated<typeof purchaseAddonSchema> }, res: Response) => {
+    try {
+      if (!req.user) return res.status(401).json({ error: "Not authenticated" });
+      if (req.user.role !== "PROVIDER") {
+        return res.status(403).json({ error: "Only providers can purchase add-ons." });
+      }
+
+      const body = req.validated.body as any;
+      const input: ProviderAddonPurchaseRequestV2 | LegacyProviderAddonPurchaseRequest =
+        body && typeof body === "object" && "addonType" in body
+          ? (body as ProviderAddonPurchaseRequestV2)
+          : (body as LegacyProviderAddonPurchaseRequest);
+
+      const { clientSecret, paymentIntentId, addonPurchaseId } = await createProviderAddonPaymentIntentV2({
+        providerId: req.user.userId,
+        input,
+        deps: { stripe, prisma },
+      });
+
+      await logSecurityEvent(req, "provider.addon_purchase_intent_created", {
+        targetType: "USER",
+        targetId: req.user.userId,
+        addon: input,
+        paymentIntentId,
+        addonPurchaseId,
+      });
+
+      return res.json({ clientSecret, paymentIntentId });
+    } catch (err: any) {
+      console.error("POST /provider/addons/purchase error:", err);
+      return res.status(500).json({ error: "Internal server error while creating add-on purchase intent." });
+    }
+  }
+);
+
+// GET /provider/entitlements
+// Returns current provider entitlements/perks granted by add-on purchases.
+app.get("/provider/entitlements", authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    if (!req.user) return res.status(401).json({ error: "Not authenticated" });
+    if (req.user.role !== "PROVIDER") {
+      return res.status(403).json({ error: "Only providers can view entitlements." });
+    }
+
+    const ent = await prisma.providerEntitlement.upsert({
+      where: { providerId: req.user.userId },
+      update: {},
+      create: {
+        providerId: req.user.userId,
+        verificationBadge: false,
+        featuredZipCodes: [],
+        leadCredits: 0,
+      },
+    });
+
+    return res.json({ entitlements: ent });
+  } catch (err) {
+    console.error("GET /provider/entitlements error:", err);
+    return res.status(500).json({ error: "Internal server error while fetching entitlements." });
+  }
 });
 
 
 // POST /subscription/upgrade
 // Body: { tier: "BASIC" | "PRO" }
-app.post("/subscription/upgrade", authMiddleware, async (req: AuthRequest, res: Response) => {
+app.post(
+  "/subscription/upgrade",
+  authMiddleware,
+  requireVerifiedEmail,
+  validate({ body: z.object({ tier: subscriptionUpgradeTierSchema }) }),
+  async (req: AuthRequest, res: Response) => {
   try {
     if (!req.user) {
       return res.status(401).json({ error: "Not authenticated" });
@@ -846,13 +1504,7 @@ app.post("/subscription/upgrade", authMiddleware, async (req: AuthRequest, res: 
       return res.status(403).json({ error: "Only providers can upgrade subscriptions." });
     }
 
-    const { tier } = req.body as { tier?: "FREE" | "BASIC" | "PRO" };
-
-    if (!tier || (tier !== "BASIC" && tier !== "PRO")) {
-      return res.status(400).json({
-        error: "tier is required and must be either BASIC or PRO for upgrade.",
-      });
-    }
+    const { tier } = (req as any).validated.body as { tier: z.infer<typeof subscriptionUpgradeTierSchema> };
 
     const userId = req.user.userId;
 
@@ -915,6 +1567,16 @@ app.post("/subscription/upgrade", authMiddleware, async (req: AuthRequest, res: 
       },
     });
 
+    await logSecurityEvent(req, "subscription.upgraded", {
+      targetType: "SUBSCRIPTION",
+      targetId: subscription.id,
+      userId,
+      previousTier,
+      newTier: tier,
+      amountCents,
+      paymentId: payment.id,
+    });
+
     return res.json({
       message: "Subscription upgraded and payment recorded.",
       subscription,
@@ -928,7 +1590,12 @@ app.post("/subscription/upgrade", authMiddleware, async (req: AuthRequest, res: 
 
 // POST /subscription/downgrade  → downgrade my tier (FREE by default)
 // Body: { tier?: "FREE" | "BASIC" }
-app.post("/subscription/downgrade", authMiddleware, async (req: AuthRequest, res: Response) => {
+app.post(
+  "/subscription/downgrade",
+  authMiddleware,
+  requireVerifiedEmail,
+  validate({ body: z.object({ tier: subscriptionDowngradeTierSchema.optional() }) }),
+  async (req: AuthRequest, res: Response) => {
   try {
     if (!req.user) {
       return res.status(401).json({ error: "Not authenticated" });
@@ -940,11 +1607,8 @@ app.post("/subscription/downgrade", authMiddleware, async (req: AuthRequest, res
 
     const userId = req.user.userId;
 
-    const { tier: requestedTier } = req.body as { tier?: "FREE" | "BASIC" };
+    const { tier: requestedTier } = (req as any).validated.body as { tier?: z.infer<typeof subscriptionDowngradeTierSchema> };
     const targetTier: "FREE" | "BASIC" = requestedTier ?? "FREE";
-    if (targetTier !== "FREE" && targetTier !== "BASIC") {
-      return res.status(400).json({ error: "tier must be FREE or BASIC" });
-    }
 
     const user = await prisma.user.findUnique({
       where: { id: userId },
@@ -991,6 +1655,14 @@ app.post("/subscription/downgrade", authMiddleware, async (req: AuthRequest, res
       },
     });
 
+    await logSecurityEvent(req, "subscription.downgraded", {
+      targetType: "SUBSCRIPTION",
+      targetId: subscription.id,
+      userId,
+      previousTier,
+      newTier: targetTier,
+    });
+
     return res.json({
       message: `Subscription downgraded to ${targetTier}.`,
       subscription: {
@@ -1009,6 +1681,7 @@ app.post("/subscription/downgrade", authMiddleware, async (req: AuthRequest, res
 app.get(
   "/payments/subscriptions",
   authMiddleware,
+  requireVerifiedEmail,
   async (req: AuthRequest, res: Response) => {
     try {
       if (!req.user) {
@@ -1043,22 +1716,25 @@ app.get(
 // --- AUTH: SIGNUP ---
 // POST /auth/signup
 // Body: { role, name, email, password, phone?, location? }
-app.post("/auth/signup", signupLimiter, async (req, res) => {
+const signupSchema = {
+  body: z.object({
+    role: z.enum(["CONSUMER", "PROVIDER"]),
+    name: z.string().trim().min(1, "name is required"),
+    email: emailSchema,
+    password: passwordSchema,
+    phone: z.string().trim().min(1).optional(),
+    location: z.string().trim().min(1).optional(),
+  }),
+};
+
+app.post(
+  "/auth/signup",
+  signupLimiter,
+  requireAttestation,
+  validate(signupSchema),
+  async (req: ValidatedRequest<typeof signupSchema>, res) => {
   try {
-    const { role, name, email, password, phone, location } = req.body;
-
-    // Basic validation
-    if (!role || !name || !email || !password) {
-      return res.status(400).json({
-        error: "role, name, email, and password are required.",
-      });
-    }
-
-    if (role !== "CONSUMER" && role !== "PROVIDER") {
-      return res.status(400).json({
-        error: "role must be CONSUMER or PROVIDER.",
-      });
-    }
+    const { role, name, email, password, phone, location } = req.validated.body;
 
     // Check if user already exists
     const existing = await prisma.user.findUnique({
@@ -1072,7 +1748,11 @@ app.post("/auth/signup", signupLimiter, async (req, res) => {
     }
 
     // Hash password
-    const passwordHash = await bcrypt.hash(password, 10);
+    const passwordHash = await bcrypt.hash(String(password), 10);
+
+    const verifyToken = randomToken();
+    const verifyTokenHash = sha256Hex(verifyToken);
+    const verifyExpiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
 
     // Create user + subscription (+ provider profile if needed)
     const user = await prisma.user.create({
@@ -1083,6 +1763,9 @@ app.post("/auth/signup", signupLimiter, async (req, res) => {
         passwordHash,
         phone,
         location,
+        emailVerifiedAt: null,
+        emailVerificationTokenHash: verifyTokenHash,
+        emailVerificationExpiresAt: verifyExpiresAt,
         subscription: {
           create: {
             tier: "FREE",
@@ -1118,6 +1801,25 @@ app.post("/auth/signup", signupLimiter, async (req, res) => {
       },
     });
 
+    const verifyLink = `${publicAppUrl().replace(/\/$/, "")}/verify-email?token=${encodeURIComponent(
+      verifyToken
+    )}`;
+
+    await sendMail({
+      to: user.email,
+      subject: "Verify your Home Hero email",
+      text: `Welcome to Home Hero!\n\nVerify your email using this link:\n${verifyLink}\n\nIf you did not create an account, you can ignore this email.`,
+    });
+
+    await logSecurityEvent(req, "auth.signup", {
+      actorUserId: user.id,
+      actorRole: user.role,
+      actorEmail: user.email,
+      targetType: "USER",
+      targetId: user.id,
+      role: user.role,
+    });
+
     // Create JWT
     const token = jwt.sign(
       {
@@ -1136,7 +1838,9 @@ app.post("/auth/signup", signupLimiter, async (req, res) => {
         name: user.name,
         email: user.email,
         subscriptionTier: user.subscription?.tier ?? "FREE",
+        emailVerified: Boolean(user.emailVerifiedAt),
       },
+      needsEmailVerification: !user.emailVerifiedAt,
     });
   } catch (err) {
     console.error("Signup error:", err);
@@ -1144,18 +1848,79 @@ app.post("/auth/signup", signupLimiter, async (req, res) => {
   }
 });
 
+// --- AUTH: VERIFY EMAIL ---
+// POST /auth/verify-email
+// Body: { token }
+const verifyEmailSchema = {
+  body: z.object({ token: z.string().trim().min(1, "token is required") }),
+};
+
+app.post(
+  "/auth/verify-email",
+  verifyEmailLimiter,
+  requireAttestation,
+  validate(verifyEmailSchema),
+  async (req: ValidatedRequest<typeof verifyEmailSchema>, res) => {
+  try {
+    const raw = req.validated.body.token;
+
+    const tokenHash = sha256Hex(raw);
+    const now = new Date();
+
+    const user = await prisma.user.findUnique({
+      where: { emailVerificationTokenHash: tokenHash },
+      select: { id: true, email: true, emailVerifiedAt: true, emailVerificationExpiresAt: true },
+    });
+
+    if (!user || !user.emailVerificationExpiresAt || user.emailVerificationExpiresAt <= now) {
+      await logSecurityEvent(req, "auth.verify_email_failed", {
+        reason: "token_invalid_or_expired",
+      });
+      return res.status(400).json({ error: "Invalid or expired verification token." });
+    }
+
+    const updated = await prisma.user.update({
+      where: { id: user.id },
+      data: {
+        emailVerifiedAt: user.emailVerifiedAt ?? now,
+        emailVerificationTokenHash: null,
+        emailVerificationExpiresAt: null,
+      },
+      select: { id: true, email: true, emailVerifiedAt: true },
+    });
+
+    await logSecurityEvent(req, "auth.verify_email", {
+      actorUserId: updated.id,
+      actorEmail: updated.email,
+      targetType: "USER",
+      targetId: updated.id,
+    });
+
+    return res.json({ ok: true, emailVerifiedAt: updated.emailVerifiedAt });
+  } catch (err) {
+    console.error("Verify email error:", err);
+    return res.status(500).json({ error: "Internal server error during email verification." });
+  }
+});
+
 // --- AUTH: LOGIN ---
 // POST /auth/login
 // Body: { email, password }
-app.post("/auth/login", loginLimiter, async (req, res) => {
-  try {
-    const { email, password } = req.body;
+const loginSchema = {
+  body: z.object({
+    email: emailSchema,
+    password: z.string().min(1, "password is required"),
+  }),
+};
 
-    if (!email || !password) {
-      return res.status(400).json({
-        error: "email and password are required.",
-      });
-    }
+app.post(
+  "/auth/login",
+  loginLimiter,
+  requireAttestation,
+  validate(loginSchema),
+  async (req: ValidatedRequest<typeof loginSchema>, res) => {
+  try {
+    const { email, password } = req.validated.body;
 
     const user = await prisma.user.findUnique({
       where: { email },
@@ -1163,14 +1928,33 @@ app.post("/auth/login", loginLimiter, async (req, res) => {
     });
 
     if (!user) {
+      await logSecurityEvent(req, "auth.login_failed", {
+        actorEmail: email,
+        reason: "user_not_found",
+      });
       return res.status(401).json({ error: "Invalid email or password." });
     }
 
-    const isValid = await bcrypt.compare(password, user.passwordHash);
+    const isValid = await bcrypt.compare(String(password), user.passwordHash);
 
     if (!isValid) {
+      await logSecurityEvent(req, "auth.login_failed", {
+        actorUserId: user.id,
+        actorRole: user.role,
+        actorEmail: user.email,
+        reason: "bad_password",
+      });
       return res.status(401).json({ error: "Invalid email or password." });
     }
+
+    await logSecurityEvent(req, "auth.login", {
+      actorUserId: user.id,
+      actorRole: user.role,
+      actorEmail: user.email,
+      targetType: "USER",
+      targetId: user.id,
+      emailVerified: Boolean(user.emailVerifiedAt),
+    });
 
     const token = jwt.sign(
       {
@@ -1189,6 +1973,7 @@ app.post("/auth/login", loginLimiter, async (req, res) => {
         name: user.name,
         email: user.email,
         subscriptionTier: user.subscription?.tier ?? "FREE",
+        emailVerified: Boolean(user.emailVerifiedAt),
       },
     });
   } catch (err) {
@@ -1197,10 +1982,213 @@ app.post("/auth/login", loginLimiter, async (req, res) => {
   }
 });
 
+// --- AUTH: FORGOT PASSWORD ---
+// POST /auth/forgot-password
+// Body: { email }
+const forgotPasswordSchema = {
+  body: z.object({
+    email: emailSchema.optional(),
+  }),
+};
+
+app.post(
+  "/auth/forgot-password",
+  forgotPasswordLimiter,
+  requireAttestation,
+  validate(forgotPasswordSchema),
+  async (req: ValidatedRequest<typeof forgotPasswordSchema>, res) => {
+  try {
+    const normalizedEmail = req.validated.body.email ?? null;
+
+    // Always return ok to avoid user enumeration.
+    if (!normalizedEmail) {
+      await logSecurityEvent(req, "auth.forgot_password", { emailProvided: false });
+      return res.json({ ok: true });
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { email: normalizedEmail },
+      select: { id: true, email: true },
+    });
+
+    if (user) {
+      const token = randomToken();
+      const tokenHash = sha256Hex(token);
+      const expiresAt = new Date(Date.now() + 30 * 60 * 1000); // 30 minutes
+
+      await prisma.user.update({
+        where: { id: user.id },
+        data: {
+          passwordResetTokenHash: tokenHash,
+          passwordResetExpiresAt: expiresAt,
+        },
+      });
+
+      const resetLink = `${publicAppUrl().replace(/\/$/, "")}/reset-password?token=${encodeURIComponent(
+        token
+      )}`;
+
+      await sendMail({
+        to: user.email,
+        subject: "Reset your Home Hero password",
+        text: `We received a request to reset your password.\n\nReset using this link:\n${resetLink}\n\nIf you did not request this, you can ignore this email.`,
+      });
+
+      await logSecurityEvent(req, "auth.forgot_password", {
+        actorUserId: user.id,
+        actorEmail: user.email,
+        targetType: "USER",
+        targetId: user.id,
+      });
+    } else {
+      await logSecurityEvent(req, "auth.forgot_password", {
+        actorEmail: normalizedEmail,
+        userFound: false,
+      });
+    }
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("Forgot password error:", err);
+    return res.status(500).json({ error: "Internal server error during forgot password." });
+  }
+});
+
+// --- AUTH: RESET PASSWORD ---
+// POST /auth/reset-password
+// Body: { token, newPassword }
+const resetPasswordSchema = {
+  body: z.object({
+    token: z.string().trim().min(1, "token is required"),
+    newPassword: passwordSchema,
+  }),
+};
+
+app.post(
+  "/auth/reset-password",
+  resetPasswordLimiter,
+  requireAttestation,
+  validate(resetPasswordSchema),
+  async (req: ValidatedRequest<typeof resetPasswordSchema>, res) => {
+  try {
+    const raw = req.validated.body.token;
+    const newPassword = req.validated.body.newPassword;
+
+    const tokenHash = sha256Hex(raw);
+    const now = new Date();
+
+    const user = await prisma.user.findUnique({
+      where: { passwordResetTokenHash: tokenHash },
+      select: { id: true, email: true, passwordResetExpiresAt: true },
+    });
+
+    if (!user || !user.passwordResetExpiresAt || user.passwordResetExpiresAt <= now) {
+      await logSecurityEvent(req, "auth.reset_password_failed", {
+        reason: "token_invalid_or_expired",
+      });
+      return res.status(400).json({ error: "Invalid or expired reset token." });
+    }
+
+    const passwordHash = await bcrypt.hash(String(newPassword), 10);
+    await prisma.user.update({
+      where: { id: user.id },
+      data: {
+        passwordHash,
+        passwordResetTokenHash: null,
+        passwordResetExpiresAt: null,
+      },
+    });
+
+    await logSecurityEvent(req, "auth.reset_password", {
+      actorUserId: user.id,
+      actorEmail: user.email,
+      targetType: "USER",
+      targetId: user.id,
+    });
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("Reset password error:", err);
+    return res.status(500).json({ error: "Internal server error during reset password." });
+  }
+});
+
 // --- Jobs: create job (CONSUMER only) ---
 // POST /jobs
 // Body: { title, description, budgetMin?, budgetMax?, location? }
-app.post("/jobs", authMiddleware, async (req: AuthRequest, res: Response) => {
+const createJobSchema = {
+  body: z.object({
+    title: z.string().trim().min(1, "title is required"),
+    description: z.string().trim().min(1, "description is required"),
+    budgetMin: z.number().int().positive().optional().nullable(),
+    budgetMax: z.number().int().positive().optional().nullable(),
+    location: z.string().trim().min(1).optional().nullable(),
+  }),
+};
+
+// --- Jobs: suggested price range (CONSUMER only) ---
+// POST /jobs/suggest-price
+// Body: { title, description, location? }
+const suggestPriceSchema = {
+  body: z.object({
+    title: z.string().trim().min(1, "title is required"),
+    description: z.string().trim().min(1, "description is required"),
+    location: z.string().trim().min(1).optional().nullable(),
+  }),
+};
+
+app.post(
+  "/jobs/suggest-price",
+  authMiddleware,
+  requireVerifiedEmail,
+  requireAttestation,
+  validate(suggestPriceSchema),
+  async (req: (AuthRequest & ValidatedRequest<typeof suggestPriceSchema>), res: Response) => {
+    try {
+      if (!req.user) return res.status(401).json({ error: "Not authenticated" });
+
+      if (req.user.role !== "CONSUMER") {
+        return res.status(403).json({ error: "Only consumers can use this endpoint" });
+      }
+
+      if (isRestrictedUser(req) && !isAdmin(req)) {
+        return restrictedResponse(res, {
+          message: "Your account is temporarily restricted. Please try again later or contact support.",
+          restrictedUntil: req.user.restrictedUntil ?? null,
+        });
+      }
+
+      const { title, description, location } = req.validated.body;
+
+      const classification = await classifyJob(`${title}\n${description}`);
+      const suggestion = suggestJobPrice({
+        category: classification.category,
+        trade: classification.trade,
+        location: location ?? null,
+        title,
+        description,
+      });
+
+      return res.json({
+        classification,
+        suggestion,
+      });
+    } catch (err) {
+      console.error("POST /jobs/suggest-price error:", err);
+      return res
+        .status(500)
+        .json({ error: "Internal server error while suggesting a price range." });
+    }
+  }
+);
+
+app.post(
+  "/jobs",
+  authMiddleware,
+  requireVerifiedEmail,
+  requireAttestation,
+  validate(createJobSchema),
+  async (req: (AuthRequest & ValidatedRequest<typeof createJobSchema>), res: Response) => {
   try {
     if (!req.user) return res.status(401).json({ error: "Not authenticated" });
 
@@ -1208,23 +2196,102 @@ app.post("/jobs", authMiddleware, async (req: AuthRequest, res: Response) => {
       return res.status(403).json({ error: "Only consumers can create jobs" });
     }
 
-    const { title, description, budgetMin, budgetMax, location } = req.body;
-
-    if (!title || !description) {
-      return res.status(400).json({ error: "title and description are required." });
+    if (isRestrictedUser(req) && !isAdmin(req)) {
+      return restrictedResponse(res, {
+        message: "Your account is temporarily restricted from posting jobs. Please try again later.",
+        restrictedUntil: req.user.restrictedUntil ?? null,
+      });
     }
 
-    const job = await prisma.job.create({
-      data: {
-        title,
-        description,
-        budgetMin: budgetMin ?? null,
-        budgetMax: budgetMax ?? null,
-        location: location ?? null,
-        consumerId: req.user.userId,
-        status: "OPEN",
-      },
+    const { title, description, budgetMin, budgetMax, location } = req.validated.body;
+
+    const classification = await classifyJob(`${title}\n${description}`);
+    const suggestion = suggestJobPrice({
+      category: classification.category,
+      trade: classification.trade,
+      location: location ?? null,
+      title,
+      description,
     });
+
+    // Risk scoring (best-effort; does not fail the request if DB is missing new columns)
+    const risk = await assessJobPostRisk({
+      consumerId: req.user.userId,
+      title,
+      description,
+      location: location ?? null,
+    });
+
+    let job: any;
+    try {
+      job = await prisma.job.create({
+        data: {
+          title,
+          description,
+          budgetMin: budgetMin ?? null,
+          budgetMax: budgetMax ?? null,
+          location: location ?? null,
+          consumerId: req.user.userId,
+          status: "OPEN",
+          category: classification.category,
+          trade: classification.trade,
+          urgency: classification.urgency,
+          suggestedTags: classification.suggestedTags,
+          suggestedMinPrice: suggestion.suggestedMinPrice,
+          suggestedMaxPrice: suggestion.suggestedMaxPrice,
+          suggestedReason: suggestion.suggestedReason,
+          riskScore: risk.totalScore,
+        },
+      });
+    } catch (err: any) {
+      // Deploy-safe fallback if DB migration lags API deploy.
+      if (!isMissingDbColumnError(err)) throw err;
+      job = await prisma.job.create({
+        data: {
+          title,
+          description,
+          budgetMin: budgetMin ?? null,
+          budgetMax: budgetMax ?? null,
+          location: location ?? null,
+          consumerId: req.user.userId,
+          status: "OPEN",
+        },
+      });
+    }
+
+    let reviewRequired = false;
+    let restrictedUntil: Date | null = null;
+    try {
+      if (risk.totalScore >= RISK_REVIEW_THRESHOLD) {
+        reviewRequired = true;
+        // Hide from public browse; consumer can still view their own.
+        await prisma.job.update({
+          where: { id: job.id },
+          data: { isHidden: true, hiddenAt: new Date() },
+        });
+      }
+
+      if (risk.totalScore >= RISK_RESTRICT_THRESHOLD) {
+        restrictedUntil = computeRestrictedUntil();
+        await prisma.user.update({
+          where: { id: req.user.userId },
+          data: {
+            riskScore: { increment: risk.totalScore },
+            restrictedUntil,
+          },
+        });
+      } else if (risk.totalScore > 0) {
+        await prisma.user.update({
+          where: { id: req.user.userId },
+          data: {
+            riskScore: { increment: risk.totalScore },
+          },
+        });
+      }
+    } catch (err: any) {
+      if (!isMissingDbColumnError(err)) throw err;
+      // If columns don't exist yet, ignore persistence.
+    }
 
     // ✅ enqueue webhook
     await enqueueWebhookEvent({
@@ -1237,11 +2304,23 @@ app.post("/jobs", authMiddleware, async (req: AuthRequest, res: Response) => {
         status: job.status,
         budgetMin: job.budgetMin,
         budgetMax: job.budgetMax,
+        category: job.category ?? classification.category,
+        trade: job.trade ?? classification.trade,
+        urgency: job.urgency ?? classification.urgency,
+        suggestedTags: job.suggestedTags ?? classification.suggestedTags,
         createdAt: job.createdAt,
       },
     });
 
-    return res.status(201).json({
+    // ✅ enqueue smart-match notifications (dedicated worker service)
+    if (!reviewRequired) {
+      await enqueueBackgroundJob({
+        type: "JOB_MATCH_NOTIFY",
+        payload: { jobId: job.id },
+      });
+    }
+
+    return res.status(reviewRequired ? 202 : 201).json({
       id: job.id,
       title: job.title,
       description: job.description,
@@ -1249,6 +2328,15 @@ app.post("/jobs", authMiddleware, async (req: AuthRequest, res: Response) => {
       budgetMax: job.budgetMax,
       location: job.location,
       status: job.status,
+      category: job.category ?? classification.category,
+      trade: job.trade ?? classification.trade,
+      urgency: job.urgency ?? classification.urgency,
+      suggestedTags: job.suggestedTags ?? classification.suggestedTags,
+      suggestedMinPrice: job.suggestedMinPrice ?? suggestion.suggestedMinPrice,
+      suggestedMaxPrice: job.suggestedMaxPrice ?? suggestion.suggestedMaxPrice,
+      suggestedReason: job.suggestedReason ?? suggestion.suggestedReason,
+      reviewRequired,
+      restrictedUntil,
       createdAt: job.createdAt,
     });
   } catch (err) {
@@ -1296,22 +2384,59 @@ app.get("/jobs/browse", authMiddleware, async (req: AuthRequest, res: Response) 
       where.location = { contains: location.trim(), mode: "insensitive" };
     }
 
-    const jobs = await prisma.job.findMany({
-      where,
-      orderBy: [{ id: "desc" }],
-      take,
-      ...(cursorId
-        ? {
-            cursor: { id: cursorId },
-            skip: 1,
-          }
-        : {}),
-      include: {
-        consumer: { select: { id: true, name: true, location: true, isSuspended: true } },
-        _count: { select: { bids: true } },
-        attachments: true,
-      },
-    });
+    const selectBase = {
+      id: true,
+      title: true,
+      description: true,
+      budgetMin: true,
+      budgetMax: true,
+      status: true,
+      location: true,
+      createdAt: true,
+      consumer: { select: { id: true, name: true, location: true, isSuspended: true } },
+      _count: { select: { bids: true } },
+      attachments: true,
+    } as const;
+
+    const selectWithClassification = {
+      ...selectBase,
+      category: true,
+      trade: true,
+      urgency: true,
+      suggestedTags: true,
+    } as const;
+
+    let jobs: any[] = [];
+    let hasClassificationColumns = true;
+    try {
+      jobs = await prisma.job.findMany({
+        where,
+        orderBy: [{ id: "desc" }],
+        take,
+        ...(cursorId
+          ? {
+              cursor: { id: cursorId },
+              skip: 1,
+            }
+          : {}),
+        select: selectWithClassification,
+      });
+    } catch (err: any) {
+      if (!isMissingDbColumnError(err)) throw err;
+      hasClassificationColumns = false;
+      jobs = await prisma.job.findMany({
+        where,
+        orderBy: [{ id: "desc" }],
+        take,
+        ...(cursorId
+          ? {
+              cursor: { id: cursorId },
+              skip: 1,
+            }
+          : {}),
+        select: selectBase,
+      });
+    }
 
     // Optional favorites block (keep if you have favoriteJob)
     let favoriteJobIds = new Set<number>();
@@ -1326,25 +2451,65 @@ app.get("/jobs/browse", authMiddleware, async (req: AuthRequest, res: Response) 
 
     const nextCursor = jobs.length === take ? jobs[jobs.length - 1].id : null;
 
+    const items = hasClassificationColumns
+      ? jobs.map((j) => ({
+          id: j.id,
+          title: j.title,
+          description: j.description,
+          budgetMin: j.budgetMin,
+          budgetMax: j.budgetMax,
+          status: j.status,
+          location: j.location,
+          category: j.category,
+          trade: j.trade,
+          urgency: j.urgency,
+          suggestedTags: j.suggestedTags ?? [],
+          createdAt: j.createdAt,
+          bidCount: j._count.bids,
+          isFavorited: favoriteJobIds.has(j.id),
+          consumer: {
+            id: j.consumer.id,
+            name: j.consumer.name,
+            location: j.consumer.location,
+          },
+          attachments: (j.attachments ?? []).map((a: any) => ({
+            ...a,
+            url: attachmentPublicUrl(req, a.id),
+          })),
+        }))
+      : await Promise.all(
+          jobs.map(async (j) => {
+            const cls = await classifyJob(`${j.title}\n${j.description ?? ""}`);
+            return {
+              id: j.id,
+              title: j.title,
+              description: j.description,
+              budgetMin: j.budgetMin,
+              budgetMax: j.budgetMax,
+              status: j.status,
+              location: j.location,
+              category: cls.category,
+              trade: cls.trade,
+              urgency: cls.urgency,
+              suggestedTags: cls.suggestedTags,
+              createdAt: j.createdAt,
+              bidCount: j._count.bids,
+              isFavorited: favoriteJobIds.has(j.id),
+              consumer: {
+                id: j.consumer.id,
+                name: j.consumer.name,
+                location: j.consumer.location,
+              },
+              attachments: (j.attachments ?? []).map((a: any) => ({
+                ...a,
+                url: attachmentPublicUrl(req, a.id),
+              })),
+            };
+          })
+        );
+
     return res.json({
-      items: jobs.map((j) => ({
-        id: j.id,
-        title: j.title,
-        description: j.description,
-        budgetMin: j.budgetMin,
-        budgetMax: j.budgetMax,
-        status: j.status,
-        location: j.location,
-        createdAt: j.createdAt,
-        bidCount: j._count.bids,
-        isFavorited: favoriteJobIds.has(j.id),
-        consumer: {
-          id: j.consumer.id,
-          name: j.consumer.name,
-          location: j.consumer.location,
-        },
-        attachments: j.attachments ?? [],
-      })),
+      items,
       pageInfo: {
         limit: take,
         nextCursor,
@@ -1359,22 +2524,24 @@ app.get("/jobs/browse", authMiddleware, async (req: AuthRequest, res: Response) 
 
 // POST /jobs/:jobId/attachments
 // Body: { url: string, type?: string }
-app.post("/jobs/:jobId/attachments", authMiddleware, async (req: AuthRequest, res: Response) => {
+app.post(
+  "/jobs/:jobId/attachments",
+  authMiddleware,
+  validate({
+    params: jobIdParamsSchema,
+    body: z.object({
+      url: z.string().trim().min(1, "url is required"),
+      type: z.string().trim().optional(),
+    }),
+  }),
+  async (req: AuthRequest, res: Response) => {
   try {
     if (!req.user) {
       return res.status(401).json({ error: "Not authenticated" });
     }
 
-    const jobId = Number(req.params.jobId);
-    if (Number.isNaN(jobId)) {
-      return res.status(400).json({ error: "Invalid jobId" });
-    }
-
-    const { url, type } = req.body as { url?: string; type?: string };
-
-    if (!url || typeof url !== "string") {
-      return res.status(400).json({ error: "url is required" });
-    }
+    const { jobId } = (req as any).validated.params as { jobId: number };
+    const { url, type } = (req as any).validated.body as { url: string; type?: string };
 
     const job = await prisma.job.findUnique({
       where: { id: jobId },
@@ -1402,6 +2569,7 @@ app.post("/jobs/:jobId/attachments", authMiddleware, async (req: AuthRequest, re
       data: {
         jobId,
         url: url.trim(),
+        uploaderUserId: req.user.userId,
         type: type?.trim() || null,
       },
     });
@@ -1441,6 +2609,7 @@ app.post("/jobs/:jobId/attachments", authMiddleware, async (req: AuthRequest, re
 app.post(
   "/jobs/:jobId/attachments/upload",
   authMiddleware,
+  validate({ params: jobIdParamsSchema }),
   uploadSingleAttachment,
   async (req: AuthRequest, res: Response) => {
     try {
@@ -1448,10 +2617,7 @@ app.post(
         return res.status(401).json({ error: "Not authenticated" });
       }
 
-      const jobId = Number(req.params.jobId);
-      if (Number.isNaN(jobId)) {
-        return res.status(400).json({ error: "Invalid jobId" });
-      }
+      const { jobId } = (req as any).validated.params as { jobId: number };
 
       const file = (req as any).file as Express.Multer.File | undefined;
       if (!file) {
@@ -1477,18 +2643,28 @@ app.post(
         (process.env.PUBLIC_BASE_URL ?? "").trim() ||
         `${req.protocol}://${req.get("host")}`;
 
-      const url = `${publicBase}/uploads/attachments/${file.filename}`;
+      const diskPath = path.posix.join("attachments", file.filename);
       const kind = file.mimetype.startsWith("video/") ? "video" : "image";
 
-      const attach = await prisma.jobAttachment.create({
-        data: {
-          jobId,
-          url,
-          type: kind,
-          mimeType: file.mimetype,
-          filename: file.originalname || null,
-          sizeBytes: file.size || null,
-        },
+      const attach = await prisma.$transaction(async (tx) => {
+        const created = await tx.jobAttachment.create({
+          data: {
+            jobId,
+            url: "",
+            diskPath,
+            uploaderUserId: req.user!.userId,
+            type: kind,
+            mimeType: file.mimetype,
+            filename: file.originalname || null,
+            sizeBytes: file.size || null,
+          },
+        });
+
+        const url = `${publicBase}/attachments/${created.id}`;
+        return tx.jobAttachment.update({
+          where: { id: created.id },
+          data: { url },
+        });
       });
 
       await enqueueWebhookEvent({
@@ -1497,7 +2673,7 @@ app.post(
           attachmentId: attach.id,
           jobId: attach.jobId,
           addedByUserId: req.user.userId,
-          url: attach.url,
+          url: `${publicBase}/attachments/${attach.id}`,
           type: attach.type,
           mimeType: attach.mimeType,
           filename: attach.filename,
@@ -1513,7 +2689,10 @@ app.post(
 
       return res.status(201).json({
         message: "Attachment uploaded.",
-        attachment: attach,
+        attachment: {
+          ...attach,
+          url: `${publicBase}/attachments/${attach.id}`,
+        },
         limits: { maxBytes: MAX_ATTACHMENT_BYTES },
       });
     } catch (err: any) {
@@ -1541,11 +2720,1197 @@ app.post(
 // - If provider already has a bid, this acts like "update my bid".
 // - Updates are blocked if bid is locked (non-PENDING or counter already ACCEPTED).
 
+const placeBidSchema = {
+  params: z.object({
+    jobId: z.coerce.number().int().positive(),
+  }),
+  body: z
+    .object({
+      templateId: z.coerce.number().int().positive().optional(),
+      amount: z.coerce.number().finite().positive().optional(),
+      message: z.string().trim().max(2000).optional(),
+    })
+    .superRefine((val, ctx) => {
+      // Backwards compatible: if no templateId, amount is required.
+      if (!val.templateId && typeof val.amount !== "number") {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["amount"],
+          message: "Amount is required when no templateId is provided.",
+        });
+      }
+    }),
+};
+
+const bidTemplateCreateSchema = {
+  body: z.object({
+    title: z.string().trim().min(1).max(120),
+    body: z.string().trim().min(1).max(2000),
+    defaultAmount: z.coerce.number().finite().positive().optional(),
+    tags: z.array(z.string().trim().min(1).max(32)).max(20).optional(),
+  }),
+};
+
+const bidTemplateUpdateSchema = {
+  params: z.object({
+    id: z.coerce.number().int().positive(),
+  }),
+  body: z
+    .object({
+      title: z.string().trim().min(1).max(120).optional(),
+      body: z.string().trim().min(1).max(2000).optional(),
+      defaultAmount: z.coerce.number().finite().positive().nullable().optional(),
+      tags: z.array(z.string().trim().min(1).max(32)).max(20).optional(),
+    })
+    .superRefine((val, ctx) => {
+      const hasAny =
+        typeof val.title === "string" ||
+        typeof val.body === "string" ||
+        typeof val.defaultAmount !== "undefined" ||
+        typeof val.tags !== "undefined";
+      if (!hasAny) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "Provide at least one field to update.",
+        });
+      }
+    }),
+};
+
+const bidTemplateIdParamSchema = {
+  params: z.object({
+    id: z.coerce.number().int().positive(),
+  }),
+};
+
+const quickReplyCreateSchema = {
+  body: z.object({
+    title: z.string().trim().min(1).max(80),
+    body: z.string().trim().min(1).max(2000),
+    tags: z.array(z.string().trim().min(1).max(32)).max(20).optional(),
+  }),
+};
+
+const quickReplyUpdateSchema = {
+  params: z.object({
+    id: z.coerce.number().int().positive(),
+  }),
+  body: z
+    .object({
+      title: z.string().trim().min(1).max(80).optional(),
+      body: z.string().trim().min(1).max(2000).optional(),
+      tags: z.array(z.string().trim().min(1).max(32)).max(20).optional(),
+    })
+    .superRefine((val, ctx) => {
+      const hasAny =
+        typeof val.title === "string" || typeof val.body === "string" || typeof val.tags !== "undefined";
+      if (!hasAny) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Provide at least one field to update." });
+      }
+    }),
+};
+
+const quickReplyIdParamSchema = {
+  params: z.object({
+    id: z.coerce.number().int().positive(),
+  }),
+};
+
+const zip5Schema = z
+  .string()
+  .trim()
+  .regex(/^\d{5}$/, "Expected a 5-digit ZIP code");
+
+const providerSavedSearchCreateSchema = {
+  body: z
+    .object({
+      categories: z.array(z.string().trim().min(1).max(64)).min(1).max(20),
+      radiusMiles: z.coerce.number().int().min(1).max(500),
+      zipCode: zip5Schema,
+      minBudget: z.coerce.number().int().positive().nullable().optional(),
+      maxBudget: z.coerce.number().int().positive().nullable().optional(),
+      isEnabled: z.coerce.boolean().optional(),
+    })
+    .superRefine((val, ctx) => {
+      const minB = val.minBudget == null ? null : Number(val.minBudget);
+      const maxB = val.maxBudget == null ? null : Number(val.maxBudget);
+      if (minB != null && maxB != null && minB > maxB) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "minBudget must be <= maxBudget",
+        });
+      }
+    }),
+};
+
+const providerSavedSearchUpdateSchema = {
+  params: z.object({
+    id: z.coerce.number().int().positive(),
+  }),
+  body: z
+    .object({
+      categories: z.array(z.string().trim().min(1).max(64)).min(1).max(20).optional(),
+      radiusMiles: z.coerce.number().int().min(1).max(500).optional(),
+      zipCode: zip5Schema.optional(),
+      minBudget: z.coerce.number().int().positive().nullable().optional(),
+      maxBudget: z.coerce.number().int().positive().nullable().optional(),
+      isEnabled: z.coerce.boolean().optional(),
+    })
+    .superRefine((val, ctx) => {
+      const hasAny =
+        typeof val.categories !== "undefined" ||
+        typeof val.radiusMiles !== "undefined" ||
+        typeof val.zipCode !== "undefined" ||
+        typeof val.minBudget !== "undefined" ||
+        typeof val.maxBudget !== "undefined" ||
+        typeof val.isEnabled !== "undefined";
+
+      if (!hasAny) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "Provide at least one field to update.",
+        });
+      }
+
+      const minB = typeof val.minBudget === "undefined" || val.minBudget == null ? null : Number(val.minBudget);
+      const maxB = typeof val.maxBudget === "undefined" || val.maxBudget == null ? null : Number(val.maxBudget);
+      if (minB != null && maxB != null && minB > maxB) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "minBudget must be <= maxBudget",
+        });
+      }
+    }),
+};
+
+const providerSavedSearchIdParamSchema = {
+  params: z.object({
+    id: z.coerce.number().int().positive(),
+  }),
+};
+
+const hhmmSchema = z
+  .string()
+  .trim()
+  .regex(/^([01]\d|2[0-3]):[0-5]\d$/, "Expected time in HH:MM (24h) format");
+
+const providerAvailabilityReplaceSchema = {
+  body: z
+    .object({
+      timezone: z.string().trim().min(1).max(64),
+      slots: z
+        .array(
+          z.object({
+            dayOfWeek: z.coerce.number().int().min(0).max(6),
+            startTime: hhmmSchema,
+            endTime: hhmmSchema,
+          })
+        )
+        .max(70)
+        .default([]),
+    })
+    .superRefine((val, ctx) => {
+      for (let i = 0; i < val.slots.length; i++) {
+        const slot = val.slots[i];
+        const [sh, sm] = slot.startTime.split(":").map((n) => Number(n));
+        const [eh, em] = slot.endTime.split(":").map((n) => Number(n));
+        const startMin = sh * 60 + sm;
+        const endMin = eh * 60 + em;
+        if (!(endMin > startMin)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ["slots", i, "endTime"],
+            message: "endTime must be after startTime.",
+          });
+        }
+      }
+    }),
+};
+
+const jobIdParamSchema = {
+  params: z.object({
+    jobId: z.coerce.number().int().positive(),
+  }),
+};
+
+const appointmentProposeSchema = {
+  params: z.object({
+    jobId: z.coerce.number().int().positive(),
+  }),
+  body: z
+    .object({
+      startAt: z.string().datetime(),
+      endAt: z.string().datetime(),
+    })
+    .superRefine((val, ctx) => {
+      const start = new Date(val.startAt);
+      const end = new Date(val.endAt);
+      if (!(start instanceof Date) || Number.isNaN(start.getTime())) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["startAt"], message: "Invalid startAt" });
+        return;
+      }
+      if (!(end instanceof Date) || Number.isNaN(end.getTime())) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["endAt"], message: "Invalid endAt" });
+        return;
+      }
+      if (!(end.getTime() > start.getTime())) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["endAt"],
+          message: "endAt must be after startAt.",
+        });
+      }
+    }),
+};
+
+const appointmentIdParamSchema = {
+  params: z.object({
+    id: z.coerce.number().int().positive(),
+  }),
+};
+
+const appointmentCalendarEventSchema = {
+  params: z.object({
+    id: z.coerce.number().int().positive(),
+  }),
+  body: z.object({
+    eventId: z.string().trim().min(1).max(200),
+  }),
+};
+
+const appointmentSelectBase = {
+  id: true,
+  jobId: true,
+  providerId: true,
+  consumerId: true,
+  startAt: true,
+  endAt: true,
+  status: true,
+  createdAt: true,
+  updatedAt: true,
+} as const;
+
+const appointmentSelectWithCalendar = {
+  ...appointmentSelectBase,
+  calendarEventId: true,
+} as const;
+
+function isMissingDbColumnError(err: any): boolean {
+  const code = String(err?.code ?? "");
+  const msg = String(err?.message ?? "");
+  // Prisma uses P2022 for missing columns in some engines/adapters.
+  if (code === "P2022") return true;
+  return /column/i.test(msg) && /does not exist/i.test(msg);
+}
+
+const WEEKDAY_SHORT_TO_DOW: Record<string, number> = {
+  Sun: 0,
+  Mon: 1,
+  Tue: 2,
+  Wed: 3,
+  Thu: 4,
+  Fri: 5,
+  Sat: 6,
+};
+
+function getLocalDayOfWeekAndMinutes(date: Date, timeZone: string): { dayOfWeek: number; minutes: number } {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    weekday: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(date);
+
+  const weekday = parts.find((p) => p.type === "weekday")?.value;
+  const hourStr = parts.find((p) => p.type === "hour")?.value;
+  const minuteStr = parts.find((p) => p.type === "minute")?.value;
+
+  const dayOfWeek = weekday ? WEEKDAY_SHORT_TO_DOW[weekday] : undefined;
+  const hour = hourStr ? Number(hourStr) : NaN;
+  const minute = minuteStr ? Number(minuteStr) : NaN;
+
+  if (typeof dayOfWeek !== "number" || Number.isNaN(hour) || Number.isNaN(minute)) {
+    throw new Error("Failed to compute local time parts");
+  }
+
+  return { dayOfWeek, minutes: hour * 60 + minute };
+}
+
+function parseHHMMToMinutes(hhmm: string): number {
+  const [h, m] = hhmm.split(":").map((n) => Number(n));
+  return h * 60 + m;
+}
+
+async function assertProviderAvailableAndNoConflicts(opts: {
+  providerId: number;
+  startAt: Date;
+  endAt: Date;
+  excludeAppointmentId?: number;
+}) {
+  const availabilities = await prisma.providerAvailability.findMany({
+    where: { providerId: opts.providerId },
+    orderBy: [{ dayOfWeek: "asc" }, { startTime: "asc" }],
+  });
+
+  if (availabilities.length === 0) {
+    throw new Error("Provider has not set availability.");
+  }
+
+  const timezones = Array.from(new Set(availabilities.map((a) => a.timezone)));
+  if (timezones.length !== 1) {
+    throw new Error("Provider availability timezone is not configured consistently.");
+  }
+  const timeZone = timezones[0];
+
+  const localStart = getLocalDayOfWeekAndMinutes(opts.startAt, timeZone);
+  const localEnd = getLocalDayOfWeekAndMinutes(opts.endAt, timeZone);
+
+  if (localStart.dayOfWeek !== localEnd.dayOfWeek) {
+    throw new Error("Appointment must start and end on the same local day for the provider.");
+  }
+
+  const matching = availabilities.filter((a) => a.dayOfWeek === localStart.dayOfWeek);
+  const within = matching.some((a) => {
+    const aStart = parseHHMMToMinutes(a.startTime);
+    const aEnd = parseHHMMToMinutes(a.endTime);
+    return aStart <= localStart.minutes && aEnd >= localEnd.minutes;
+  });
+
+  if (!within) {
+    throw new Error("Requested time is outside provider availability.");
+  }
+
+  const conflict = await prisma.appointment.findFirst({
+    where: {
+      providerId: opts.providerId,
+      status: "CONFIRMED",
+      ...(typeof opts.excludeAppointmentId === "number" ? { id: { not: opts.excludeAppointmentId } } : {}),
+      AND: [{ startAt: { lt: opts.endAt } }, { endAt: { gt: opts.startAt } }],
+    },
+    select: { id: true, startAt: true, endAt: true },
+  });
+  if (conflict) {
+    throw new Error("Provider has a conflicting confirmed appointment.");
+  }
+}
+
+// --- Provider quick replies (CRUD) ---
+// GET /provider/quick-replies
+app.get(
+  "/provider/quick-replies",
+  authMiddleware,
+  requireVerifiedEmail,
+  requireAttestation,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      if (!req.user) return res.status(401).json({ error: "Not authenticated" });
+      if (req.user.role !== "PROVIDER") {
+        return res.status(403).json({ error: "Only providers can manage quick replies" });
+      }
+
+      const items = await prisma.providerQuickReply.findMany({
+        where: { providerId: req.user.userId },
+        orderBy: [{ updatedAt: "desc" }, { id: "desc" }],
+      });
+
+      return res.json({ items });
+    } catch (err) {
+      console.error("GET /provider/quick-replies error:", err);
+      return res.status(500).json({ error: "Internal server error." });
+    }
+  }
+);
+
+// POST /provider/quick-replies
+app.post(
+  "/provider/quick-replies",
+  authMiddleware,
+  requireVerifiedEmail,
+  requireAttestation,
+  validate(quickReplyCreateSchema),
+  async (req: AuthRequest & { validated: Validated<typeof quickReplyCreateSchema> }, res: Response) => {
+    try {
+      if (!req.user) return res.status(401).json({ error: "Not authenticated" });
+      if (req.user.role !== "PROVIDER") {
+        return res.status(403).json({ error: "Only providers can manage quick replies" });
+      }
+
+      const created = await prisma.providerQuickReply.create({
+        data: {
+          providerId: req.user.userId,
+          title: req.validated.body.title.trim(),
+          body: req.validated.body.body.trim(),
+          tags: (req.validated.body.tags ?? []).map((t) => t.trim()).filter(Boolean),
+        },
+      });
+
+      return res.status(201).json({ item: created });
+    } catch (err) {
+      console.error("POST /provider/quick-replies error:", err);
+      return res.status(500).json({ error: "Internal server error." });
+    }
+  }
+);
+
+// PUT /provider/quick-replies/:id
+app.put(
+  "/provider/quick-replies/:id",
+  authMiddleware,
+  requireVerifiedEmail,
+  requireAttestation,
+  validate(quickReplyUpdateSchema),
+  async (req: AuthRequest & { validated: Validated<typeof quickReplyUpdateSchema> }, res: Response) => {
+    try {
+      if (!req.user) return res.status(401).json({ error: "Not authenticated" });
+      if (req.user.role !== "PROVIDER") {
+        return res.status(403).json({ error: "Only providers can manage quick replies" });
+      }
+
+      const id = req.validated.params.id;
+      const existing = await prisma.providerQuickReply.findFirst({
+        where: { id, providerId: req.user.userId },
+        select: { id: true },
+      });
+      if (!existing) return res.status(404).json({ error: "Quick reply not found." });
+
+      const updated = await prisma.providerQuickReply.update({
+        where: { id },
+        data: {
+          title: typeof req.validated.body.title === "string" ? req.validated.body.title.trim() : undefined,
+          body: typeof req.validated.body.body === "string" ? req.validated.body.body.trim() : undefined,
+          tags:
+            typeof req.validated.body.tags !== "undefined"
+              ? req.validated.body.tags.map((t) => t.trim()).filter(Boolean)
+              : undefined,
+        },
+      });
+
+      return res.json({ item: updated });
+    } catch (err) {
+      console.error("PUT /provider/quick-replies/:id error:", err);
+      return res.status(500).json({ error: "Internal server error." });
+    }
+  }
+);
+
+// DELETE /provider/quick-replies/:id
+app.delete(
+  "/provider/quick-replies/:id",
+  authMiddleware,
+  requireVerifiedEmail,
+  requireAttestation,
+  validate(quickReplyIdParamSchema),
+  async (req: AuthRequest & { validated: Validated<typeof quickReplyIdParamSchema> }, res: Response) => {
+    try {
+      if (!req.user) return res.status(401).json({ error: "Not authenticated" });
+      if (req.user.role !== "PROVIDER") {
+        return res.status(403).json({ error: "Only providers can manage quick replies" });
+      }
+
+      const id = req.validated.params.id;
+      const existing = await prisma.providerQuickReply.findFirst({
+        where: { id, providerId: req.user.userId },
+        select: { id: true },
+      });
+      if (!existing) return res.status(404).json({ error: "Quick reply not found." });
+
+      await prisma.providerQuickReply.delete({ where: { id } });
+      return res.json({ ok: true });
+    } catch (err) {
+      console.error("DELETE /provider/quick-replies/:id error:", err);
+      return res.status(500).json({ error: "Internal server error." });
+    }
+  }
+);
+
+
+// --- Provider saved searches (CRUD) ---
+// GET /provider/saved-searches
+app.get(
+  "/provider/saved-searches",
+  authMiddleware,
+  requireVerifiedEmail,
+  requireAttestation,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      if (!req.user) return res.status(401).json({ error: "Not authenticated" });
+      if (req.user.role !== "PROVIDER") {
+        return res.status(403).json({ error: "Only providers can manage saved searches" });
+      }
+
+      const items = await prisma.providerSavedSearch.findMany({
+        where: { providerId: req.user.userId },
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+      });
+
+      return res.json({ items });
+    } catch (err) {
+      console.error("GET /provider/saved-searches error:", err);
+      return res.status(500).json({ error: "Internal server error." });
+    }
+  }
+);
+
+// POST /provider/saved-searches
+app.post(
+  "/provider/saved-searches",
+  authMiddleware,
+  requireVerifiedEmail,
+  requireAttestation,
+  validate(providerSavedSearchCreateSchema),
+  async (
+    req: AuthRequest & { validated: Validated<typeof providerSavedSearchCreateSchema> },
+    res: Response
+  ) => {
+    try {
+      if (!req.user) return res.status(401).json({ error: "Not authenticated" });
+      if (req.user.role !== "PROVIDER") {
+        return res.status(403).json({ error: "Only providers can manage saved searches" });
+      }
+
+      const maxSaved = Number(process.env.PROVIDER_SAVED_SEARCH_MAX ?? 10);
+      const existingCount = await prisma.providerSavedSearch.count({
+        where: { providerId: req.user.userId },
+      });
+      if (existingCount >= Math.max(1, Math.min(50, maxSaved))) {
+        return res.status(400).json({ error: "Saved search limit reached." });
+      }
+
+      const body = req.validated.body;
+
+      const created = await prisma.providerSavedSearch.create({
+        data: {
+          providerId: req.user.userId,
+          categories: body.categories.map((c) => c.trim()).filter(Boolean),
+          radiusMiles: body.radiusMiles,
+          zipCode: body.zipCode.trim(),
+          minBudget: body.minBudget ?? null,
+          maxBudget: body.maxBudget ?? null,
+          isEnabled: typeof body.isEnabled === "boolean" ? body.isEnabled : true,
+        },
+      });
+
+      return res.status(201).json({ item: created });
+    } catch (err) {
+      console.error("POST /provider/saved-searches error:", err);
+      return res.status(500).json({ error: "Internal server error." });
+    }
+  }
+);
+
+// PUT /provider/saved-searches/:id
+app.put(
+  "/provider/saved-searches/:id",
+  authMiddleware,
+  requireVerifiedEmail,
+  requireAttestation,
+  validate(providerSavedSearchUpdateSchema),
+  async (
+    req: AuthRequest & { validated: Validated<typeof providerSavedSearchUpdateSchema> },
+    res: Response
+  ) => {
+    try {
+      if (!req.user) return res.status(401).json({ error: "Not authenticated" });
+      if (req.user.role !== "PROVIDER") {
+        return res.status(403).json({ error: "Only providers can manage saved searches" });
+      }
+
+      const id = req.validated.params.id;
+
+      const existing = await prisma.providerSavedSearch.findFirst({
+        where: { id, providerId: req.user.userId },
+        select: { id: true },
+      });
+      if (!existing) return res.status(404).json({ error: "Saved search not found." });
+
+      const body = req.validated.body;
+
+      const updated = await prisma.providerSavedSearch.update({
+        where: { id },
+        data: {
+          categories:
+            typeof body.categories !== "undefined"
+              ? body.categories.map((c) => c.trim()).filter(Boolean)
+              : undefined,
+          radiusMiles: typeof body.radiusMiles !== "undefined" ? body.radiusMiles : undefined,
+          zipCode: typeof body.zipCode === "string" ? body.zipCode.trim() : undefined,
+          minBudget: typeof body.minBudget !== "undefined" ? body.minBudget : undefined,
+          maxBudget: typeof body.maxBudget !== "undefined" ? body.maxBudget : undefined,
+          isEnabled: typeof body.isEnabled === "boolean" ? body.isEnabled : undefined,
+        },
+      });
+
+      return res.json({ item: updated });
+    } catch (err) {
+      console.error("PUT /provider/saved-searches/:id error:", err);
+      return res.status(500).json({ error: "Internal server error." });
+    }
+  }
+);
+
+// DELETE /provider/saved-searches/:id
+app.delete(
+  "/provider/saved-searches/:id",
+  authMiddleware,
+  requireVerifiedEmail,
+  requireAttestation,
+  validate(providerSavedSearchIdParamSchema),
+  async (
+    req: AuthRequest & { validated: Validated<typeof providerSavedSearchIdParamSchema> },
+    res: Response
+  ) => {
+    try {
+      if (!req.user) return res.status(401).json({ error: "Not authenticated" });
+      if (req.user.role !== "PROVIDER") {
+        return res.status(403).json({ error: "Only providers can manage saved searches" });
+      }
+
+      const id = req.validated.params.id;
+      const existing = await prisma.providerSavedSearch.findFirst({
+        where: { id, providerId: req.user.userId },
+        select: { id: true },
+      });
+      if (!existing) return res.status(404).json({ error: "Saved search not found." });
+
+      await prisma.providerSavedSearch.delete({ where: { id } });
+      return res.json({ ok: true });
+    } catch (err) {
+      console.error("DELETE /provider/saved-searches/:id error:", err);
+      return res.status(500).json({ error: "Internal server error." });
+    }
+  }
+);
+
+// --- Provider bid templates (CRUD) ---
+// GET /provider/bid-templates
+app.get(
+  "/provider/bid-templates",
+  authMiddleware,
+  requireVerifiedEmail,
+  requireAttestation,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      if (!req.user) return res.status(401).json({ error: "Not authenticated" });
+      if (req.user.role !== "PROVIDER") {
+        return res.status(403).json({ error: "Only providers can manage bid templates" });
+      }
+
+      const items = await prisma.bidTemplate.findMany({
+        where: { providerId: req.user.userId },
+        orderBy: [{ updatedAt: "desc" }, { id: "desc" }],
+      });
+
+      return res.json({ items });
+    } catch (err) {
+      console.error("GET /provider/bid-templates error:", err);
+      return res.status(500).json({ error: "Internal server error." });
+    }
+  }
+);
+
+// POST /provider/bid-templates
+app.post(
+  "/provider/bid-templates",
+  authMiddleware,
+  requireVerifiedEmail,
+  requireAttestation,
+  validate(bidTemplateCreateSchema),
+  async (req: AuthRequest & { validated: Validated<typeof bidTemplateCreateSchema> }, res: Response) => {
+    try {
+      if (!req.user) return res.status(401).json({ error: "Not authenticated" });
+      if (req.user.role !== "PROVIDER") {
+        return res.status(403).json({ error: "Only providers can manage bid templates" });
+      }
+
+      const created = await prisma.bidTemplate.create({
+        data: {
+          providerId: req.user.userId,
+          title: req.validated.body.title.trim(),
+          body: req.validated.body.body.trim(),
+          defaultAmount:
+            typeof req.validated.body.defaultAmount === "number"
+              ? Math.trunc(req.validated.body.defaultAmount)
+              : null,
+          tags: (req.validated.body.tags ?? []).map((t) => t.trim()).filter(Boolean),
+        },
+      });
+
+      return res.status(201).json({ item: created });
+    } catch (err) {
+      console.error("POST /provider/bid-templates error:", err);
+      return res.status(500).json({ error: "Internal server error." });
+    }
+  }
+);
+
+// GET /provider/bid-templates/:id
+app.get(
+  "/provider/bid-templates/:id",
+  authMiddleware,
+  requireVerifiedEmail,
+  requireAttestation,
+  validate(bidTemplateIdParamSchema),
+  async (req: AuthRequest & { validated: Validated<typeof bidTemplateIdParamSchema> }, res: Response) => {
+    try {
+      if (!req.user) return res.status(401).json({ error: "Not authenticated" });
+      if (req.user.role !== "PROVIDER") {
+        return res.status(403).json({ error: "Only providers can manage bid templates" });
+      }
+
+      const id = req.validated.params.id;
+      const item = await prisma.bidTemplate.findFirst({
+        where: { id, providerId: req.user.userId },
+      });
+      if (!item) return res.status(404).json({ error: "Bid template not found." });
+
+      return res.json({ item });
+    } catch (err) {
+      console.error("GET /provider/bid-templates/:id error:", err);
+      return res.status(500).json({ error: "Internal server error." });
+    }
+  }
+);
+
+// PUT /provider/bid-templates/:id
+app.put(
+  "/provider/bid-templates/:id",
+  authMiddleware,
+  requireVerifiedEmail,
+  requireAttestation,
+  validate(bidTemplateUpdateSchema),
+  async (req: AuthRequest & { validated: Validated<typeof bidTemplateUpdateSchema> }, res: Response) => {
+    try {
+      if (!req.user) return res.status(401).json({ error: "Not authenticated" });
+      if (req.user.role !== "PROVIDER") {
+        return res.status(403).json({ error: "Only providers can manage bid templates" });
+      }
+
+      const id = req.validated.params.id;
+
+      const existing = await prisma.bidTemplate.findFirst({
+        where: { id, providerId: req.user.userId },
+        select: { id: true },
+      });
+      if (!existing) return res.status(404).json({ error: "Bid template not found." });
+
+      const updated = await prisma.bidTemplate.update({
+        where: { id },
+        data: {
+          title: typeof req.validated.body.title === "string" ? req.validated.body.title.trim() : undefined,
+          body: typeof req.validated.body.body === "string" ? req.validated.body.body.trim() : undefined,
+          defaultAmount:
+            typeof req.validated.body.defaultAmount !== "undefined"
+              ? req.validated.body.defaultAmount === null
+                ? null
+                : Math.trunc(req.validated.body.defaultAmount)
+              : undefined,
+          tags:
+            typeof req.validated.body.tags !== "undefined"
+              ? req.validated.body.tags.map((t) => t.trim()).filter(Boolean)
+              : undefined,
+        },
+      });
+
+      return res.json({ item: updated });
+    } catch (err) {
+      console.error("PUT /provider/bid-templates/:id error:", err);
+      return res.status(500).json({ error: "Internal server error." });
+    }
+  }
+);
+
+// DELETE /provider/bid-templates/:id
+app.delete(
+  "/provider/bid-templates/:id",
+  authMiddleware,
+  requireVerifiedEmail,
+  requireAttestation,
+  validate(bidTemplateIdParamSchema),
+  async (req: AuthRequest & { validated: Validated<typeof bidTemplateIdParamSchema> }, res: Response) => {
+    try {
+      if (!req.user) return res.status(401).json({ error: "Not authenticated" });
+      if (req.user.role !== "PROVIDER") {
+        return res.status(403).json({ error: "Only providers can manage bid templates" });
+      }
+
+      const id = req.validated.params.id;
+      const existing = await prisma.bidTemplate.findFirst({
+        where: { id, providerId: req.user.userId },
+        select: { id: true },
+      });
+      if (!existing) return res.status(404).json({ error: "Bid template not found." });
+
+      await prisma.bidTemplate.delete({ where: { id } });
+      return res.json({ ok: true });
+    } catch (err) {
+      console.error("DELETE /provider/bid-templates/:id error:", err);
+      return res.status(500).json({ error: "Internal server error." });
+    }
+  }
+);
+
+// --- Provider availability ---
+// GET /provider/availability
+app.get(
+  "/provider/availability",
+  authMiddleware,
+  requireVerifiedEmail,
+  requireAttestation,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      if (!req.user) return res.status(401).json({ error: "Not authenticated" });
+      if (req.user.role !== "PROVIDER") {
+        return res.status(403).json({ error: "Only providers can manage availability" });
+      }
+
+      const slots = await prisma.providerAvailability.findMany({
+        where: { providerId: req.user.userId },
+        orderBy: [{ dayOfWeek: "asc" }, { startTime: "asc" }],
+      });
+
+      const timezone = slots.length > 0 ? slots[0].timezone : null;
+      return res.json({ timezone, slots });
+    } catch (err) {
+      console.error("GET /provider/availability error:", err);
+      return res.status(500).json({ error: "Internal server error." });
+    }
+  }
+);
+
+// PUT /provider/availability (replace)
+app.put(
+  "/provider/availability",
+  authMiddleware,
+  requireVerifiedEmail,
+  requireAttestation,
+  validate(providerAvailabilityReplaceSchema),
+  async (
+    req: AuthRequest & { validated: Validated<typeof providerAvailabilityReplaceSchema> },
+    res: Response
+  ) => {
+    try {
+      if (!req.user) return res.status(401).json({ error: "Not authenticated" });
+      if (req.user.role !== "PROVIDER") {
+        return res.status(403).json({ error: "Only providers can manage availability" });
+      }
+
+      const { timezone, slots } = req.validated.body;
+
+      await prisma.$transaction(async (tx) => {
+        await tx.providerAvailability.deleteMany({ where: { providerId: req.user!.userId } });
+        if (slots.length > 0) {
+          await tx.providerAvailability.createMany({
+            data: slots.map((s) => ({
+              providerId: req.user!.userId,
+              dayOfWeek: s.dayOfWeek,
+              startTime: s.startTime,
+              endTime: s.endTime,
+              timezone,
+            })),
+          });
+        }
+      });
+
+      const saved = await prisma.providerAvailability.findMany({
+        where: { providerId: req.user.userId },
+        orderBy: [{ dayOfWeek: "asc" }, { startTime: "asc" }],
+      });
+
+      return res.json({ timezone: saved.length > 0 ? saved[0].timezone : null, slots: saved });
+    } catch (err) {
+      console.error("PUT /provider/availability error:", err);
+      return res.status(500).json({ error: "Internal server error." });
+    }
+  }
+);
+
+// --- Appointments ---
+// GET /jobs/:jobId/appointments
+app.get(
+  "/jobs/:jobId/appointments",
+  authMiddleware,
+  validate(jobIdParamSchema),
+  async (req: AuthRequest & { validated: Validated<typeof jobIdParamSchema> }, res: Response) => {
+    try {
+      if (!req.user) return res.status(401).json({ error: "Not authenticated" });
+
+      const jobId = req.validated.params.jobId;
+      const job = await prisma.job.findUnique({
+        where: { id: jobId },
+        select: { id: true, consumerId: true },
+      });
+      if (!job) return res.status(404).json({ error: "Job not found." });
+
+      const awarded = await prisma.bid.findFirst({
+        where: { jobId, status: "ACCEPTED" },
+        select: { providerId: true },
+      });
+
+      const isConsumer = req.user.userId === job.consumerId;
+      const isProvider = typeof awarded?.providerId === "number" && req.user.userId === awarded.providerId;
+      if (!isConsumer && !isProvider) {
+        return res.status(403).json({ error: "Not authorized to view appointments for this job." });
+      }
+
+      try {
+        const items = await prisma.appointment.findMany({
+          where: { jobId },
+          orderBy: [{ startAt: "asc" }, { id: "asc" }],
+          select: appointmentSelectWithCalendar,
+        });
+
+        return res.json({ items });
+      } catch (err: any) {
+        // Allows deploying API code slightly ahead of the DB migration.
+        if (!isMissingDbColumnError(err)) throw err;
+
+        const items = await prisma.appointment.findMany({
+          where: { jobId },
+          orderBy: [{ startAt: "asc" }, { id: "asc" }],
+          select: appointmentSelectBase,
+        });
+
+        return res.json({
+          items: items.map((i) => ({ ...i, calendarEventId: null })),
+          warnings: ["Appointment calendarEventId column not yet deployed"],
+        });
+      }
+    } catch (err) {
+      console.error("GET /jobs/:jobId/appointments error:", err);
+      return res.status(500).json({ error: "Internal server error." });
+    }
+  }
+);
+
+// POST /jobs/:jobId/appointments/propose (consumer)
+app.post(
+  "/jobs/:jobId/appointments/propose",
+  authMiddleware,
+  requireVerifiedEmail,
+  validate(appointmentProposeSchema),
+  async (req: AuthRequest & { validated: Validated<typeof appointmentProposeSchema> }, res: Response) => {
+    try {
+      if (!req.user) return res.status(401).json({ error: "Not authenticated" });
+      if (req.user.role !== "CONSUMER") {
+        return res.status(403).json({ error: "Only consumers can propose appointments" });
+      }
+
+      const jobId = req.validated.params.jobId;
+      const job = await prisma.job.findUnique({
+        where: { id: jobId },
+        select: { id: true, consumerId: true, status: true },
+      });
+      if (!job) return res.status(404).json({ error: "Job not found." });
+      if (job.consumerId !== req.user.userId) {
+        return res.status(403).json({ error: "Not authorized for this job." });
+      }
+      if (job.status !== "IN_PROGRESS") {
+        return res.status(400).json({ error: "Appointments can be proposed once a provider is awarded." });
+      }
+
+      const awarded = await prisma.bid.findFirst({
+        where: { jobId, status: "ACCEPTED" },
+        select: { providerId: true },
+      });
+      if (!awarded) {
+        return res.status(400).json({ error: "No awarded provider for this job." });
+      }
+
+      const startAt = new Date(req.validated.body.startAt);
+      const endAt = new Date(req.validated.body.endAt);
+
+      try {
+        await assertProviderAvailableAndNoConflicts({
+          providerId: awarded.providerId,
+          startAt,
+          endAt,
+        });
+      } catch (e: any) {
+        return res.status(400).json({ error: String(e?.message || "Invalid appointment time") });
+      }
+
+      const created = await prisma.appointment.create({
+        data: {
+          jobId,
+          providerId: awarded.providerId,
+          consumerId: req.user.userId,
+          startAt,
+          endAt,
+          status: "PROPOSED",
+        },
+        select: appointmentSelectBase,
+      });
+
+      return res.status(201).json({ item: created });
+    } catch (err) {
+      console.error("POST /jobs/:jobId/appointments/propose error:", err);
+      return res.status(500).json({ error: "Internal server error." });
+    }
+  }
+);
+
+// POST /appointments/:id/confirm (provider)
+app.post(
+  "/appointments/:id/confirm",
+  authMiddleware,
+  requireVerifiedEmail,
+  requireAttestation,
+  validate(appointmentIdParamSchema),
+  async (req: AuthRequest & { validated: Validated<typeof appointmentIdParamSchema> }, res: Response) => {
+    try {
+      if (!req.user) return res.status(401).json({ error: "Not authenticated" });
+      if (req.user.role !== "PROVIDER") {
+        return res.status(403).json({ error: "Only providers can confirm appointments" });
+      }
+
+      const id = req.validated.params.id;
+      const appt = await prisma.appointment.findUnique({
+        where: { id },
+        select: { id: true, providerId: true, startAt: true, endAt: true, status: true, jobId: true },
+      });
+      if (!appt) return res.status(404).json({ error: "Appointment not found." });
+      if (appt.providerId !== req.user.userId) {
+        return res.status(403).json({ error: "Not authorized for this appointment." });
+      }
+      if (appt.status !== "PROPOSED") {
+        return res.status(400).json({ error: "Only proposed appointments can be confirmed." });
+      }
+
+      const job = await prisma.job.findUnique({
+        where: { id: appt.jobId },
+        select: { id: true, status: true },
+      });
+      if (!job) return res.status(404).json({ error: "Job not found." });
+      if (job.status !== "IN_PROGRESS") {
+        return res.status(400).json({ error: "Job is not in progress." });
+      }
+
+      try {
+        await assertProviderAvailableAndNoConflicts({
+          providerId: appt.providerId,
+          startAt: appt.startAt,
+          endAt: appt.endAt,
+          excludeAppointmentId: appt.id,
+        });
+      } catch (e: any) {
+        return res.status(400).json({ error: String(e?.message || "Invalid appointment time") });
+      }
+
+      const updated = await prisma.appointment.update({
+        where: { id },
+        data: { status: "CONFIRMED" },
+        select: appointmentSelectBase,
+      });
+
+      return res.json({ item: updated });
+    } catch (err) {
+      console.error("POST /appointments/:id/confirm error:", err);
+      return res.status(500).json({ error: "Internal server error." });
+    }
+  }
+);
+
+// POST /appointments/:id/cancel (provider or consumer)
+app.post(
+  "/appointments/:id/cancel",
+  authMiddleware,
+  requireVerifiedEmail,
+  validate(appointmentIdParamSchema),
+  async (req: AuthRequest & { validated: Validated<typeof appointmentIdParamSchema> }, res: Response) => {
+    try {
+      if (!req.user) return res.status(401).json({ error: "Not authenticated" });
+
+      const id = req.validated.params.id;
+      const appt = await prisma.appointment.findUnique({
+        where: { id },
+        select: { id: true, providerId: true, consumerId: true, status: true },
+      });
+      if (!appt) return res.status(404).json({ error: "Appointment not found." });
+
+      const canCancel = req.user.userId === appt.providerId || req.user.userId === appt.consumerId;
+      if (!canCancel) return res.status(403).json({ error: "Not authorized for this appointment." });
+      if (appt.status === "CANCELLED") return res.json({ ok: true });
+
+      const updated = await prisma.appointment.update({
+        where: { id },
+        data: { status: "CANCELLED" },
+        select: appointmentSelectBase,
+      });
+
+      return res.json({ item: updated });
+    } catch (err) {
+      console.error("POST /appointments/:id/cancel error:", err);
+      return res.status(500).json({ error: "Internal server error." });
+    }
+  }
+);
+
+// POST /appointments/:id/calendar-event (provider)
+app.post(
+  "/appointments/:id/calendar-event",
+  authMiddleware,
+  requireVerifiedEmail,
+  requireAttestation,
+  validate(appointmentCalendarEventSchema),
+  async (
+    req: AuthRequest & { validated: Validated<typeof appointmentCalendarEventSchema> },
+    res: Response
+  ) => {
+    try {
+      if (!req.user) return res.status(401).json({ error: "Not authenticated" });
+      if (req.user.role !== "PROVIDER") {
+        return res.status(403).json({ error: "Only providers can link calendar events" });
+      }
+
+      const id = req.validated.params.id;
+      const { eventId } = req.validated.body;
+
+      const appt = await prisma.appointment.findUnique({
+        where: { id },
+        select: { id: true, providerId: true, status: true },
+      });
+      if (!appt) return res.status(404).json({ error: "Appointment not found." });
+      if (appt.providerId !== req.user.userId) {
+        return res.status(403).json({ error: "Not authorized for this appointment." });
+      }
+      if (appt.status !== "CONFIRMED") {
+        return res.status(400).json({ error: "Only confirmed appointments can be added to calendar." });
+      }
+
+      try {
+        const updated = await prisma.appointment.update({
+          where: { id },
+          data: { calendarEventId: eventId },
+          select: appointmentSelectWithCalendar,
+        });
+
+        return res.json({ item: updated });
+      } catch (err: any) {
+        if (isMissingDbColumnError(err)) {
+          return res.status(501).json({
+            error:
+              "Calendar event persistence is not enabled on this server yet (missing DB column). Apply the prisma migration and redeploy.",
+            code: "CALENDAR_PERSIST_NOT_ENABLED",
+          });
+        }
+        throw err;
+      }
+    } catch (err) {
+      console.error("POST /appointments/:id/calendar-event error:", err);
+      return res.status(500).json({ error: "Internal server error." });
+    }
+  }
+);
+
 app.post(
   "/jobs/:jobId/bids",
   authMiddleware,
+  requireVerifiedEmail,
+  requireAttestation,
   bidLimiter,
-  async (req: AuthRequest, res: Response) => {
+  validate(placeBidSchema),
+  async (req: AuthRequest & { validated: Validated<typeof placeBidSchema> }, res: Response) => {
     try {
       if (!req.user) return res.status(401).json({ error: "Not authenticated" });
 
@@ -1553,56 +3918,104 @@ app.post(
         return res.status(403).json({ error: "Only providers can place bids" });
       }
 
-      const jobId = Number(req.params.jobId);
-      if (Number.isNaN(jobId)) {
-        return res.status(400).json({ error: "Invalid jobId parameter" });
+      if (isRestrictedUser(req) && !isAdmin(req)) {
+        return restrictedResponse(res, {
+          message: "Your account is temporarily restricted from bidding. Please try again later.",
+          restrictedUntil: req.user.restrictedUntil ?? null,
+        });
       }
 
-      const { amount, message } = req.body as {
-        amount?: number;
-        message?: string;
-      };
+      const jobId = req.validated.params.jobId;
+      const templateId = req.validated.body.templateId;
 
-      if (amount === undefined || amount === null) {
-        return res.status(400).json({ error: "amount is required." });
+      let numericAmount = req.validated.body.amount;
+      let message = req.validated.body.message;
+
+      if (typeof templateId === "number") {
+        const template = await prisma.bidTemplate.findFirst({
+          where: { id: templateId, providerId: req.user.userId },
+          select: { id: true, body: true, defaultAmount: true },
+        });
+
+        if (!template) {
+          return res.status(404).json({ error: "Bid template not found." });
+        }
+
+        if (typeof numericAmount !== "number") {
+          if (typeof template.defaultAmount === "number") {
+            numericAmount = template.defaultAmount;
+          } else {
+            return res.status(400).json({
+              error: "Amount is required because this template has no defaultAmount.",
+            });
+          }
+        }
+
+        if (typeof message !== "string" || message.trim().length === 0) {
+          message = template.body;
+        }
       }
 
-      const numericAmount = Number(amount);
-      if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
-        return res.status(400).json({ error: "amount must be a positive number." });
+      if (typeof numericAmount !== "number") {
+        return res.status(400).json({ error: "Amount is required." });
       }
 
       // Bid.message is required in schema → always persist a string
       const messageText =
         typeof message === "string" && message.trim().length > 0 ? message.trim() : "";
 
-      // Subscription check (your existing logic)
-      const subscription = await prisma.subscription.findUnique({
-        where: { userId: req.user.userId },
-        select: { tier: true },
-      });
-      const tier = subscription?.tier || "FREE";
-
-      if (tier === "FREE") {
-        const thirtyDaysAgo = new Date();
-        thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-
-        const bidsLast30 = await prisma.bid.count({
-          where: {
+      // Risk check for repeated/banned content in bid messages (best-effort)
+      if (messageText) {
+        try {
+          const risk = await assessRepeatedBidMessageRisk({
+            jobId,
             providerId: req.user.userId,
-            createdAt: { gte: thirtyDaysAgo },
-          },
-        });
-
-        if (bidsLast30 >= 5) {
-          return res.status(403).json({
-            error:
-              "You have reached your free tier limit of 5 bids per 30 days. Upgrade your subscription for unlimited bidding.",
-            bidsUsed: bidsLast30,
-            limit: 5,
-            tier,
-            remainingBids: 0,
+            messageText,
           });
+
+          if (risk.signals.some((s) => s.code === "CONTACT_INFO") && !isAdmin(req)) {
+            try {
+              await prisma.user.update({
+                where: { id: req.user.userId },
+                data: { riskScore: { increment: risk.totalScore } },
+              });
+            } catch (e: any) {
+              if (!isMissingDbColumnError(e)) throw e;
+            }
+            return res.status(400).json({
+              error: "For your safety, sharing phone numbers or emails in bids is not allowed. Please use in-app messaging.",
+              code: "CONTACT_INFO_NOT_ALLOWED",
+            });
+          }
+
+          if (risk.totalScore >= RISK_RESTRICT_THRESHOLD && !isAdmin(req)) {
+            const until = computeRestrictedUntil();
+            try {
+              await prisma.user.update({
+                where: { id: req.user.userId },
+                data: { riskScore: { increment: risk.totalScore }, restrictedUntil: until },
+              });
+            } catch (e: any) {
+              if (!isMissingDbColumnError(e)) throw e;
+            }
+            return restrictedResponse(res, {
+              message: "Your account is temporarily restricted due to suspicious activity.",
+              restrictedUntil: until,
+            });
+          }
+
+          if (risk.totalScore > 0) {
+            try {
+              await prisma.user.update({
+                where: { id: req.user.userId },
+                data: { riskScore: { increment: risk.totalScore } },
+              });
+            } catch (e: any) {
+              if (!isMissingDbColumnError(e)) throw e;
+            }
+          }
+        } catch (e) {
+          // ignore scoring failures
         }
       }
 
@@ -1659,23 +4072,58 @@ app.post(
         }
       }
 
-      const bid = existing
-        ? await prisma.bid.update({
+      const now = new Date();
+
+      const result = await prisma.$transaction(async (tx) => {
+        // Updating an existing bid does not consume capacity.
+        if (existing) {
+          const bid = await tx.bid.update({
             where: { id: existing.id },
             data: {
               amount: numericAmount,
               message: messageText,
-              // status: "PENDING", // keep as-is; already PENDING here
-            },
-          })
-        : await prisma.bid.create({
-            data: {
-              amount: numericAmount,
-              message: messageText,
-              jobId,
-              providerId: req.user.userId,
             },
           });
+
+          const sub = await ensureSubscriptionUsageIsCurrent(tx, req.user!.userId, now);
+          const entitlements = getLeadEntitlementsFromSubscription(sub);
+
+          return { kind: "updated" as const, bid, entitlements };
+        }
+
+        // New bid: consume one lead if available.
+        const consumption = await consumeLeadIfAvailable(tx, req.user!.userId, now);
+        if (!consumption.ok) {
+          return { kind: "limit_reached" as const, entitlements: consumption.entitlements };
+        }
+
+        const bid = await tx.bid.create({
+          data: {
+            amount: numericAmount,
+            message: messageText,
+            jobId,
+            providerId: req.user!.userId,
+          },
+        });
+
+        return { kind: "created" as const, bid, entitlements: consumption.entitlements };
+      });
+
+      if (result.kind === "limit_reached") {
+        return res.status(402).json({
+          error: "Upgrade required",
+          code: "LIMIT_REACHED",
+          tier: result.entitlements.tier,
+          usageMonthKey: result.entitlements.usageMonthKey,
+          baseLeadLimitThisMonth: result.entitlements.baseLeadLimitThisMonth,
+          extraLeadCreditsThisMonth: result.entitlements.extraLeadCreditsThisMonth,
+          leadsUsedThisMonth: result.entitlements.leadsUsedThisMonth,
+          remainingLeadsThisMonth: result.entitlements.remainingLeadsThisMonth,
+        });
+      }
+
+      const bid = result.bid;
+      const tier = result.entitlements.tier;
 
       // 🔔 Notify the job owner (consumer)
       await createNotification({
@@ -1841,6 +4289,15 @@ app.get(
 app.post(
   "/bids/:bidId/counter",
   authMiddleware,
+  validate({
+    params: bidIdParamsSchema,
+    body: z.object({
+      amount: z.coerce.number().optional(),
+      minAmount: z.coerce.number().optional(),
+      maxAmount: z.coerce.number().optional(),
+      message: z.string().optional(),
+    }),
+  }),
   async (req: AuthRequest, res: Response) => {
     try {
       if (!req.user) return res.status(401).json({ error: "Not authenticated" });
@@ -1848,10 +4305,7 @@ app.post(
         return res.status(403).json({ error: "Only consumers can counter bids." });
       }
 
-      const bidId = Number(req.params.bidId);
-      if (!Number.isFinite(bidId)) {
-        return res.status(400).json({ error: "Invalid bidId parameter" });
-      }
+      const { bidId } = (req as any).validated.params as { bidId: number };
 
       const bid = await prisma.bid.findUnique({
         where: { id: bidId },
@@ -1889,7 +4343,7 @@ app.post(
         });
       }
 
-      const { amount, minAmount, maxAmount, message } = req.body as {
+      const { amount, minAmount, maxAmount, message } = (req as any).validated.body as {
         amount?: number;
         minAmount?: number;
         maxAmount?: number;
@@ -1977,6 +4431,7 @@ app.post(
 app.post(
   "/bids/:bidId/counter/accept",
   authMiddleware,
+  validate({ params: bidIdParamsSchema }),
   async (req: AuthRequest, res: Response) => {
     try {
       if (!req.user) return res.status(401).json({ error: "Not authenticated" });
@@ -1984,10 +4439,7 @@ app.post(
         return res.status(403).json({ error: "Only providers can accept counters." });
       }
 
-      const bidId = Number(req.params.bidId);
-      if (!Number.isFinite(bidId)) {
-        return res.status(400).json({ error: "Invalid bidId parameter" });
-      }
+      const { bidId } = (req as any).validated.params as { bidId: number };
 
       const bid = await prisma.bid.findUnique({
         where: { id: bidId },
@@ -2078,6 +4530,7 @@ app.post(
 app.post(
   "/bids/:bidId/counter/decline",
   authMiddleware,
+  validate({ params: bidIdParamsSchema }),
   async (req: AuthRequest, res: Response) => {
     try {
       if (!req.user) return res.status(401).json({ error: "Not authenticated" });
@@ -2085,10 +4538,7 @@ app.post(
         return res.status(403).json({ error: "Only providers can decline counters." });
       }
 
-      const bidId = Number(req.params.bidId);
-      if (!Number.isFinite(bidId)) {
-        return res.status(400).json({ error: "Invalid bidId parameter" });
-      }
+      const { bidId } = (req as any).validated.params as { bidId: number };
 
       const bid = await prisma.bid.findUnique({
         where: { id: bidId },
@@ -2159,26 +4609,91 @@ app.get("/consumer/jobs", authMiddleware, async (req: AuthRequest, res: Response
       return res.status(403).json({ error: "Only consumers can view their jobs." });
     }
 
-    const jobs = await prisma.job.findMany({
-      where: { consumerId: req.user.userId },
-      orderBy: { createdAt: "desc" },
-      include: {
-        _count: {
-          select: { bids: true },
-        },
-      },
-    });
+    const selectBase = {
+      id: true,
+      consumerId: true,
+      title: true,
+      description: true,
+      status: true,
+      location: true,
+      createdAt: true,
+      _count: { select: { bids: true } },
+    } as const;
 
-    return res.json(
-      jobs.map((job) => ({
-        id: job.id,
-        title: job.title,
-        status: job.status,
-        location: job.location,
-        createdAt: job.createdAt,
-        bidCount: job._count.bids,
-      }))
-    );
+    const selectWithClassification = {
+      ...selectBase,
+      category: true,
+      trade: true,
+      urgency: true,
+      suggestedTags: true,
+      suggestedMinPrice: true,
+      suggestedMaxPrice: true,
+      suggestedReason: true,
+    } as const;
+
+    let jobs: any[] = [];
+    let hasClassificationColumns = true;
+    try {
+      jobs = await prisma.job.findMany({
+        where: { consumerId: req.user.userId },
+        orderBy: { createdAt: "desc" },
+        select: selectWithClassification,
+      });
+    } catch (err: any) {
+      if (!isMissingDbColumnError(err)) throw err;
+      hasClassificationColumns = false;
+      jobs = await prisma.job.findMany({
+        where: { consumerId: req.user.userId },
+        orderBy: { createdAt: "desc" },
+        select: selectBase,
+      });
+    }
+
+    const items = hasClassificationColumns
+      ? jobs.map((job) => ({
+          id: job.id,
+          title: job.title,
+          status: job.status,
+          location: job.location,
+          createdAt: job.createdAt,
+          bidCount: job._count.bids,
+          category: job.category,
+          trade: job.trade,
+          urgency: job.urgency,
+          suggestedTags: job.suggestedTags ?? [],
+          suggestedMinPrice: job.suggestedMinPrice ?? null,
+          suggestedMaxPrice: job.suggestedMaxPrice ?? null,
+          suggestedReason: job.suggestedReason ?? null,
+        }))
+      : await Promise.all(
+          jobs.map(async (job) => {
+            const cls = await classifyJob(`${job.title}\n${job.description ?? ""}`);
+            const suggestion = suggestJobPrice({
+              category: cls.category,
+              trade: cls.trade,
+              location: job.location ?? null,
+              title: job.title,
+              description: job.description ?? "",
+            });
+            return {
+              id: job.id,
+              title: job.title,
+              status: job.status,
+              location: job.location,
+              createdAt: job.createdAt,
+              bidCount: job._count.bids,
+              category: cls.category,
+              trade: cls.trade,
+              urgency: cls.urgency,
+              suggestedTags: cls.suggestedTags,
+              suggestedMinPrice: suggestion.suggestedMinPrice,
+              suggestedMaxPrice: suggestion.suggestedMaxPrice,
+              suggestedReason: suggestion.suggestedReason,
+            };
+          })
+        );
+
+    return res.json(items);
   } catch (err) {
     console.error("Consumer My Jobs error:", err);
     return res
@@ -2200,23 +4715,64 @@ app.get("/consumer/jobs/:jobId", authMiddleware, async (req: AuthRequest, res: R
     const jobId = Number(req.params.jobId);
     if (Number.isNaN(jobId)) return res.status(400).json({ error: "Invalid jobId parameter" });
 
-    const job = await prisma.job.findUnique({
-      where: { id: jobId },
-      include: {
-        _count: { select: { bids: true } },
-        attachments: true,
+    let job: any;
+    let cls: any | null = null;
 
-        // ✅ awarded (ACCEPTED) bid + provider summary
-        bids: {
-          where: { status: "ACCEPTED" },
-          orderBy: { createdAt: "desc" }, // ✅ deterministic
-          take: 1,
-          include: {
-            provider: { include: { providerProfile: true } },
-          },
+    const selectBase = {
+      id: true,
+      consumerId: true,
+      title: true,
+      description: true,
+      budgetMin: true,
+      budgetMax: true,
+      location: true,
+      status: true,
+      completionPendingForUserId: true,
+      completedAt: true,
+      createdAt: true,
+      _count: { select: { bids: true } },
+      attachments: true,
+      bids: {
+        where: { status: "ACCEPTED" },
+        orderBy: { createdAt: "desc" },
+        take: 1,
+        include: {
+          provider: { include: { providerProfile: true } },
         },
       },
-    });
+    } as const;
+
+    const selectWithClassification = {
+      ...selectBase,
+      category: true,
+      trade: true,
+      urgency: true,
+      suggestedTags: true,
+      suggestedMinPrice: true,
+      suggestedMaxPrice: true,
+      suggestedReason: true,
+    } as const;
+
+    try {
+      job = await prisma.job.findUnique({
+        where: { id: jobId },
+        select: selectWithClassification,
+      });
+      if (job) {
+        cls = {
+          category: job.category,
+          trade: job.trade,
+          urgency: job.urgency,
+          suggestedTags: job.suggestedTags ?? [],
+        };
+      }
+    } catch (err: any) {
+      if (!isMissingDbColumnError(err)) throw err;
+      job = await prisma.job.findUnique({
+        where: { id: jobId },
+        select: selectBase,
+      });
+    }
 
     if (!job) return res.status(404).json({ error: "Job not found." });
 
@@ -2227,6 +4783,18 @@ app.get("/consumer/jobs/:jobId", authMiddleware, async (req: AuthRequest, res: R
     // ✅ FIX: actually read the included accepted bid
     const awarded = job.bids?.[0] ?? null;
 
+    if (!cls) {
+      cls = await classifyJob(`${job.title}\n${job.description ?? ""}`);
+    }
+
+    const suggestion = suggestJobPrice({
+      category: cls.category,
+      trade: cls.trade,
+      location: job.location ?? null,
+      title: job.title,
+      description: job.description ?? "",
+    });
+
     return res.json({
       id: job.id,
       title: job.title,
@@ -2235,11 +4803,20 @@ app.get("/consumer/jobs/:jobId", authMiddleware, async (req: AuthRequest, res: R
       budgetMax: job.budgetMax,
       location: job.location,
       status: job.status,
+      completionPendingForUserId: (job as any).completionPendingForUserId ?? null,
+      completedAt: (job as any).completedAt ?? null,
+      category: cls.category,
+      trade: cls.trade,
+      urgency: cls.urgency,
+      suggestedTags: cls.suggestedTags ?? [],
+      suggestedMinPrice: job.suggestedMinPrice ?? suggestion.suggestedMinPrice,
+      suggestedMaxPrice: job.suggestedMaxPrice ?? suggestion.suggestedMaxPrice,
+      suggestedReason: job.suggestedReason ?? suggestion.suggestedReason,
       createdAt: job.createdAt,
       bidCount: job._count.bids,
       attachments: job.attachments.map((a) => ({
         id: a.id,
-        url: a.url,
+        url: attachmentPublicUrl(req, a.id),
         type: a.type,
         createdAt: a.createdAt,
       })),
@@ -2390,26 +4967,85 @@ app.get(
         return res.status(400).json({ error: "Invalid jobId parameter" });
       }
 
-      const job = await prisma.job.findUnique({
-        where: { id: jobId },
-        select: {
-          id: true,
-          title: true,
-          description: true,
-          budgetMin: true,
-          budgetMax: true,
-          location: true,
-          status: true,
-          createdAt: true,
-          consumer: {
-            select: { id: true, name: true },
-          },
+      let job: any;
+      let cls: any | null = null;
+
+      const selectBase = {
+        id: true,
+        title: true,
+        description: true,
+        budgetMin: true,
+        budgetMax: true,
+        location: true,
+        status: true,
+        createdAt: true,
+        consumer: {
+          select: { id: true, name: true },
         },
-      });
+      } as const;
+
+      const selectWithCompletion = {
+        ...selectBase,
+        completionPendingForUserId: true,
+        completedAt: true,
+      } as const;
+
+      const selectWithClassification = {
+        ...selectBase,
+        category: true,
+        trade: true,
+        urgency: true,
+        suggestedTags: true,
+      } as const;
+
+      const selectWithClassificationAndCompletion = {
+        ...selectWithClassification,
+        completionPendingForUserId: true,
+        completedAt: true,
+      } as const;
+
+      try {
+        job = await prisma.job.findUnique({
+          where: { id: jobId },
+          select: selectWithClassificationAndCompletion,
+        });
+        if (job) {
+          cls = {
+            category: job.category,
+            trade: job.trade,
+            urgency: job.urgency,
+            suggestedTags: job.suggestedTags ?? [],
+          };
+        }
+      } catch (err: any) {
+        if (!isMissingDbColumnError(err)) throw err;
+
+        // Classification and/or completion fields may not be deployed yet.
+        try {
+          job = await prisma.job.findUnique({ where: { id: jobId }, select: selectWithCompletion });
+        } catch (err2: any) {
+          if (!isMissingDbColumnError(err2)) throw err2;
+          job = await prisma.job.findUnique({ where: { id: jobId }, select: selectBase });
+        }
+      }
 
       if (!job) {
         return res.status(404).json({ error: "Job not found." });
       }
+
+      if (!cls) {
+        cls = await classifyJob(`${job.title}\n${job.description ?? ""}`);
+      }
+
+      job = {
+        ...job,
+        category: cls.category,
+        trade: cls.trade,
+        urgency: cls.urgency,
+        suggestedTags: cls.suggestedTags ?? [],
+        completionPendingForUserId: (job as any).completionPendingForUserId ?? null,
+        completedAt: (job as any).completedAt ?? null,
+      };
 
       // Fetch this provider's bid on the job, if any
       const myBid = await prisma.bid.findFirst({
@@ -2450,28 +5086,35 @@ app.get(
 
 
 // POST /jobs/:jobId/reviews  → consumer leaves or updates a review for the provider on this job
-app.post("/jobs/:jobId/reviews", async (req, res) => {
+app.post(
+  "/jobs/:jobId/reviews",
+  authMiddleware,
+  validate({
+    params: jobIdParamsSchema,
+    body: z.object({
+      rating: z.coerce.number().int().min(1).max(5),
+      text: z.string().max(2000).optional(),
+      comment: z.string().max(2000).optional(),
+    }),
+  }),
+  async (req, res) => {
   try {
-    const user = getUserFromAuthHeader(req);
-    if (!user) {
-      return res.status(401).json({ error: "Unauthorized" });
+    if (!req.user) return res.status(401).json({ error: "Unauthorized" });
+    if (req.user.role !== "CONSUMER" && req.user.role !== "PROVIDER") {
+      return res.status(403).json({ error: "Only consumers or providers can leave reviews." });
     }
 
-    // Only consumers can leave reviews
-    if (user.role !== "CONSUMER") {
-      return res.status(403).json({ error: "Only consumers can leave reviews on jobs." });
-    }
+    const { jobId } = (req as any).validated.params as { jobId: number };
+    const { rating: ratingNum, text, comment } = (req as any).validated.body as {
+      rating: number;
+      text?: string;
+      comment?: string;
+    };
 
-    const jobId = Number(req.params.jobId);
-    if (Number.isNaN(jobId)) {
-      return res.status(400).json({ error: "Invalid jobId in URL." });
-    }
-
-    const { rating, comment } = req.body as { rating?: number; comment?: string };
-
-    const ratingNum = Number(rating);
-    if (!ratingNum || Number.isNaN(ratingNum) || ratingNum < 1 || ratingNum > 5) {
-      return res.status(400).json({ error: "rating must be a number between 1 and 5." });
+    const moderation = moderateReviewText(text ?? comment ?? null);
+    if (!moderation.ok) {
+      const { error } = moderation as { ok: false; error: string };
+      return res.status(400).json({ error });
     }
 
     // Fetch job (to verify ownership & status)
@@ -2484,13 +5127,8 @@ app.post("/jobs/:jobId/reviews", async (req, res) => {
       return res.status(404).json({ error: "Job not found." });
     }
 
-    // Ensure this user owns the job
-    if (job.consumerId !== user.userId) {
-      return res.status(403).json({ error: "You can only review jobs that you created." });
-    }
-
     // Only allow review if job has been COMPLETED
-    if (job.status !== "COMPLETED") {
+    if (!canReviewJob(job.status)) {
       return res.status(400).json({
         error: `Only COMPLETED jobs can be reviewed. Current status: ${job.status}.`,
       });
@@ -2510,12 +5148,33 @@ app.post("/jobs/:jobId/reviews", async (req, res) => {
 
     const providerId = acceptedBid.providerId;
 
+    const reviewerUserId = req.user.userId;
+    let revieweeUserId: number;
+
+    if (req.user.role === "CONSUMER") {
+      if (job.consumerId !== reviewerUserId) {
+        return res.status(403).json({ error: "You can only review jobs that you created." });
+      }
+      revieweeUserId = providerId;
+    } else {
+      // PROVIDER: only the accepted provider can review the consumer for this job
+      if (providerId !== reviewerUserId) {
+        return res.status(403).json({ error: "Only the accepted provider can review this job." });
+      }
+      revieweeUserId = job.consumerId;
+    }
+
     // Check if this consumer already reviewed this job+provider → update instead of create
-    const existing = await prisma.review.findFirst({
-      where: { jobId, consumerId: user.userId, providerId },
+    const existing = await prisma.review.findUnique({
+      where: {
+        jobId_reviewerUserId: {
+          jobId,
+          reviewerUserId,
+        },
+      },
     });
 
-    const commentValue = comment?.trim() || null;
+    const textValue = moderation.text;
 
     let review;
     let eventType: "review.created" | "review.updated" = "review.created";
@@ -2524,45 +5183,27 @@ app.post("/jobs/:jobId/reviews", async (req, res) => {
       eventType = "review.updated";
       review = await prisma.review.update({
         where: { id: existing.id },
-        data: { rating: ratingNum, comment: commentValue },
+        data: {
+          rating: ratingNum,
+          text: textValue,
+          revieweeUserId,
+        },
       });
     } else {
       review = await prisma.review.create({
         data: {
           jobId,
-          consumerId: user.userId,
-          providerId,
+          reviewerUserId,
+          revieweeUserId,
           rating: ratingNum,
-          comment: commentValue,
+          text: textValue,
         },
       });
     }
 
-    // Recompute provider's average rating & reviewCount
-    const stats = await prisma.review.aggregate({
-      where: { providerId },
-      _avg: { rating: true },
-      _count: { _all: true },
-    });
-
-    const ratingSummary = {
-      averageRating: stats._avg.rating ?? null,
-      reviewCount: stats._count._all ?? 0,
-    };
-
-    // Update ProviderProfile.rating & reviewCount (use upsert to be safe)
-    await prisma.providerProfile.upsert({
-      where: { providerId },
-      update: {
-        rating: ratingSummary.averageRating,
-        reviewCount: ratingSummary.reviewCount,
-      },
-      create: {
-        providerId,
-        rating: ratingSummary.averageRating,
-        reviewCount: ratingSummary.reviewCount,
-      },
-    });
+    // Recompute provider's average rating & reviewCount (only when the provider is being reviewed)
+    const ratingSummary =
+      revieweeUserId === providerId ? await recomputeProviderRating(providerId) : null;
 
     // ✅ Webhook: review created/updated (after review + provider profile update)
     await enqueueWebhookEvent({
@@ -2571,11 +5212,11 @@ app.post("/jobs/:jobId/reviews", async (req, res) => {
         reviewId: review.id,
         jobId,
         jobTitle: job.title,
-        consumerId: user.userId,
-        providerId,
+        reviewerUserId,
+        revieweeUserId,
         acceptedBidId: acceptedBid.id,
         rating: review.rating,
-        comment: review.comment,
+        text: review.text,
         createdAt: review.createdAt,
         updatedAt: review.updatedAt,
         ratingSummary,
@@ -2594,6 +5235,61 @@ app.post("/jobs/:jobId/reviews", async (req, res) => {
     });
   }
 });
+
+// GET /jobs/:jobId/reviews → list reviews for a job (both sides)
+app.get(
+  "/jobs/:jobId/reviews",
+  authMiddleware,
+  validate({ params: jobIdParamsSchema }),
+  async (req: AuthRequest, res: Response) => {
+    try {
+      if (!req.user) return res.status(401).json({ error: "Not authenticated" });
+
+      const { jobId } = (req as any).validated.params as { jobId: number };
+
+      const job = await prisma.job.findUnique({
+        where: { id: jobId },
+        select: { id: true, consumerId: true, status: true, title: true },
+      });
+      if (!job) return res.status(404).json({ error: "Job not found." });
+
+      const acceptedBid = await prisma.bid.findFirst({
+        where: { jobId, status: "ACCEPTED" },
+        select: { providerId: true },
+      });
+
+      const allowedUserIds = new Set<number>([job.consumerId]);
+      if (acceptedBid) allowedUserIds.add(acceptedBid.providerId);
+
+      if (!isAdmin(req) && !allowedUserIds.has(req.user.userId)) {
+        return res.status(403).json({ error: "Not allowed." });
+      }
+
+      const reviews = await prisma.review.findMany({
+        where: { jobId },
+        orderBy: { createdAt: "asc" },
+        select: {
+          id: true,
+          rating: true,
+          text: true,
+          createdAt: true,
+          reviewerUserId: true,
+          revieweeUserId: true,
+          reviewer: { select: { id: true, name: true, role: true } },
+          reviewee: { select: { id: true, name: true, role: true } },
+        },
+      });
+
+      return res.json({
+        job: { id: job.id, title: job.title, status: job.status },
+        reviews,
+      });
+    } catch (err) {
+      console.error("GET /jobs/:jobId/reviews error:", err);
+      return res.status(500).json({ error: "Internal server error while fetching job reviews." });
+    }
+  }
+);
 
 // GET /providers/:providerId/reviews → list all reviews for a provider
 app.get(
@@ -2624,14 +5320,17 @@ app.get(
         return res.status(404).json({ error: "Provider not found." });
       }
 
+      const limit = Math.min(parsePositiveInt(req.query.limit, 50, 200), 200);
+
       // Fetch reviews with job + consumer info
       const reviews = await prisma.review.findMany({
-        where: { providerId },
+        where: { revieweeUserId: providerId },
         orderBy: { createdAt: "desc" },
+        take: limit,
         select: {
           id: true,
           rating: true,
-          comment: true,
+          text: true,
           createdAt: true,
           job: {
             select: {
@@ -2639,7 +5338,7 @@ app.get(
               title: true,
             },
           },
-          consumer: {
+          reviewer: {
             select: {
               id: true,
               name: true,
@@ -2653,28 +5352,9 @@ app.get(
       let reviewCount = provider.providerProfile?.reviewCount ?? null;
 
       if (averageRating === null || reviewCount === null) {
-        const agg = await prisma.review.aggregate({
-          where: { providerId },
-          _avg: { rating: true },
-          _count: { _all: true },
-        });
-
-        averageRating = agg._avg.rating ?? null;
-        reviewCount = agg._count._all ?? 0;
-
-        // Optionally sync ProviderProfile for future use
-        await prisma.providerProfile.upsert({
-          where: { providerId },
-          update: {
-            rating: averageRating,
-            reviewCount: reviewCount,
-          },
-          create: {
-            providerId,
-            rating: averageRating,
-            reviewCount: reviewCount,
-          },
-        });
+        const stats = await recomputeProviderRating(providerId);
+        averageRating = stats.averageRating;
+        reviewCount = stats.reviewCount;
       }
 
       return res.json({
@@ -2690,15 +5370,15 @@ app.get(
         reviews: reviews.map((r) => ({
           id: r.id,
           rating: r.rating,
-          comment: r.comment,
+          text: r.text,
           createdAt: r.createdAt,
           job: {
             id: r.job.id,
             title: r.job.title,
           },
-          consumer: {
-            id: r.consumer.id,
-            name: r.consumer.name,
+          reviewer: {
+            id: r.reviewer?.id,
+            name: r.reviewer?.name,
           },
         })),
       });
@@ -2707,6 +5387,209 @@ app.get(
       return res.status(500).json({
         error: "Internal server error while fetching provider reviews.",
       });
+    }
+  }
+);
+
+// POST /jobs/:jobId/disputes → open a dispute (consumer or accepted provider)
+app.post(
+  "/jobs/:jobId/disputes",
+  authMiddleware,
+  validate({
+    params: jobIdParamsSchema,
+    body: z.object({
+      reasonCode: z.string().min(1).max(100),
+      description: z.string().max(5000).optional(),
+    }),
+  }),
+  async (req: AuthRequest, res: Response) => {
+    try {
+      if (!req.user) return res.status(401).json({ error: "Not authenticated" });
+      if (req.user.role !== "CONSUMER" && req.user.role !== "PROVIDER") {
+        return res.status(403).json({ error: "Only consumers or providers can open disputes." });
+      }
+
+      const { jobId } = (req as any).validated.params as { jobId: number };
+      const { reasonCode, description } = (req as any).validated.body as {
+        reasonCode: string;
+        description?: string;
+      };
+
+      const job = await prisma.job.findUnique({
+        where: { id: jobId },
+        select: { id: true, consumerId: true, status: true, title: true },
+      });
+
+      if (!job) return res.status(404).json({ error: "Job not found." });
+
+      if (!canOpenDispute(job.status)) {
+        return res.status(400).json({
+          error: `Disputes can only be opened after completion is requested or confirmed. Current status: ${job.status}.`,
+        });
+      }
+
+      const acceptedBid = await prisma.bid.findFirst({
+        where: { jobId, status: "ACCEPTED" },
+        select: { providerId: true },
+      });
+
+      const me = req.user.userId;
+      const isConsumerParticipant = job.consumerId === me;
+      const isProviderParticipant = acceptedBid?.providerId === me;
+      if (!isConsumerParticipant && !isProviderParticipant && !isAdmin(req)) {
+        return res.status(403).json({ error: "Not allowed." });
+      }
+
+      const existingOpen = await prisma.dispute.findFirst({
+        where: {
+          jobId,
+          status: { in: ["OPEN", "INVESTIGATING"] },
+        },
+        select: { id: true },
+      });
+
+      if (existingOpen) {
+        return res.status(409).json({ error: "A dispute is already open for this job." });
+      }
+
+      const dispute = await prisma.dispute.create({
+        data: {
+          jobId,
+          openedByUserId: me,
+          reasonCode: reasonCode.trim(),
+          description: description?.trim() || null,
+        },
+      });
+
+      await enqueueWebhookEvent({
+        eventType: "dispute.created",
+        payload: {
+          disputeId: dispute.id,
+          jobId: job.id,
+          jobTitle: job.title,
+          openedByUserId: me,
+          reasonCode: dispute.reasonCode,
+          status: dispute.status,
+          createdAt: dispute.createdAt,
+        },
+      });
+
+      return res.status(201).json({ dispute });
+    } catch (err) {
+      console.error("POST /jobs/:jobId/disputes error:", err);
+      return res.status(500).json({ error: "Internal server error while opening dispute." });
+    }
+  }
+);
+
+// --- Job completion confirmation flow ---
+// POST /jobs/:id/mark-complete (either participant)
+app.post(
+  "/jobs/:id/mark-complete",
+  authMiddleware,
+  requireVerifiedEmail,
+  createPostJobMarkCompleteHandler({ prisma, createNotification, enqueueWebhookEvent })
+);
+
+// POST /jobs/:id/confirm-complete (the other participant)
+app.post(
+  "/jobs/:id/confirm-complete",
+  authMiddleware,
+  requireVerifiedEmail,
+  createPostJobConfirmCompleteHandler({ prisma, createNotification, enqueueWebhookEvent })
+);
+
+// GET /admin/disputes → list disputes (admin only)
+app.get("/admin/disputes", authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    if (!requireAdmin(req, res)) return;
+
+    const status = typeof req.query.status === "string" ? req.query.status : undefined;
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize) || 50));
+    const skip = (page - 1) * pageSize;
+
+    const where: any = {};
+    if (status && ["OPEN", "INVESTIGATING", "RESOLVED"].includes(status)) {
+      where.status = status;
+    }
+
+    const [total, disputes] = await Promise.all([
+      prisma.dispute.count({ where }),
+      prisma.dispute.findMany({
+        where,
+        orderBy: { createdAt: "desc" },
+        skip,
+        take: pageSize,
+        include: {
+          openedBy: { select: { id: true, name: true, email: true, role: true } },
+          job: { select: { id: true, title: true, status: true, consumerId: true } },
+        },
+      }),
+    ]);
+
+    return res.json({
+      page,
+      pageSize,
+      total,
+      disputes,
+    });
+  } catch (err) {
+    console.error("GET /admin/disputes error:", err);
+    return res.status(500).json({ error: "Internal server error while listing disputes." });
+  }
+});
+
+// PATCH /admin/disputes/:id → update dispute status/notes (admin only)
+app.patch(
+  "/admin/disputes/:id",
+  authMiddleware,
+  validate({
+    params: z.object({ id: z.coerce.number().int().positive() }),
+    body: z.object({
+      status: z.enum(["OPEN", "INVESTIGATING", "RESOLVED"]).optional(),
+      resolutionNotes: z.string().max(5000).optional(),
+    }),
+  }),
+  async (req: AuthRequest, res: Response) => {
+    try {
+      if (!requireAdmin(req, res)) return;
+
+      const { id } = (req as any).validated.params as { id: number };
+      const { status, resolutionNotes } = (req as any).validated.body as {
+        status?: "OPEN" | "INVESTIGATING" | "RESOLVED";
+        resolutionNotes?: string;
+      };
+
+      const existing = await prisma.dispute.findUnique({ where: { id } });
+      if (!existing) return res.status(404).json({ error: "Dispute not found." });
+
+      const nextStatus = status ?? existing.status;
+      const isResolved = nextStatus === "RESOLVED";
+
+      const dispute = await prisma.dispute.update({
+        where: { id },
+        data: {
+          status: nextStatus,
+          resolutionNotes: resolutionNotes?.trim() || existing.resolutionNotes,
+          resolvedAt: isResolved ? new Date() : null,
+        },
+      });
+
+      await enqueueWebhookEvent({
+        eventType: "dispute.updated",
+        payload: {
+          disputeId: dispute.id,
+          jobId: dispute.jobId,
+          status: dispute.status,
+          resolvedAt: dispute.resolvedAt,
+        },
+      });
+
+      return res.json({ dispute });
+    } catch (err) {
+      console.error("PATCH /admin/disputes/:id error:", err);
+      return res.status(500).json({ error: "Internal server error while updating dispute." });
     }
   }
 );
@@ -2842,69 +5725,6 @@ app.get("/me/inbox", authMiddleware, async (req: AuthRequest, res: Response) => 
     return res.status(500).json({ error: "Internal server error while fetching inbox." });
   }
 });
-
-// POST /jobs/:jobId/messages/read → mark thread as read for current user
-app.post(
-  "/jobs/:jobId/messages/read",
-  authMiddleware,
-  async (req: AuthRequest, res: Response) => {
-    try {
-      if (!req.user) return res.status(401).json({ error: "Not authenticated" });
-
-      const jobId = Number(req.params.jobId);
-      if (!Number.isFinite(jobId)) {
-        return res.status(400).json({ error: "Invalid job id." });
-      }
-
-      const { jobWhereVisible } = visibilityFilters(req);
-
-      const me = req.user.userId;
-
-      // Role-based access:
-      // - Admin: any visible job
-      // - Consumer: jobs they own
-      // - Provider: jobs they have bid on
-      const roleWhere = isAdmin(req)
-        ? {}
-        : req.user.role === "CONSUMER"
-          ? { consumerId: me }
-          : req.user.role === "PROVIDER"
-            ? { bids: { some: { providerId: me } } }
-            : null;
-
-      if (!isAdmin(req) && !roleWhere) {
-        return res.status(403).json({ error: "Unsupported role for marking read." });
-      }
-
-      const job = await prisma.job.findFirst({
-        where: {
-          ...jobWhereVisible,
-          id: jobId,
-          ...(roleWhere ?? {}),
-        },
-        select: { id: true },
-      });
-
-      if (!job) {
-        return res.status(404).json({ error: "Job not found or not accessible." });
-      }
-
-      const now = new Date();
-
-      const state = await prisma.jobMessageReadState.upsert({
-        where: { jobId_userId: { jobId, userId: me } }, // ✅ matches @@unique([jobId, userId])
-        update: { lastReadAt: now },
-        create: { jobId, userId: me, lastReadAt: now },
-        select: { jobId: true, userId: true, lastReadAt: true, updatedAt: true },
-      });
-
-      return res.json({ ok: true, state });
-    } catch (err) {
-      console.error("POST /jobs/:jobId/messages/read error:", err);
-      return res.status(500).json({ error: "Internal server error while marking read." });
-    }
-  }
-);
 
 // GET /me/inbox/unread-total → total unread messages across all job threads for current user
 app.get("/me/inbox/unread-total", authMiddleware, async (req: AuthRequest, res: Response) => {
@@ -3215,12 +6035,12 @@ app.get("/me/reviews", authMiddleware, async (req: AuthRequest, res: Response) =
     const providerId = req.user.userId;
 
     const reviews = await prisma.review.findMany({
-      where: { providerId },
+      where: { revieweeUserId: providerId },
       orderBy: { createdAt: "desc" },
       select: {
         id: true,
         rating: true,
-        comment: true,
+        text: true,
         createdAt: true,
         job: {
           select: {
@@ -3229,8 +6049,7 @@ app.get("/me/reviews", authMiddleware, async (req: AuthRequest, res: Response) =
             location: true,
           },
         },
-        // ✅ FIX: "consumer" is the reviewer in your schema (not "reviewer")
-        consumer: {
+        reviewer: {
           select: {
             id: true,
             name: true,
@@ -3240,7 +6059,7 @@ app.get("/me/reviews", authMiddleware, async (req: AuthRequest, res: Response) =
     });
 
     const agg = await prisma.review.aggregate({
-      where: { providerId },
+      where: { revieweeUserId: providerId },
       _avg: { rating: true },
       _count: { rating: true },
     });
@@ -3254,7 +6073,7 @@ app.get("/me/reviews", authMiddleware, async (req: AuthRequest, res: Response) =
       reviews: reviews.map((r) => ({
         id: r.id,
         rating: r.rating,
-        comment: r.comment,
+        text: r.text,
         createdAt: r.createdAt,
         job: r.job
           ? {
@@ -3263,10 +6082,9 @@ app.get("/me/reviews", authMiddleware, async (req: AuthRequest, res: Response) =
               location: r.job.location,
             }
           : null,
-        // ✅ FIX: return consumer as the reviewer
-        consumer: {
-          id: r.consumer.id,
-          name: r.consumer.name,
+        reviewer: {
+          id: r.reviewer?.id,
+          name: r.reviewer?.name,
         },
       })),
     });
@@ -3286,10 +6104,12 @@ app.get(
   async (req: AuthRequest, res: Response) => {
     try {
       const limit = Math.min(Number(req.query.limit) || 10, 50);
+      const zip = typeof req.query.zip === "string" ? req.query.zip : undefined;
+      const boostedZip = normalizeZipForBoost({ zip });
 
       const { userWhereVisible } = visibilityFilters(req);
 
-      const profiles = await prisma.providerProfile.findMany({
+      const profilesWindow = await prisma.providerProfile.findMany({
         where: {
           provider: {
             role: "PROVIDER",
@@ -3297,21 +6117,96 @@ app.get(
           },
         },
         orderBy: [{ rating: "desc" }, { reviewCount: "desc" }],
-        take: limit,
+        take: Math.min(Math.max(limit * 5, limit), 200),
         select: {
           experience: true,
           specialties: true,
           rating: true,
           reviewCount: true,
+          verificationBadge: true,
+          featuredZipCodes: true,
           categories: { select: { id: true, name: true, slug: true } },
-          provider: { select: { id: true, name: true, email: true, phone: true, location: true } },
+          provider: {
+            select: {
+              id: true,
+              name: true,
+              email: true,
+              phone: true,
+              location: true,
+              subscription: { select: { tier: true } },
+              providerStats: {
+                select: {
+                  avgRating: true,
+                  ratingCount: true,
+                  jobsCompleted30d: true,
+                  medianResponseTimeSeconds30d: true,
+                  cancellationRate30d: true,
+                  disputeRate30d: true,
+                  reportRate30d: true,
+                  updatedAt: true,
+                },
+              },
+              providerEntitlement: {
+                select: {
+                  verificationBadge: true,
+                  featuredZipCodes: true,
+                },
+              },
+              providerVerification: { select: { status: true } },
+            },
+          },
         }
       });
 
+      const ranked = profilesWindow
+        .map((p) => {
+          const entitlement = p.provider.providerEntitlement;
+          const verificationBadge = Boolean(entitlement?.verificationBadge ?? p.verificationBadge);
+
+          const featuredZipCodes = entitlement?.featuredZipCodes ?? p.featuredZipCodes ?? [];
+          const isFeaturedForZip = boostedZip ? featuredZipCodes.includes(boostedZip) : false;
+          const subscriptionTier = p.provider.subscription?.tier ?? "FREE";
+
+          const stats = p.provider.providerStats;
+          const avgRating = stats?.avgRating ?? p.rating ?? null;
+          const ratingCount = stats?.ratingCount ?? p.reviewCount ?? 0;
+          const ranking = computeProviderDiscoveryRanking({
+            avgRating,
+            ratingCount,
+            jobsCompleted30d: stats?.jobsCompleted30d ?? 0,
+            cancellationRate30d: stats?.cancellationRate30d ?? 0,
+            disputeRate30d: stats?.disputeRate30d ?? 0,
+            reportRate30d: stats?.reportRate30d ?? 0,
+            subscriptionTier,
+            isFeaturedForZip,
+          });
+
+          return { profile: p, verificationBadge, isFeaturedForZip, ranking, stats };
+        })
+        .sort((a, b) => {
+          if (b.ranking.finalScore !== a.ranking.finalScore) return b.ranking.finalScore - a.ranking.finalScore;
+
+          const ar = a.profile.rating ?? 0;
+          const br = b.profile.rating ?? 0;
+          if (br !== ar) return br - ar;
+
+          const ac = a.profile.reviewCount ?? 0;
+          const bc = b.profile.reviewCount ?? 0;
+          if (bc !== ac) return bc - ac;
+
+          const an = a.profile.provider.name ?? "";
+          const bn = b.profile.provider.name ?? "";
+          const nameCmp = an.localeCompare(bn);
+          if (nameCmp !== 0) return nameCmp;
+
+          return a.profile.provider.id - b.profile.provider.id;
+        })
+        .slice(0, limit);
+
       // Favorites (provider favorites) for consumer
       let favoriteIds = new Set<number>();
-      if (req.user?.role === "CONSUMER" && profiles.length > 0) {
-        const providerIds = profiles.map((p) => p.provider.id);
+      if (req.user?.role === "CONSUMER" && ranked.length > 0) {
+        const providerIds = ranked.map((it) => it.profile.provider.id);
         const favorites = await prisma.favoriteProvider.findMany({
           where: {
             consumerId: req.user.userId,
@@ -3322,7 +6217,7 @@ app.get(
       }
 
       return res.json(
-        profiles.map((p) => ({
+        ranked.map(({ profile: p, verificationBadge, isFeaturedForZip, ranking, stats }) => ({
           id: p.provider.id,
           name: p.provider.name,
           email: p.provider.email,
@@ -3330,8 +6225,30 @@ app.get(
           location: p.provider.location,
           experience: p.experience,
           specialties: p.specialties,
-          rating: p.rating,
-          reviewCount: p.reviewCount,
+          rating: stats?.avgRating ?? p.rating,
+          reviewCount: stats?.ratingCount ?? p.reviewCount,
+          verificationBadge,
+          verificationStatus: p.provider.providerVerification?.status ?? "NONE",
+          isVerified: p.provider.providerVerification?.status === "VERIFIED",
+          isFeaturedForZip,
+          ranking: {
+            baseScore: ranking.baseScore,
+            tierBoost: ranking.tierBoost,
+            featuredBoost: ranking.featuredBoost,
+            finalScore: ranking.finalScore,
+          },
+          stats: stats
+            ? {
+                avgRating: stats.avgRating,
+                ratingCount: stats.ratingCount,
+                jobsCompleted30d: stats.jobsCompleted30d,
+                medianResponseTimeSeconds30d: stats.medianResponseTimeSeconds30d,
+                cancellationRate30d: stats.cancellationRate30d,
+                disputeRate30d: stats.disputeRate30d,
+                reportRate30d: stats.reportRate30d,
+                updatedAt: stats.updatedAt,
+              }
+            : null,
           isFavorited:
             req.user?.role === "CONSUMER" ? favoriteIds.has(p.provider.id) : false,
           categories: p.categories.map((c) => ({
@@ -3358,6 +6275,7 @@ app.get(
 //   specialty?: string
 //   minRating?: number
 //   minReviews?: number
+//   zip?: string (optional; used only for featured-zip ranking boost)
 //   page?: number (1-based, default 1)
 //   pageSize?: number (default 10, max 50)
 app.get(
@@ -3371,6 +6289,7 @@ app.get(
         specialty,
         minRating,
         minReviews,
+        zip,
         page = "1",
         pageSize = "10",
       } = req.query as {
@@ -3379,6 +6298,7 @@ app.get(
         specialty?: string;
         minRating?: string;
         minReviews?: string;
+        zip?: string;
         page?: string;
         pageSize?: string;
       };
@@ -3419,28 +6339,123 @@ app.get(
         where.reviewCount = { gte: minReviewsNum };
       }
 
-      const [profiles, total] = await Promise.all([
+      const boostedZip = normalizeZipForBoost({ zip, location });
+
+      // We compute a deterministic ranking score in JS (includes subscription + featured zip boosts).
+      // To keep pagination reasonably accurate without expensive raw SQL, we rank a capped window
+      // (first N results under the existing rating/review ordering) then slice.
+      const rankWindowTake = Math.min(skip + take, 200);
+
+      const [profilesWindow, total] = await Promise.all([
         prisma.providerProfile.findMany({
           where,
-            select: {
-              experience: true,
-              specialties: true,
-              rating: true,
-              reviewCount: true,
-              categories: { select: { id: true, name: true, slug: true } },
-              provider: { select: { id: true, name: true, email: true, phone: true, location: true } },
+          select: {
+            experience: true,
+            specialties: true,
+            rating: true,
+            reviewCount: true,
+            // Back-compat: some older rows may still set these on the profile.
+            verificationBadge: true,
+            featuredZipCodes: true,
+            categories: { select: { id: true, name: true, slug: true } },
+            provider: {
+              select: {
+                id: true,
+                name: true,
+                email: true,
+                phone: true,
+                location: true,
+                subscription: { select: { tier: true } },
+                providerStats: {
+                  select: {
+                    avgRating: true,
+                    ratingCount: true,
+                    jobsCompleted30d: true,
+                    medianResponseTimeSeconds30d: true,
+                    cancellationRate30d: true,
+                    disputeRate30d: true,
+                    reportRate30d: true,
+                    updatedAt: true,
+                  },
+                },
+                providerEntitlement: {
+                  select: {
+                    verificationBadge: true,
+                    featuredZipCodes: true,
+                  },
+                },
+                providerVerification: { select: { status: true } },
+              },
             },
+          },
           orderBy: [{ rating: "desc" }, { reviewCount: "desc" }, { provider: { name: "asc" } }],
-          skip,
-          take,
+          skip: 0,
+          take: rankWindowTake,
         }),
         prisma.providerProfile.count({ where }),
       ]);
 
+      const ranked = profilesWindow
+        .map((p) => {
+          const entitlement = p.provider.providerEntitlement;
+          const verificationBadge = Boolean(entitlement?.verificationBadge ?? p.verificationBadge);
+
+          const featuredZipCodes = entitlement?.featuredZipCodes ?? p.featuredZipCodes ?? [];
+          const isFeaturedForZip = boostedZip ? featuredZipCodes.includes(boostedZip) : false;
+
+          const subscriptionTier = p.provider.subscription?.tier ?? "FREE";
+
+          const stats = p.provider.providerStats;
+          const avgRating = stats?.avgRating ?? p.rating ?? null;
+          const ratingCount = stats?.ratingCount ?? p.reviewCount ?? 0;
+
+          const ranking = computeProviderDiscoveryRanking({
+            avgRating,
+            ratingCount,
+            jobsCompleted30d: stats?.jobsCompleted30d ?? 0,
+            cancellationRate30d: stats?.cancellationRate30d ?? 0,
+            disputeRate30d: stats?.disputeRate30d ?? 0,
+            reportRate30d: stats?.reportRate30d ?? 0,
+            subscriptionTier,
+            isFeaturedForZip,
+          });
+
+          return {
+            profile: p,
+            verificationBadge,
+            isFeaturedForZip,
+            ranking,
+            stats,
+          };
+        })
+        .sort((a, b) => {
+          // Deterministic ordering: score desc, then rating/reviews, then name, then providerId.
+          if (b.ranking.finalScore !== a.ranking.finalScore) {
+            return b.ranking.finalScore - a.ranking.finalScore;
+          }
+
+          const ar = a.profile.rating ?? 0;
+          const br = b.profile.rating ?? 0;
+          if (br !== ar) return br - ar;
+
+          const ac = a.profile.reviewCount ?? 0;
+          const bc = b.profile.reviewCount ?? 0;
+          if (bc !== ac) return bc - ac;
+
+          const an = a.profile.provider.name ?? "";
+          const bn = b.profile.provider.name ?? "";
+          const nameCmp = an.localeCompare(bn);
+          if (nameCmp !== 0) return nameCmp;
+
+          return a.profile.provider.id - b.profile.provider.id;
+        });
+
+      const pageItems = ranked.slice(skip, skip + take);
+
       // Favorites for consumer
       let favoriteIds = new Set<number>();
-      if (req.user?.role === "CONSUMER" && profiles.length > 0) {
-        const providerIds = profiles.map((p) => p.provider.id);
+      if (req.user?.role === "CONSUMER" && pageItems.length > 0) {
+        const providerIds = pageItems.map((it) => it.profile.provider.id);
         const favorites = await prisma.favoriteProvider.findMany({
           where: {
             consumerId: req.user.userId,
@@ -3455,7 +6470,7 @@ app.get(
         pageSize: take,
         total,
         totalPages: Math.ceil(total / take) || 1,
-        providers: profiles.map((p) => ({
+        providers: pageItems.map(({ profile: p, verificationBadge, isFeaturedForZip, ranking, stats }) => ({
           id: p.provider.id,
           name: p.provider.name,
           email: p.provider.email,
@@ -3463,8 +6478,34 @@ app.get(
           location: p.provider.location,
           experience: p.experience,
           specialties: p.specialties,
-          rating: p.rating,
-          reviewCount: p.reviewCount,
+          rating: stats?.avgRating ?? p.rating,
+          reviewCount: stats?.ratingCount ?? p.reviewCount,
+          verificationBadge,
+          verificationStatus: p.provider.providerVerification?.status ?? "NONE",
+          isVerified: p.provider.providerVerification?.status === "VERIFIED",
+
+          // Do not leak featured zip lists; only expose what UI needs.
+          isFeaturedForZip,
+          ranking: {
+            baseScore: ranking.baseScore,
+            tierBoost: ranking.tierBoost,
+            featuredBoost: ranking.featuredBoost,
+            finalScore: ranking.finalScore,
+          },
+
+          stats: stats
+            ? {
+                avgRating: stats.avgRating,
+                ratingCount: stats.ratingCount,
+                jobsCompleted30d: stats.jobsCompleted30d,
+                medianResponseTimeSeconds30d: stats.medianResponseTimeSeconds30d,
+                cancellationRate30d: stats.cancellationRate30d,
+                disputeRate30d: stats.disputeRate30d,
+                reportRate30d: stats.reportRate30d,
+                updatedAt: stats.updatedAt,
+              }
+            : null,
+
           isFavorited:
             req.user?.role === "CONSUMER" ? favoriteIds.has(p.provider.id) : false,
           categories: p.categories.map((c) => ({
@@ -3492,9 +6533,15 @@ app.get("/providers/search/feed", authMiddleware, async (req: AuthRequest, res: 
   try {
     if (!req.user) return res.status(401).json({ error: "Not authenticated" });
 
-    const { cursor, limit } = req.query as { cursor?: string; limit?: string };
+    const { cursor, limit, zip, location } = req.query as {
+      cursor?: string;
+      limit?: string;
+      zip?: string;
+      location?: string;
+    };
     const take = parsePositiveInt(limit, 20, 50);
     const cursorId = parseOptionalCursorId(cursor);
+    const boostedZip = normalizeZipForBoost({ zip, location });
 
     const { userWhereVisible } = visibilityFilters(req);
 
@@ -3515,8 +6562,38 @@ app.get("/providers/search/feed", authMiddleware, async (req: AuthRequest, res: 
         specialties: true,
         rating: true,
         reviewCount: true,
+        verificationBadge: true,
+        featuredZipCodes: true,
         categories: { select: { id: true, name: true, slug: true } },
-        provider: { select: { id: true, name: true, email: true, phone: true, location: true } },
+        provider: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+            phone: true,
+            location: true,
+            subscription: { select: { tier: true } },
+            providerStats: {
+              select: {
+                avgRating: true,
+                ratingCount: true,
+                jobsCompleted30d: true,
+                medianResponseTimeSeconds30d: true,
+                cancellationRate30d: true,
+                disputeRate30d: true,
+                reportRate30d: true,
+                updatedAt: true,
+              },
+            },
+            providerEntitlement: {
+              select: {
+                verificationBadge: true,
+                featuredZipCodes: true,
+              },
+            },
+            providerVerification: { select: { status: true } },
+          },
+        },
       },
     });
 
@@ -3541,8 +6618,44 @@ app.get("/providers/search/feed", authMiddleware, async (req: AuthRequest, res: 
         location: p.provider.location,
         experience: p.experience,
         specialties: p.specialties,
-        rating: p.rating,
-        reviewCount: p.reviewCount,
+        rating: p.provider.providerStats?.avgRating ?? p.rating,
+        reviewCount: p.provider.providerStats?.ratingCount ?? p.reviewCount,
+        verificationBadge: Boolean(p.provider.providerEntitlement?.verificationBadge ?? p.verificationBadge),
+        verificationStatus: p.provider.providerVerification?.status ?? "NONE",
+        isVerified: p.provider.providerVerification?.status === "VERIFIED",
+        isFeaturedForZip: boostedZip
+          ? (p.provider.providerEntitlement?.featuredZipCodes ?? p.featuredZipCodes ?? []).includes(boostedZip)
+          : false,
+        ranking: (() => {
+          const featuredZipCodes = p.provider.providerEntitlement?.featuredZipCodes ?? p.featuredZipCodes ?? [];
+          const isFeaturedForZip = boostedZip ? featuredZipCodes.includes(boostedZip) : false;
+          const subscriptionTier = p.provider.subscription?.tier ?? "FREE";
+          const stats = p.provider.providerStats;
+          const avgRating = stats?.avgRating ?? p.rating ?? null;
+          const ratingCount = stats?.ratingCount ?? p.reviewCount ?? 0;
+          return computeProviderDiscoveryRanking({
+            avgRating,
+            ratingCount,
+            jobsCompleted30d: stats?.jobsCompleted30d ?? 0,
+            cancellationRate30d: stats?.cancellationRate30d ?? 0,
+            disputeRate30d: stats?.disputeRate30d ?? 0,
+            reportRate30d: stats?.reportRate30d ?? 0,
+            subscriptionTier,
+            isFeaturedForZip,
+          });
+        })(),
+        stats: p.provider.providerStats
+          ? {
+              avgRating: p.provider.providerStats.avgRating,
+              ratingCount: p.provider.providerStats.ratingCount,
+              jobsCompleted30d: p.provider.providerStats.jobsCompleted30d,
+              medianResponseTimeSeconds30d: p.provider.providerStats.medianResponseTimeSeconds30d,
+              cancellationRate30d: p.provider.providerStats.cancellationRate30d,
+              disputeRate30d: p.provider.providerStats.disputeRate30d,
+              reportRate30d: p.provider.providerStats.reportRate30d,
+              updatedAt: p.provider.providerStats.updatedAt,
+            }
+          : null,
         isFavorited: req.user.role === "CONSUMER" ? favoriteIds.has(p.provider.id) : false,
         categories: p.categories.map((c) => ({ id: c.id, name: c.name, slug: c.slug })),
       })),
@@ -3571,7 +6684,7 @@ app.get(
           .json({ error: "Only providers have a provider profile." });
       }
 
-      const provider = await prisma.user.findUnique({
+      let provider = await prisma.user.findUnique({
         where: { id: req.user.userId },
         include: {
           providerProfile: {
@@ -3579,8 +6692,31 @@ app.get(
               categories: true,
             },
           },
+          providerStats: true,
+          providerVerification: {
+            select: { status: true, method: true, providerSubmittedAt: true, verifiedAt: true },
+          },
         },
       });
+
+      // If missing (e.g., new provider), compute on-demand once.
+      if (provider && !provider.providerStats) {
+        await recomputeProviderStatsForProvider({ prisma, providerId: provider.id });
+        provider = await prisma.user.findUnique({
+          where: { id: req.user.userId },
+          include: {
+            providerProfile: {
+              include: {
+                categories: true,
+              },
+            },
+            providerStats: true,
+            providerVerification: {
+              select: { status: true, method: true, providerSubmittedAt: true, verifiedAt: true },
+            },
+          },
+        });
+      }
 
       if (!provider) {
         return res.status(404).json({ error: "Provider not found." });
@@ -3595,8 +6731,25 @@ app.get(
         createdAt: provider.createdAt,
         experience: provider.providerProfile?.experience ?? null,
         specialties: provider.providerProfile?.specialties ?? null,
-        rating: provider.providerProfile?.rating ?? null,
-        reviewCount: provider.providerProfile?.reviewCount ?? 0,
+        rating: provider.providerStats?.avgRating ?? provider.providerProfile?.rating ?? null,
+        reviewCount: provider.providerStats?.ratingCount ?? provider.providerProfile?.reviewCount ?? 0,
+        verificationBadge: provider.providerProfile?.verificationBadge ?? false,
+        verificationStatus: provider.providerVerification?.status ?? "NONE",
+        isVerified: provider.providerVerification?.status === "VERIFIED",
+        featuredZipCodes: provider.providerProfile?.featuredZipCodes ?? [],
+        stats: provider.providerStats
+          ? {
+              avgRating: provider.providerStats.avgRating,
+              ratingCount: provider.providerStats.ratingCount,
+              jobsCompletedAllTime: provider.providerStats.jobsCompletedAllTime,
+              jobsCompleted30d: provider.providerStats.jobsCompleted30d,
+              medianResponseTimeSeconds30d: provider.providerStats.medianResponseTimeSeconds30d,
+              cancellationRate30d: provider.providerStats.cancellationRate30d,
+              disputeRate30d: provider.providerStats.disputeRate30d,
+              reportRate30d: provider.providerStats.reportRate30d,
+              updatedAt: provider.providerStats.updatedAt,
+            }
+          : null,
         categories:
           provider.providerProfile?.categories.map((c) => ({
             id: c.id,
@@ -3613,9 +6766,447 @@ app.get(
   }
 );
 
+// -----------------------------
+// Provider Verification
+// -----------------------------
+
+const providerVerificationSubmitSchema = {
+  body: z.object({
+    method: z.enum(["ID", "BACKGROUND_CHECK"]).optional(),
+    attachmentIds: z.array(z.coerce.number().int().positive()).optional(),
+    externalReference: z.string().max(200).optional(),
+    metadataJson: z.record(z.any()).optional(),
+  }),
+};
+
+// GET /provider/verification/status
+app.get("/provider/verification/status", authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    if (!req.user) return res.status(401).json({ error: "Not authenticated" });
+    if (req.user.role !== "PROVIDER") {
+      return res.status(403).json({ error: "Only providers can access verification." });
+    }
+
+    const row = await prisma.providerVerification.findUnique({
+      where: { providerId: req.user.userId },
+      select: {
+        providerId: true,
+        status: true,
+        method: true,
+        providerSubmittedAt: true,
+        verifiedAt: true,
+        metadataJson: true,
+        updatedAt: true,
+        createdAt: true,
+        attachments: {
+          orderBy: { createdAt: "desc" },
+          select: {
+            id: true,
+            mimeType: true,
+            filename: true,
+            sizeBytes: true,
+            createdAt: true,
+          },
+        },
+      },
+    });
+
+    return res.json({
+      providerId: req.user.userId,
+      status: row?.status ?? "NONE",
+      method: row?.method ?? null,
+      providerSubmittedAt: row?.providerSubmittedAt ?? null,
+      verifiedAt: row?.verifiedAt ?? null,
+      metadataJson: row?.metadataJson ?? null,
+      createdAt: row?.createdAt ?? null,
+      updatedAt: row?.updatedAt ?? null,
+      attachments: (row?.attachments ?? []).map((a) => ({
+        ...a,
+        url: `${(process.env.PUBLIC_BASE_URL ?? "").trim() || `${req.protocol}://${req.get("host")}`}/provider/verification/attachments/${a.id}`,
+      })),
+    });
+  } catch (err) {
+    console.error("GET /provider/verification/status error:", err);
+    return res.status(500).json({ error: "Internal server error while fetching verification status." });
+  }
+});
+
+// POST /provider/verification/attachments/upload
+// Multipart: file=<binary>
+app.post(
+  "/provider/verification/attachments/upload",
+  authMiddleware,
+  requireVerifiedEmail,
+  requireAttestation,
+  uploadSingleVerificationAttachment,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      if (!req.user) return res.status(401).json({ error: "Not authenticated" });
+      if (req.user.role !== "PROVIDER") {
+        return res.status(403).json({ error: "Only providers can upload verification documents." });
+      }
+
+      const file = (req as any).file as Express.Multer.File | undefined;
+      if (!file) {
+        return res.status(400).json({ error: "file is required" });
+      }
+
+      // Ensure parent record exists so the FK can be satisfied
+      await prisma.providerVerification.upsert({
+        where: { providerId: req.user.userId },
+        create: { providerId: req.user.userId },
+        update: {},
+      });
+
+      const diskPath = path.posix.join("attachments", file.filename);
+
+      const attach = await prisma.providerVerificationAttachment.create({
+        data: {
+          providerId: req.user.userId,
+          uploaderUserId: req.user.userId,
+          diskPath,
+          mimeType: file.mimetype,
+          filename: file.originalname || null,
+          sizeBytes: file.size || null,
+        },
+        select: {
+          id: true,
+          providerId: true,
+          mimeType: true,
+          filename: true,
+          sizeBytes: true,
+          createdAt: true,
+        },
+      });
+
+      const publicBase =
+        (process.env.PUBLIC_BASE_URL ?? "").trim() ||
+        `${req.protocol}://${req.get("host")}`;
+
+      return res.json({
+        attachment: {
+          ...attach,
+          url: `${publicBase}/provider/verification/attachments/${attach.id}`,
+        },
+      });
+    } catch (err) {
+      console.error("POST /provider/verification/attachments/upload error:", err);
+      return res.status(500).json({ error: "Internal server error while uploading verification document." });
+    }
+  }
+);
+
+// GET /provider/verification/attachments/:id
+// Streams a verification attachment from disk if caller is authorized (provider owner or admin).
+app.get(
+  "/provider/verification/attachments/:id",
+  authMiddleware,
+  attachmentDownloadLimiter,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      if (!req.user) return res.status(401).json({ error: "Not authenticated" });
+
+      const id = Number(req.params.id);
+      if (Number.isNaN(id)) return res.status(400).json({ error: "Invalid attachment id" });
+
+      const attach = await prisma.providerVerificationAttachment.findUnique({
+        where: { id },
+        select: {
+          id: true,
+          providerId: true,
+          mimeType: true,
+          filename: true,
+          sizeBytes: true,
+          diskPath: true,
+        },
+      });
+
+      if (!attach) return res.status(404).json({ error: "Attachment not found" });
+
+      const authorized =
+        isAdmin(req) || (req.user.role === "PROVIDER" && req.user.userId === attach.providerId);
+
+      if (!authorized) {
+        return res.status(403).json({ error: "Not allowed to access this attachment." });
+      }
+
+      if (!attach.diskPath) {
+        return res.status(404).json({ error: "Attachment file is not available." });
+      }
+
+      let absPath: string;
+      try {
+        absPath = resolveDiskPathInsideUploadsDir(UPLOADS_DIR, attach.diskPath);
+      } catch {
+        return res.status(400).json({ error: "Invalid attachment path." });
+      }
+
+      let st: fs.Stats;
+      try {
+        st = await fs.promises.stat(absPath);
+        if (!st.isFile()) return res.status(404).json({ error: "Attachment file not found." });
+      } catch {
+        return res.status(404).json({ error: "Attachment file not found." });
+      }
+
+      const ct = attach.mimeType || "application/octet-stream";
+      res.setHeader("Content-Type", ct);
+      res.setHeader("X-Content-Type-Options", "nosniff");
+
+      const safeName = sanitizeFilenameForHeader(attach.filename);
+      const dispoType = shouldInlineContentType(ct) ? "inline" : "attachment";
+      res.setHeader("Content-Disposition", `${dispoType}; filename=\"${safeName}\"`);
+
+      if (typeof attach.sizeBytes === "number" && Number.isFinite(attach.sizeBytes) && attach.sizeBytes > 0) {
+        res.setHeader("Content-Length", String(attach.sizeBytes));
+      } else {
+        res.setHeader("Content-Length", String(st.size));
+      }
+
+      const stream = fs.createReadStream(absPath);
+      stream.on("error", (e) => {
+        console.error("Verification attachment stream error:", e);
+        if (!res.headersSent) res.status(500).json({ error: "Failed to stream attachment." });
+        else res.end();
+      });
+      return stream.pipe(res);
+    } catch (err) {
+      console.error("GET /provider/verification/attachments/:id error:", err);
+      return res.status(500).json({ error: "Internal server error fetching attachment." });
+    }
+  }
+);
+
+// POST /provider/verification/submit
+app.post(
+  "/provider/verification/submit",
+  authMiddleware,
+  requireVerifiedEmail,
+  requireAttestation,
+  validate(providerVerificationSubmitSchema),
+  async (req: AuthRequest, res: Response) => {
+    try {
+      if (!req.user) return res.status(401).json({ error: "Not authenticated" });
+      if (req.user.role !== "PROVIDER") {
+        return res.status(403).json({ error: "Only providers can submit verification." });
+      }
+
+      const { method, attachmentIds, externalReference, metadataJson } = (req as any)
+        .validated.body as {
+        method?: "ID" | "BACKGROUND_CHECK";
+        attachmentIds?: number[];
+        externalReference?: string;
+        metadataJson?: Record<string, any>;
+      };
+
+      if (attachmentIds?.length) {
+        const found = await prisma.providerVerificationAttachment.findMany({
+          where: { id: { in: attachmentIds }, providerId: req.user.userId },
+          select: { id: true },
+        });
+        if (found.length !== attachmentIds.length) {
+          return res.status(400).json({ error: "One or more attachmentIds are invalid." });
+        }
+      }
+
+      const mergedMeta: any = {
+        ...(metadataJson ?? {}),
+        ...(externalReference ? { externalReference } : {}),
+        ...(attachmentIds?.length ? { attachmentIds } : {}),
+      };
+
+      const updated = await prisma.providerVerification.upsert({
+        where: { providerId: req.user.userId },
+        create: {
+          providerId: req.user.userId,
+          status: "PENDING",
+          method: method ?? null,
+          providerSubmittedAt: new Date(),
+          verifiedAt: null,
+          metadataJson: Object.keys(mergedMeta).length ? mergedMeta : undefined,
+        },
+        update: {
+          status: "PENDING",
+          method: method ?? undefined,
+          providerSubmittedAt: new Date(),
+          verifiedAt: null,
+          metadataJson: Object.keys(mergedMeta).length ? mergedMeta : undefined,
+        },
+        select: {
+          providerId: true,
+          status: true,
+          method: true,
+          providerSubmittedAt: true,
+          verifiedAt: true,
+          metadataJson: true,
+          updatedAt: true,
+        },
+      });
+
+      return res.json({ verification: updated });
+    } catch (err) {
+      console.error("POST /provider/verification/submit error:", err);
+      return res.status(500).json({ error: "Internal server error while submitting verification." });
+    }
+  }
+);
+
+// Admin: list/approve/reject verifications
+app.get("/admin/provider-verifications", authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    if (!requireAdmin(req, res)) return;
+
+    const { status } = req.query as { status?: string };
+    const where: any = {};
+    if (status && ["NONE", "PENDING", "VERIFIED", "REJECTED"].includes(status)) {
+      where.status = status;
+    }
+
+    const rows = await prisma.providerVerification.findMany({
+      where,
+      orderBy: [{ providerSubmittedAt: "desc" }, { updatedAt: "desc" }],
+      select: {
+        providerId: true,
+        status: true,
+        method: true,
+        providerSubmittedAt: true,
+        verifiedAt: true,
+        metadataJson: true,
+        updatedAt: true,
+        provider: { select: { id: true, name: true, email: true, phone: true } },
+        attachments: { select: { id: true, createdAt: true } },
+      },
+      take: 200,
+    });
+
+    return res.json({
+      items: rows.map((r) => ({
+        providerId: r.providerId,
+        status: r.status,
+        method: r.method,
+        providerSubmittedAt: r.providerSubmittedAt,
+        verifiedAt: r.verifiedAt,
+        metadataJson: r.metadataJson,
+        updatedAt: r.updatedAt,
+        provider: r.provider,
+        attachmentCount: r.attachments.length,
+      })),
+    });
+  } catch (err) {
+    console.error("GET /admin/provider-verifications error:", err);
+    return res.status(500).json({ error: "Internal server error while listing provider verifications." });
+  }
+});
+
+const adminVerificationDecisionSchema = {
+  body: z.object({
+    notes: z.string().max(2000).optional(),
+    reason: z.string().max(500).optional(),
+  }),
+  params: z.object({ providerId: z.coerce.number().int().positive() }),
+};
+
+app.post(
+  "/admin/provider-verifications/:providerId/approve",
+  authMiddleware,
+  validate(adminVerificationDecisionSchema),
+  async (req: AuthRequest, res: Response) => {
+    try {
+      if (!requireAdmin(req, res)) return;
+      const { providerId } = (req as any).validated.params as { providerId: number };
+      const { notes } = (req as any).validated.body as { notes?: string };
+
+      const updated = await prisma.$transaction(async (tx) => {
+        const v = await tx.providerVerification.upsert({
+          where: { providerId },
+          create: {
+            providerId,
+            status: "VERIFIED",
+            verifiedAt: new Date(),
+            metadataJson: { approvedByAdminId: req.user!.userId, notes: notes ?? null },
+          },
+          update: {
+            status: "VERIFIED",
+            verifiedAt: new Date(),
+            metadataJson: { approvedByAdminId: req.user!.userId, notes: notes ?? null },
+          },
+          select: { providerId: true, status: true, verifiedAt: true },
+        });
+
+        await tx.providerProfile.upsert({
+          where: { providerId },
+          create: { providerId, verificationBadge: true },
+          update: { verificationBadge: true },
+        });
+
+        return v;
+      });
+
+      return res.json({ verification: updated });
+    } catch (err) {
+      console.error("POST /admin/provider-verifications/:providerId/approve error:", err);
+      return res.status(500).json({ error: "Internal server error while approving verification." });
+    }
+  }
+);
+
+app.post(
+  "/admin/provider-verifications/:providerId/reject",
+  authMiddleware,
+  validate(adminVerificationDecisionSchema),
+  async (req: AuthRequest, res: Response) => {
+    try {
+      if (!requireAdmin(req, res)) return;
+      const { providerId } = (req as any).validated.params as { providerId: number };
+      const { notes, reason } = (req as any).validated.body as { notes?: string; reason?: string };
+
+      const updated = await prisma.$transaction(async (tx) => {
+        const v = await tx.providerVerification.upsert({
+          where: { providerId },
+          create: {
+            providerId,
+            status: "REJECTED",
+            verifiedAt: null,
+            metadataJson: { rejectedByAdminId: req.user!.userId, reason: reason ?? null, notes: notes ?? null },
+          },
+          update: {
+            status: "REJECTED",
+            verifiedAt: null,
+            metadataJson: { rejectedByAdminId: req.user!.userId, reason: reason ?? null, notes: notes ?? null },
+          },
+          select: { providerId: true, status: true, verifiedAt: true },
+        });
+
+        await tx.providerProfile.upsert({
+          where: { providerId },
+          create: { providerId, verificationBadge: false },
+          update: { verificationBadge: false },
+        });
+
+        return v;
+      });
+
+      return res.json({ verification: updated });
+    } catch (err) {
+      console.error("POST /admin/provider-verifications/:providerId/reject error:", err);
+      return res.status(500).json({ error: "Internal server error while rejecting verification." });
+    }
+  }
+);
+
 // PUT /providers/me/profile
 // Body: { experience?: string, specialties?: string, location?: string }
-app.put("/providers/me/profile", authMiddleware, async (req: AuthRequest, res: Response) => {
+app.put(
+  "/providers/me/profile",
+  authMiddleware,
+  validate({
+    body: z.object({
+      experience: z.string().nullable().optional(),
+      specialties: z.string().nullable().optional(),
+      location: z.string().nullable().optional(),
+    }),
+  }),
+  async (req: AuthRequest, res: Response) => {
   try {
     if (!req.user) {
       return res.status(401).json({ error: "Not authenticated" });
@@ -3625,10 +7216,10 @@ app.put("/providers/me/profile", authMiddleware, async (req: AuthRequest, res: R
       return res.status(403).json({ error: "Only providers can update a provider profile." });
     }
 
-    const { experience, specialties, location } = req.body as {
-      experience?: string;
-      specialties?: string;
-      location?: string;
+    const { experience, specialties, location } = (req as any).validated.body as {
+      experience?: string | null;
+      specialties?: string | null;
+      location?: string | null;
     };
 
     // Update User (location) if provided
@@ -3694,7 +7285,15 @@ app.put("/providers/me/profile", authMiddleware, async (req: AuthRequest, res: R
 
 // PUT /providers/me/categories
 // Body: { categoryIds: number[] }
-app.put("/providers/me/categories", authMiddleware, async (req: AuthRequest, res: Response) => {
+app.put(
+  "/providers/me/categories",
+  authMiddleware,
+  validate({
+    body: z.object({
+      categoryIds: z.array(positiveIntSchema).nonempty("categoryIds must be a non-empty array"),
+    }),
+  }),
+  async (req: AuthRequest, res: Response) => {
   try {
     if (!req.user) {
       return res.status(401).json({ error: "Not authenticated" });
@@ -3704,23 +7303,8 @@ app.put("/providers/me/categories", authMiddleware, async (req: AuthRequest, res
       return res.status(403).json({ error: "Only providers can set categories." });
     }
 
-    const { categoryIds } = req.body as { categoryIds?: number[] };
-
-    if (!Array.isArray(categoryIds) || categoryIds.length === 0) {
-      return res.status(400).json({
-        error: "categoryIds must be a non-empty array of numeric IDs.",
-      });
-    }
-
-    const uniqueIds = Array.from(new Set(categoryIds)).filter(
-      (id) => typeof id === "number" && !Number.isNaN(id)
-    );
-
-    if (uniqueIds.length === 0) {
-      return res.status(400).json({
-        error: "categoryIds must contain at least one valid numeric id.",
-      });
-    }
+    const { categoryIds } = (req as any).validated.body as { categoryIds: number[] };
+    const uniqueIds = Array.from(new Set(categoryIds));
 
     // Ensure providerProfile exists
     const profile = await prisma.providerProfile.upsert({
@@ -3832,6 +7416,8 @@ app.get(
             specialties: p.specialties,
             rating: p.rating,
             reviewCount: p.reviewCount ?? 0,
+            verificationBadge: p.verificationBadge,
+            featuredZipCodes: p.featuredZipCodes,
           })),
         };
       });
@@ -3849,7 +7435,11 @@ app.get(
 
 
 // POST /providers/:id/favorite → consumer favorites a provider
-app.post("/providers/:id/favorite", authMiddleware, async (req: AuthRequest, res: Response) => {
+app.post(
+  "/providers/:id/favorite",
+  authMiddleware,
+  validate({ params: idParamsSchema }),
+  async (req: AuthRequest, res: Response) => {
   try {
     if (!req.user) return res.status(401).json({ error: "Not authenticated" });
 
@@ -3857,10 +7447,7 @@ app.post("/providers/:id/favorite", authMiddleware, async (req: AuthRequest, res
       return res.status(403).json({ error: "Only consumers can favorite providers." });
     }
 
-    const providerId = Number(req.params.id);
-    if (Number.isNaN(providerId)) {
-      return res.status(400).json({ error: "Invalid provider id" });
-    }
+    const { id: providerId } = (req as any).validated.params as { id: number };
 
     const provider = await prisma.user.findUnique({
       where: { id: providerId },
@@ -3982,6 +7569,7 @@ app.get(
           provider: {
             include: {
               providerProfile: { include: { categories: true } },
+              providerStats: true,
             },
           },
         },
@@ -3998,8 +7586,23 @@ app.get(
             location: fav.provider.location,
             experience: fav.provider.providerProfile?.experience ?? null,
             specialties: fav.provider.providerProfile?.specialties ?? null,
-            rating: fav.provider.providerProfile?.rating ?? null,
-            reviewCount: fav.provider.providerProfile?.reviewCount ?? 0,
+            rating: fav.provider.providerStats?.avgRating ?? fav.provider.providerProfile?.rating ?? null,
+            reviewCount: fav.provider.providerStats?.ratingCount ?? fav.provider.providerProfile?.reviewCount ?? 0,
+            verificationBadge: fav.provider.providerProfile?.verificationBadge ?? false,
+            featuredZipCodes: fav.provider.providerProfile?.featuredZipCodes ?? [],
+            stats: fav.provider.providerStats
+              ? {
+                  avgRating: fav.provider.providerStats.avgRating,
+                  ratingCount: fav.provider.providerStats.ratingCount,
+                  jobsCompletedAllTime: fav.provider.providerStats.jobsCompletedAllTime,
+                  jobsCompleted30d: fav.provider.providerStats.jobsCompleted30d,
+                  medianResponseTimeSeconds30d: fav.provider.providerStats.medianResponseTimeSeconds30d,
+                  cancellationRate30d: fav.provider.providerStats.cancellationRate30d,
+                  disputeRate30d: fav.provider.providerStats.disputeRate30d,
+                  reportRate30d: fav.provider.providerStats.reportRate30d,
+                  updatedAt: fav.provider.providerStats.updatedAt,
+                }
+              : null,
             isFavorited: true,
             categories:
               fav.provider.providerProfile?.categories.map((c) => ({
@@ -4100,6 +7703,13 @@ app.get(
           providerProfile: {
             include: { categories: true },
           },
+          providerStats: true,
+          providerEntitlement: {
+            select: { verificationBadge: true },
+          },
+          providerVerification: {
+            select: { status: true, method: true, providerSubmittedAt: true, verifiedAt: true },
+          },
         },
       });
 
@@ -4135,9 +7745,28 @@ app.get(
         createdAt: provider.createdAt,
         experience: provider.providerProfile?.experience ?? null,
         specialties: provider.providerProfile?.specialties ?? null,
-        rating: provider.providerProfile?.rating ?? null,
-        reviewCount: provider.providerProfile?.reviewCount ?? 0,
+        rating: provider.providerStats?.avgRating ?? provider.providerProfile?.rating ?? null,
+        reviewCount: provider.providerStats?.ratingCount ?? provider.providerProfile?.reviewCount ?? 0,
+        verificationBadge: Boolean(
+          provider.providerEntitlement?.verificationBadge ?? provider.providerProfile?.verificationBadge ?? false
+        ),
+        verificationStatus: provider.providerVerification?.status ?? "NONE",
+        isVerified: provider.providerVerification?.status === "VERIFIED",
+        // Do not leak featured zip lists on public profile.
         isFavorited,
+        stats: provider.providerStats
+          ? {
+              avgRating: provider.providerStats.avgRating,
+              ratingCount: provider.providerStats.ratingCount,
+              jobsCompletedAllTime: provider.providerStats.jobsCompletedAllTime,
+              jobsCompleted30d: provider.providerStats.jobsCompleted30d,
+              medianResponseTimeSeconds30d: provider.providerStats.medianResponseTimeSeconds30d,
+              cancellationRate30d: provider.providerStats.cancellationRate30d,
+              disputeRate30d: provider.providerStats.disputeRate30d,
+              reportRate30d: provider.providerStats.reportRate30d,
+              updatedAt: provider.providerStats.updatedAt,
+            }
+          : null,
         categories:
           provider.providerProfile?.categories.map((c) => ({
             id: c.id,
@@ -4150,6 +7779,63 @@ app.get(
       return res
         .status(500)
         .json({ error: "Internal server error while fetching provider." });
+    }
+  }
+);
+
+// GET /providers/:id/stats → provider marketplace stats
+app.get(
+  "/providers/:id/stats",
+  authMiddleware,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const providerId = Number(req.params.id);
+      if (Number.isNaN(providerId)) {
+        return res.status(400).json({ error: "Invalid provider id" });
+      }
+
+      const provider = await prisma.user.findUnique({
+        where: { id: providerId },
+        select: { id: true, role: true, isSuspended: true },
+      });
+
+      if (!provider || provider.role !== "PROVIDER") {
+        return res.status(404).json({ error: "Provider not found" });
+      }
+
+      if (!isAdmin(req) && provider.isSuspended) {
+        return res.status(404).json({ error: "Provider not found" });
+      }
+
+      let stats = await prisma.providerStats.findUnique({ where: { providerId } });
+
+      // If missing (e.g., new provider), compute on-demand once.
+      if (!stats) {
+        await recomputeProviderStatsForProvider({ prisma, providerId });
+        stats = await prisma.providerStats.findUnique({ where: { providerId } });
+      }
+
+      if (!stats) {
+        return res.json({ providerId, stats: null });
+      }
+
+      return res.json({
+        providerId,
+        stats: {
+          avgRating: stats.avgRating,
+          ratingCount: stats.ratingCount,
+          jobsCompletedAllTime: stats.jobsCompletedAllTime,
+          jobsCompleted30d: stats.jobsCompleted30d,
+          medianResponseTimeSeconds30d: stats.medianResponseTimeSeconds30d,
+          cancellationRate30d: stats.cancellationRate30d,
+          disputeRate30d: stats.disputeRate30d,
+          reportRate30d: stats.reportRate30d,
+          updatedAt: stats.updatedAt,
+        },
+      });
+    } catch (err) {
+      console.error("GET /providers/:id/stats error:", err);
+      return res.status(500).json({ error: "Internal server error while fetching provider stats." });
     }
   }
 );
@@ -4200,15 +7886,30 @@ app.get(
       const take = parsePositiveInt(limit, 30, 100);
       const cursorId = parseOptionalCursorId(cursor);
 
-      const job = await prisma.job.findUnique({
-        where: { id: jobId },
-        select: {
-          id: true,
-          consumerId: true,
-          isHidden: true,
-          consumer: { select: { isSuspended: true } },
-        },
-      });
+      let job: any;
+      try {
+        job = await prisma.job.findUnique({
+          where: { id: jobId },
+          select: {
+            id: true,
+            consumerId: true,
+            awardedProviderId: true,
+            isHidden: true,
+            consumer: { select: { isSuspended: true } },
+          },
+        });
+      } catch (err: any) {
+        if (!isMissingDbColumnError(err)) throw err;
+        job = await prisma.job.findUnique({
+          where: { id: jobId },
+          select: {
+            id: true,
+            consumerId: true,
+            isHidden: true,
+            consumer: { select: { isSuspended: true } },
+          },
+        });
+      }
 
       if (!job) return res.status(404).json({ error: "Job not found." });
 
@@ -4230,6 +7931,16 @@ app.get(
       }
 
       if (!isOwner && !hasBid && !isAdmin(req)) {
+        return res.status(403).json({ error: "Not allowed to view messages for this job." });
+      }
+
+      const awardedProviderId = (job as any).awardedProviderId as number | undefined;
+      if (
+        typeof awardedProviderId === "number" &&
+        req.user.role === "PROVIDER" &&
+        req.user.userId !== awardedProviderId &&
+        !isAdmin(req)
+      ) {
         return res.status(403).json({ error: "Not allowed to view messages for this job." });
       }
 
@@ -4258,7 +7969,10 @@ app.get(
           text: m.text,
           createdAt: m.createdAt,
           sender: m.sender,
-          attachments: (m as any).attachments ?? [],
+          attachments: ((m as any).attachments ?? []).map((a: any) => ({
+            ...a,
+            url: attachmentPublicUrl(req, a.id),
+          })),
         })),
         pageInfo: {
           limit: take,
@@ -4274,22 +7988,40 @@ app.get(
 
 
 // POST /jobs/:jobId/messages/read → mark thread as read for current user
-app.post("/jobs/:jobId/messages/read", authMiddleware, async (req: AuthRequest, res: Response) => {
+app.post(
+  "/jobs/:jobId/messages/read",
+  authMiddleware,
+  validate({ params: jobIdParamsSchema }),
+  async (req: AuthRequest, res: Response) => {
   try {
     if (!req.user) return res.status(401).json({ error: "Not authenticated" });
 
-    const jobId = Number(req.params.jobId);
-    if (Number.isNaN(jobId)) return res.status(400).json({ error: "Invalid jobId in URL." });
+    const { jobId } = (req as any).validated.params as { jobId: number };
 
-    const job = await prisma.job.findUnique({
-      where: { id: jobId },
-      select: {
-        id: true,
-        consumerId: true,
-        isHidden: true,
-        consumer: { select: { isSuspended: true } },
-      },
-    });
+    let job: any;
+    try {
+      job = await prisma.job.findUnique({
+        where: { id: jobId },
+        select: {
+          id: true,
+          consumerId: true,
+          awardedProviderId: true,
+          isHidden: true,
+          consumer: { select: { isSuspended: true } },
+        },
+      });
+    } catch (err: any) {
+      if (!isMissingDbColumnError(err)) throw err;
+      job = await prisma.job.findUnique({
+        where: { id: jobId },
+        select: {
+          id: true,
+          consumerId: true,
+          isHidden: true,
+          consumer: { select: { isSuspended: true } },
+        },
+      });
+    }
 
     if (!job) return res.status(404).json({ error: "Job not found." });
 
@@ -4311,6 +8043,16 @@ app.post("/jobs/:jobId/messages/read", authMiddleware, async (req: AuthRequest, 
     }
 
     if (!isOwner && !hasBid && !isAdmin(req)) {
+      return res.status(403).json({ error: "Not allowed to mark messages read for this job." });
+    }
+
+    const awardedProviderId = (job as any).awardedProviderId as number | undefined;
+    if (
+      typeof awardedProviderId === "number" &&
+      req.user.role === "PROVIDER" &&
+      req.user.userId !== awardedProviderId &&
+      !isAdmin(req)
+    ) {
       return res.status(403).json({ error: "Not allowed to mark messages read for this job." });
     }
 
@@ -4369,15 +8111,30 @@ app.get("/jobs/:jobId/messages/unread-count", authMiddleware, async (req: AuthRe
     const jobId = Number(req.params.jobId);
     if (Number.isNaN(jobId)) return res.status(400).json({ error: "Invalid jobId in URL." });
 
-    const job = await prisma.job.findUnique({
-      where: { id: jobId },
-      select: {
-        id: true,
-        consumerId: true,
-        isHidden: true,
-        consumer: { select: { isSuspended: true } },
-      },
-    });
+    let job: any;
+    try {
+      job = await prisma.job.findUnique({
+        where: { id: jobId },
+        select: {
+          id: true,
+          consumerId: true,
+          awardedProviderId: true,
+          isHidden: true,
+          consumer: { select: { isSuspended: true } },
+        },
+      });
+    } catch (err: any) {
+      if (!isMissingDbColumnError(err)) throw err;
+      job = await prisma.job.findUnique({
+        where: { id: jobId },
+        select: {
+          id: true,
+          consumerId: true,
+          isHidden: true,
+          consumer: { select: { isSuspended: true } },
+        },
+      });
+    }
 
     if (!job) return res.status(404).json({ error: "Job not found." });
 
@@ -4399,6 +8156,16 @@ app.get("/jobs/:jobId/messages/unread-count", authMiddleware, async (req: AuthRe
     }
 
     if (!isOwner && !hasBid && !isAdmin(req)) {
+      return res.status(403).json({ error: "Not allowed to view unread count for this job." });
+    }
+
+    const awardedProviderId = (job as any).awardedProviderId as number | undefined;
+    if (
+      typeof awardedProviderId === "number" &&
+      req.user.role === "PROVIDER" &&
+      req.user.userId !== awardedProviderId &&
+      !isAdmin(req)
+    ) {
       return res.status(403).json({ error: "Not allowed to view unread count for this job." });
     }
 
@@ -4442,23 +8209,40 @@ app.get("/jobs/:jobId/messages/unread-count", authMiddleware, async (req: AuthRe
 // Supports:
 // - JSON: { text: string }
 // - multipart/form-data: text=<string?>, file=<image|video>
+
+const sendMessageSchema = {
+  params: z.object({
+    jobId: z.coerce.number().int().positive(),
+  }),
+  // text is optional because attachments can be sent without text
+  body: z.object({
+    text: z.string().max(4000).optional(),
+  }),
+};
+
 app.post(
   "/jobs/:jobId/messages",
   authMiddleware,
+  requireVerifiedEmail,
+  requireAttestation,
+  validate(sendMessageSchema),
   uploadSingleAttachment,
-  async (req: AuthRequest, res: Response) => {
+  async (req: AuthRequest & { validated: Validated<typeof sendMessageSchema> }, res: Response) => {
   try {
     if (!req.user) {
       return res.status(401).json({ error: "Not authenticated" });
     }
 
-    const jobId = Number(req.params.jobId);
-    if (Number.isNaN(jobId)) {
-      return res.status(400).json({ error: "Invalid jobId in URL." });
+    if (isRestrictedUser(req) && !isAdmin(req)) {
+      return restrictedResponse(res, {
+        message: "Your account is temporarily restricted from sending messages. Please try again later.",
+        restrictedUntil: req.user.restrictedUntil ?? null,
+      });
     }
 
-    const bodyText = (req.body as any)?.text;
-    const textRaw = typeof bodyText === "string" ? bodyText : "";
+    const jobId = req.validated.params.jobId;
+
+    const textRaw = typeof (req.body as any)?.text === "string" ? String((req.body as any).text) : "";
     const textTrim = textRaw.trim();
 
     const file = (req as any).file as Express.Multer.File | undefined;
@@ -4469,16 +8253,32 @@ app.post(
     }
 
     // Fetch job so we know who the consumer is (+ visibility basics)
-    const job = await prisma.job.findUnique({
-      where: { id: jobId },
-      select: {
-        id: true,
-        consumerId: true,
-        title: true,
-        isHidden: true,
-        consumer: { select: { isSuspended: true } },
-      },
-    });
+    let job: any;
+    try {
+      job = await prisma.job.findUnique({
+        where: { id: jobId },
+        select: {
+          id: true,
+          consumerId: true,
+          awardedProviderId: true,
+          title: true,
+          isHidden: true,
+          consumer: { select: { isSuspended: true } },
+        },
+      });
+    } catch (err: any) {
+      if (!isMissingDbColumnError(err)) throw err;
+      job = await prisma.job.findUnique({
+        where: { id: jobId },
+        select: {
+          id: true,
+          consumerId: true,
+          title: true,
+          isHidden: true,
+          consumer: { select: { isSuspended: true } },
+        },
+      });
+    }
 
     if (!job) {
       return res.status(404).json({ error: "Job not found." });
@@ -4509,6 +8309,16 @@ app.post(
       return res.status(403).json({ error: "Not allowed to message on this job." });
     }
 
+    const awardedProviderId = (job as any).awardedProviderId as number | undefined;
+    if (
+      typeof awardedProviderId === "number" &&
+      req.user.role === "PROVIDER" &&
+      senderId !== awardedProviderId &&
+      !isAdmin(req)
+    ) {
+      return res.status(403).json({ error: "Not allowed to message on this job." });
+    }
+
     // Block check (same behavior you had, just now after we know they're a participant)
     if (!isOwner) {
       const blocked = await isBlockedBetween(senderId, job.consumerId);
@@ -4525,6 +8335,130 @@ app.post(
       (process.env.PUBLIC_BASE_URL ?? "").trim() ||
       `${req.protocol}://${req.get("host")}`;
 
+    const appealUrl = (process.env.PUBLIC_APPEAL_URL ?? "").trim() || `${publicBase}/support`;
+
+    // Risk scoring / spam detection (best-effort)
+    try {
+      const risk = await assessRepeatedMessageRisk({ jobId, senderId: req.user.userId, text: messageText });
+
+      const moderation = decideMessageModeration(risk);
+      if (moderation.action === "BLOCK" && !isAdmin(req)) {
+        try {
+          await prisma.user.update({
+            where: { id: req.user.userId },
+            data: { riskScore: { increment: risk.totalScore } },
+          });
+        } catch (e: any) {
+          if (!isMissingDbColumnError(e)) throw e;
+        }
+
+        await logSecurityEvent(req, "message.blocked", {
+          targetType: "JOB",
+          targetId: jobId,
+          jobId,
+          senderId: req.user.userId,
+          reasonCodes: moderation.reasonCodes,
+          riskTotalScore: risk.totalScore,
+          riskSignals: risk.signals,
+          textPreview: messageText.slice(0, 200),
+        });
+
+        // Repeat-offender throttling: if a user triggers multiple blocks in a short window,
+        // temporarily restrict to slow down spam/scams.
+        try {
+          const windowMinutes = 60;
+          const since = new Date(Date.now() - windowMinutes * 60_000);
+          const recentBlocks = await prisma.securityEvent.count({
+            where: {
+              actorUserId: req.user.userId,
+              actionType: "message.blocked",
+              createdAt: { gt: since },
+            },
+          });
+
+          if (recentBlocks >= 3) {
+            const until = computeRestrictedUntil();
+            try {
+              await prisma.user.update({
+                where: { id: req.user.userId },
+                data: { restrictedUntil: until },
+              });
+            } catch (e: any) {
+              if (!isMissingDbColumnError(e)) throw e;
+            }
+
+            await logSecurityEvent(req, "user.restricted", {
+              targetType: "USER",
+              targetId: req.user.userId,
+              reason: "repeated_message_blocks",
+              restrictedUntil: until.toISOString(),
+              recentBlocks,
+              windowMinutes,
+            });
+
+            return restrictedResponse(res, {
+              message:
+                "Your account is temporarily restricted due to repeated blocked messages. Please try again later.",
+              restrictedUntil: until,
+            });
+          }
+        } catch {
+          // ignore throttling failures
+        }
+
+        const isContactInfo = moderation.reasonCodes.includes("CONTACT_INFO");
+        return res.status(400).json({
+          error: isContactInfo
+            ? "For your safety, sharing phone numbers or emails in messages is not allowed. Please keep communication in-app."
+            : "For your safety, messages asking to move off-platform or use risky payment methods are blocked. Please keep communication in-app.",
+          code: isContactInfo ? "CONTACT_INFO_NOT_ALLOWED" : "MESSAGE_BLOCKED",
+          blocked: true,
+          reasonCodes: moderation.reasonCodes,
+          appealUrl,
+        });
+      }
+
+      if (risk.totalScore >= RISK_RESTRICT_THRESHOLD && !isAdmin(req)) {
+        const until = computeRestrictedUntil();
+        try {
+          await prisma.user.update({
+            where: { id: req.user.userId },
+            data: { riskScore: { increment: risk.totalScore }, restrictedUntil: until },
+          });
+        } catch (e: any) {
+          if (!isMissingDbColumnError(e)) throw e;
+        }
+
+        await logSecurityEvent(req, "user.restricted", {
+          targetType: "USER",
+          targetId: req.user.userId,
+          reason: "message_risk_threshold",
+          jobId,
+          riskTotalScore: risk.totalScore,
+          riskSignals: risk.signals,
+          restrictedUntil: until.toISOString(),
+        });
+
+        return restrictedResponse(res, {
+          message: "Your account is temporarily restricted due to suspicious activity.",
+          restrictedUntil: until,
+        });
+      }
+
+      if (risk.totalScore > 0) {
+        try {
+          await prisma.user.update({
+            where: { id: req.user.userId },
+            data: { riskScore: { increment: risk.totalScore } },
+          });
+        } catch (e: any) {
+          if (!isMissingDbColumnError(e)) throw e;
+        }
+      }
+    } catch {
+      // ignore scoring failures
+    }
+
     const created = await prisma.$transaction(async (tx) => {
       const message = await tx.message.create({
         data: {
@@ -4536,17 +8470,26 @@ app.post(
 
       let attachments: any[] = [];
       if (file) {
-        const url = `${publicBase}/uploads/attachments/${file.filename}`;
+        const diskPath = path.posix.join("attachments", file.filename);
+
         const a = await tx.messageAttachment.create({
           data: {
             messageId: message.id,
-            url,
+            url: "",
+            diskPath,
+            uploaderUserId: senderId,
             mimeType: file.mimetype,
             filename: file.originalname || null,
             sizeBytes: file.size || null,
           },
         });
-        attachments = [a];
+
+        const updated = await tx.messageAttachment.update({
+          where: { id: a.id },
+          data: { url: `${publicBase}/attachments/${a.id}` },
+        });
+
+        attachments = [updated];
       }
 
       return { message, attachments };
@@ -4596,7 +8539,7 @@ app.post(
         notifiedUserIds,
         attachments: created.attachments.map((a) => ({
           id: a.id,
-          url: a.url,
+          url: `${publicBase}/attachments/${a.id}`,
           mimeType: a.mimeType,
           filename: a.filename,
           sizeBytes: a.sizeBytes,
@@ -4607,7 +8550,10 @@ app.post(
 
     return res.status(201).json({
       ...created.message,
-      attachments: created.attachments,
+      attachments: created.attachments.map((a) => ({
+        ...a,
+        url: `${publicBase}/attachments/${a.id}`,
+      })),
     });
   } catch (err) {
     const msg = String((err as any)?.message || "");
@@ -4627,36 +8573,96 @@ app.post(
   }
 );
 
+// --- Admin: flagged users/jobs by risk score ---
+// GET /admin/risk/flagged?minScore=60&limit=50
+app.get("/admin/risk/flagged", authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    if (!req.user) return res.status(401).json({ error: "Not authenticated" });
+    if (req.user.role !== "ADMIN") return res.status(403).json({ error: "Admins only" });
+
+    const minScore = Math.max(Number(req.query.minScore) || RISK_REVIEW_THRESHOLD, 0);
+    const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 200);
+
+    try {
+      const [users, jobs] = await Promise.all([
+        prisma.user.findMany({
+          where: {
+            OR: [{ riskScore: { gte: minScore } }, { restrictedUntil: { not: null } }],
+          },
+          orderBy: [{ riskScore: "desc" }, { id: "desc" }],
+          take: limit,
+          select: {
+            id: true,
+            email: true,
+            name: true,
+            role: true,
+            riskScore: true,
+            restrictedUntil: true,
+            createdAt: true,
+            isSuspended: true,
+          },
+        }),
+        prisma.job.findMany({
+          where: { riskScore: { gte: minScore } },
+          orderBy: [{ riskScore: "desc" }, { id: "desc" }],
+          take: limit,
+          select: {
+            id: true,
+            consumerId: true,
+            title: true,
+            status: true,
+            riskScore: true,
+            createdAt: true,
+            isHidden: true,
+            location: true,
+          },
+        }),
+      ]);
+
+      return res.json({ users, jobs, minScore, limit });
+    } catch (err: any) {
+      if (isMissingDbColumnError(err)) {
+        return res.status(501).json({
+          error: "Risk scoring columns not available on this server yet. Apply DB migrations and redeploy.",
+          code: "RISK_SCORING_NOT_ENABLED",
+        });
+      }
+      throw err;
+    }
+  } catch (err) {
+    console.error("GET /admin/risk/flagged error:", err);
+    return res.status(500).json({ error: "Internal server error while fetching flagged items." });
+  }
+});
+
 // POST /reports
 // Body: { type: "USER" | "JOB" | "MESSAGE", targetId: number, reason: string, details?: string }
-app.post("/reports", authMiddleware, reportLimiter, async (req: AuthRequest, res: Response) => {
+app.post(
+  "/reports",
+  authMiddleware,
+  reportLimiter,
+  validate({
+    body: z.object({
+      type: z.enum(["USER", "JOB", "MESSAGE"]),
+      targetId: positiveIntSchema,
+      reason: z.string().trim().min(1, "reason is required"),
+      details: z.string().trim().optional(),
+    }),
+  }),
+  async (req: AuthRequest, res: Response) => {
   try {
     if (!req.user) {
       return res.status(401).json({ error: "Not authenticated" });
     }
 
-    const { type, targetId, reason, details } = req.body as {
-      type?: string;
-      targetId?: number;
-      reason?: string;
+    const { type, targetId, reason, details } = (req as any).validated.body as {
+      type: "USER" | "JOB" | "MESSAGE";
+      targetId: number;
+      reason: string;
       details?: string;
     };
 
-    if (!type || !["USER", "JOB", "MESSAGE"].includes(type)) {
-      return res.status(400).json({
-        error: 'type is required and must be one of "USER", "JOB", or "MESSAGE".',
-      });
-    }
-
-    if (targetId === undefined || targetId === null || Number.isNaN(Number(targetId))) {
-      return res.status(400).json({ error: "targetId is required and must be a valid number." });
-    }
-
-    if (!reason || !reason.trim()) {
-      return res.status(400).json({ error: "reason is required and cannot be empty." });
-    }
-
-    const targetIdNum = Number(targetId);
+    const targetIdNum = targetId;
     let targetUserId: number | null = null;
     let targetJobId: number | null = null;
     let targetMessageId: number | null = null;
@@ -4690,7 +8696,7 @@ app.post("/reports", authMiddleware, reportLimiter, async (req: AuthRequest, res
         targetUserId,
         targetJobId,
         targetMessageId,
-        reason: reason.trim(),
+        reason: reason,
         details: details?.trim() || null,
       },
     });
@@ -4775,7 +8781,11 @@ app.get(
 
 // --- Consumer: Accept a bid ---
 // POST /jobs/:jobId/bids/:bidId/accept
-app.post("/jobs/:jobId/bids/:bidId/accept", authMiddleware, async (req: AuthRequest, res: Response) => {
+app.post(
+  "/jobs/:jobId/bids/:bidId/accept",
+  authMiddleware,
+  validate({ params: jobBidParamsSchema }),
+  async (req: AuthRequest, res: Response) => {
   try {
     if (!req.user) return res.status(401).json({ error: "Not authenticated" });
 
@@ -4783,12 +8793,7 @@ app.post("/jobs/:jobId/bids/:bidId/accept", authMiddleware, async (req: AuthRequ
       return res.status(403).json({ error: "Only consumers can accept bids." });
     }
 
-    const jobId = Number(req.params.jobId);
-    const bidId = Number(req.params.bidId);
-
-    if (Number.isNaN(jobId) || Number.isNaN(bidId)) {
-      return res.status(400).json({ error: "Invalid jobId or bidId parameter" });
-    }
+    const { jobId, bidId } = (req as any).validated.params as { jobId: number; bidId: number };
 
     // Fetch job and verify ownership
     const job = await prisma.job.findUnique({
@@ -4817,26 +8822,56 @@ app.post("/jobs/:jobId/bids/:bidId/accept", authMiddleware, async (req: AuthRequ
     }
 
     const previousJobStatus = job.status;
+    const now = new Date();
 
     // Accept in a transaction: accept chosen, decline others, job -> IN_PROGRESS
-    const result = await prisma.$transaction(async (tx) => {
-      const accepted = await tx.bid.update({
-        where: { id: bidId },
-        data: { status: "ACCEPTED" },
-      });
+    // Also set award fields if the DB has those columns.
+    let result: { accepted: any; updatedJob: any };
+    try {
+      result = await prisma.$transaction(async (tx) => {
+        const accepted = await tx.bid.update({
+          where: { id: bidId },
+          data: { status: "ACCEPTED" },
+        });
 
-      await tx.bid.updateMany({
-        where: { jobId: job.id, id: { not: bidId }, status: "PENDING" },
-        data: { status: "DECLINED" },
-      });
+        await tx.bid.updateMany({
+          where: { jobId: job.id, id: { not: bidId }, status: "PENDING" },
+          data: { status: "DECLINED" },
+        });
 
-      const updatedJob = await tx.job.update({
-        where: { id: job.id },
-        data: { status: "IN_PROGRESS" },
-      });
+        const updatedJob = await tx.job.update({
+          where: { id: job.id },
+          data: {
+            status: "IN_PROGRESS",
+            awardedProviderId: bid.providerId,
+            awardedAt: now,
+          },
+        });
 
-      return { accepted, updatedJob };
-    });
+        return { accepted, updatedJob };
+      });
+    } catch (err: any) {
+      if (!isMissingDbColumnError(err)) throw err;
+
+      result = await prisma.$transaction(async (tx) => {
+        const accepted = await tx.bid.update({
+          where: { id: bidId },
+          data: { status: "ACCEPTED" },
+        });
+
+        await tx.bid.updateMany({
+          where: { jobId: job.id, id: { not: bidId }, status: "PENDING" },
+          data: { status: "DECLINED" },
+        });
+
+        const updatedJob = await tx.job.update({
+          where: { id: job.id },
+          data: { status: "IN_PROGRESS" },
+        });
+
+        return { accepted, updatedJob };
+      });
+    }
 
     // 🔔 Notify the winning provider
     await createNotification({
@@ -4855,7 +8890,7 @@ app.post("/jobs/:jobId/bids/:bidId/accept", authMiddleware, async (req: AuthRequ
         providerId: bid.providerId,
         amount: bid.amount,
         jobTitle: job.title,
-        acceptedAt: new Date(),
+        acceptedAt: now,
       },
     });
 
@@ -4868,7 +8903,7 @@ app.post("/jobs/:jobId/bids/:bidId/accept", authMiddleware, async (req: AuthRequ
         previousStatus: previousJobStatus,
         newStatus: result.updatedJob.status,
         jobTitle: job.title,
-        changedAt: new Date(),
+        changedAt: now,
       },
     });
 
@@ -4883,8 +8918,22 @@ app.post("/jobs/:jobId/bids/:bidId/accept", authMiddleware, async (req: AuthRequ
   }
 });
 
+// --- Consumer: Award a provider on a job ---
+// POST /jobs/:jobId/award
+// Body: { bidId: number } OR { providerId: number }
+app.post(
+  "/jobs/:jobId/award",
+  authMiddleware,
+  requireVerifiedEmail,
+  createPostJobAwardHandler({
+    prisma,
+    createNotification,
+    enqueueWebhookEvent,
+  })
+);
+
 // POST /jobs/:jobId/cancel  → consumer cancels a job
-app.post("/jobs/:jobId/cancel", async (req, res) => {
+app.post("/jobs/:jobId/cancel", validate({ params: jobIdParamsSchema }), async (req, res) => {
   try {
     const user = getUserFromAuthHeader(req);
     if (!user) {
@@ -4896,10 +8945,7 @@ app.post("/jobs/:jobId/cancel", async (req, res) => {
       return res.status(403).json({ error: "Only consumers can cancel jobs." });
     }
 
-    const jobId = Number(req.params.jobId);
-    if (Number.isNaN(jobId)) {
-      return res.status(400).json({ error: "Invalid jobId in URL." });
-    }
+    const { jobId } = (req as any).validated.params as { jobId: number };
 
     // Fetch job & ownership
     const job = await prisma.job.findUnique({
@@ -4990,7 +9036,7 @@ app.post("/jobs/:jobId/cancel", async (req, res) => {
 });
 
 // POST /jobs/:jobId/complete  → consumer marks job as completed
-app.post("/jobs/:jobId/complete", async (req, res) => {
+app.post("/jobs/:jobId/complete", validate({ params: jobIdParamsSchema }), async (req, res) => {
   try {
     const user = getUserFromAuthHeader(req);
     if (!user) {
@@ -5002,87 +9048,171 @@ app.post("/jobs/:jobId/complete", async (req, res) => {
       return res.status(403).json({ error: "Only consumers can mark jobs as completed." });
     }
 
-    const jobId = Number(req.params.jobId);
-    if (Number.isNaN(jobId)) {
-      return res.status(400).json({ error: "Invalid jobId in URL." });
-    }
+    const { jobId } = (req as any).validated.params as { jobId: number };
 
-    // Fetch the job to verify ownership and status
-    const job = await prisma.job.findUnique({
-      where: { id: jobId },
-      select: {
-        id: true,
-        consumerId: true,
-        status: true,
-        title: true,
-        location: true,
-        createdAt: true,
-      },
-    });
+    // Prefer new two-step completion confirmation flow when DB supports it.
+    // If the migration/enum isn't deployed yet, fall back to the legacy direct-COMPLETED behavior.
+    const isCompletionNotEnabledError = (err: any) => {
+      if (isMissingDbColumnError(err)) return true;
+      const msg = String(err?.message ?? "");
+      return (
+        msg.includes("invalid input value for enum") && msg.includes("COMPLETED_PENDING_CONFIRMATION")
+      );
+    };
 
-    if (!job) {
-      return res.status(404).json({ error: "Job not found." });
-    }
+    try {
+      const job = await prisma.job.findUnique({
+        where: { id: jobId },
+        select: {
+          id: true,
+          consumerId: true,
+          status: true,
+          title: true,
+          location: true,
+          createdAt: true,
+          awardedProviderId: true,
+          completionPendingForUserId: true,
+          completedAt: true,
+        },
+      });
 
-    // Ensure this user owns the job
-    if (job.consumerId !== user.userId) {
-      return res.status(403).json({ error: "You can only complete jobs that you created." });
-    }
+      if (!job) {
+        return res.status(404).json({ error: "Job not found." });
+      }
 
-    // Only allow completion if job is IN_PROGRESS
-    if (job.status !== "IN_PROGRESS") {
-      return res.status(400).json({
-        error: `Only jobs that are IN_PROGRESS can be marked as completed. Current status: ${job.status}.`,
+      if (job.consumerId !== user.userId) {
+        return res.status(403).json({ error: "You can only complete jobs that you created." });
+      }
+
+      if (job.status !== "IN_PROGRESS") {
+        return res.status(400).json({
+          error: `Only jobs that are IN_PROGRESS can be marked as completed. Current status: ${job.status}.`,
+        });
+      }
+
+      const acceptedBid = await prisma.bid.findFirst({
+        where: { jobId, status: "ACCEPTED" },
+        select: { providerId: true },
+      });
+      const providerId = (job as any).awardedProviderId ?? acceptedBid?.providerId ?? null;
+      if (!providerId) {
+        return res.status(400).json({ error: "No awarded provider for this job." });
+      }
+
+      const previousStatus = job.status;
+      const now = new Date();
+
+      const updatedJob = await prisma.job.update({
+        where: { id: jobId },
+        data: {
+          status: "COMPLETED_PENDING_CONFIRMATION",
+          completionPendingForUserId: providerId,
+          completedAt: null,
+        },
+      });
+
+      await createNotification({
+        userId: providerId,
+        type: "JOB_COMPLETION_CONFIRM_REQUIRED",
+        content: `Job "${job.title}" was marked complete. Please confirm completion.`,
+      });
+      await createNotification({
+        userId: user.userId,
+        type: "JOB_COMPLETION_MARKED",
+        content: `You marked "${job.title}" complete. Waiting for confirmation.`,
+      });
+
+      await enqueueWebhookEvent({
+        eventType: "job.status_changed",
+        payload: {
+          jobId: updatedJob.id,
+          consumerId: job.consumerId,
+          previousStatus,
+          newStatus: updatedJob.status,
+          title: job.title,
+          changedAt: now,
+        },
+      });
+
+      return res.json({
+        message: "Completion requested. Waiting for the provider to confirm.",
+        job: updatedJob,
+      });
+    } catch (err: any) {
+      if (!isCompletionNotEnabledError(err)) throw err;
+
+      // ---- Legacy fallback: direct COMPLETED ----
+      const job = await prisma.job.findUnique({
+        where: { id: jobId },
+        select: {
+          id: true,
+          consumerId: true,
+          status: true,
+          title: true,
+          location: true,
+          createdAt: true,
+        },
+      });
+
+      if (!job) {
+        return res.status(404).json({ error: "Job not found." });
+      }
+
+      if (job.consumerId !== user.userId) {
+        return res.status(403).json({ error: "You can only complete jobs that you created." });
+      }
+
+      if (job.status !== "IN_PROGRESS") {
+        return res.status(400).json({
+          error: `Only jobs that are IN_PROGRESS can be marked as completed. Current status: ${job.status}.`,
+        });
+      }
+
+      const previousStatus = job.status;
+
+      const updatedJob = await prisma.job.update({
+        where: { id: jobId },
+        data: { status: "COMPLETED" },
+        select: {
+          id: true,
+          title: true,
+          location: true,
+          status: true,
+          createdAt: true,
+        },
+      });
+
+      await enqueueWebhookEvent({
+        eventType: "job.completed",
+        payload: {
+          jobId: updatedJob.id,
+          consumerId: job.consumerId,
+          previousStatus,
+          newStatus: updatedJob.status,
+          title: updatedJob.title,
+          location: updatedJob.location,
+          createdAt: updatedJob.createdAt,
+          completedAt: new Date(),
+        },
+      });
+
+      await enqueueWebhookEvent({
+        eventType: "job.status_changed",
+        payload: {
+          jobId: updatedJob.id,
+          consumerId: job.consumerId,
+          previousStatus,
+          newStatus: updatedJob.status,
+          title: updatedJob.title,
+          changedAt: new Date(),
+        },
+      });
+
+      return res.json({
+        message: "Job marked as completed.",
+        job: updatedJob,
       });
     }
-
-    const previousStatus = job.status;
-
-    // Update job status → COMPLETED
-    const updatedJob = await prisma.job.update({
-      where: { id: jobId },
-      data: { status: "COMPLETED" },
-      select: {
-        id: true,
-        title: true,
-        location: true,
-        status: true,
-        createdAt: true,
-      },
-    });
-
-    // ✅ Webhook 1: job completed
-    await enqueueWebhookEvent({
-      eventType: "job.completed",
-      payload: {
-        jobId: updatedJob.id,
-        consumerId: job.consumerId,
-        previousStatus,
-        newStatus: updatedJob.status,
-        title: updatedJob.title,
-        location: updatedJob.location,
-        createdAt: updatedJob.createdAt,
-        completedAt: new Date(),
-      },
-    });
-
-    // ✅ Webhook 2: job status changed
-    await enqueueWebhookEvent({
-      eventType: "job.status_changed",
-      payload: {
-        jobId: updatedJob.id,
-        consumerId: job.consumerId,
-        previousStatus,
-        newStatus: updatedJob.status,
-        title: updatedJob.title,
-        changedAt: new Date(),
-      },
-    });
-
-    return res.json({
-      message: "Job marked as completed.",
-      job: updatedJob,
-    });
   } catch (err) {
     console.error("Error completing job:", err);
     return res.status(500).json({ error: "Internal server error while completing job." });
@@ -5090,16 +9220,17 @@ app.post("/jobs/:jobId/complete", async (req, res) => {
 });
 
 // POST /jobs/:id/favorite → user favorites a job
-app.post("/jobs/:id/favorite", authMiddleware, async (req: AuthRequest, res: Response) => {
+app.post(
+  "/jobs/:id/favorite",
+  authMiddleware,
+  validate({ params: idParamsSchema }),
+  async (req: AuthRequest, res: Response) => {
   try {
     if (!req.user) {
       return res.status(401).json({ error: "Not authenticated" });
     }
 
-    const jobId = Number(req.params.id);
-    if (Number.isNaN(jobId)) {
-      return res.status(400).json({ error: "Invalid job id" });
-    }
+    const { id: jobId } = (req as any).validated.params as { id: number };
 
     const job = await prisma.job.findUnique({
       where: { id: jobId },
@@ -5249,18 +9380,54 @@ app.get("/notifications", authMiddleware, notificationsLimiter, async (req: Auth
   }
 });
 
+// GET /me/notifications (alias of /notifications)
+app.get("/me/notifications", authMiddleware, notificationsLimiter, async (req: AuthRequest, res: Response) => {
+  try {
+    if (!req.user) return res.status(401).json({ error: "Not authenticated" });
+
+    const { cursor, limit } = req.query as { cursor?: string; limit?: string };
+    const take = parsePositiveInt(limit, 25, 100);
+    const cursorId = parseOptionalCursorId(cursor);
+
+    const notifications = await prisma.notification.findMany({
+      where: { userId: req.user.userId },
+      orderBy: [{ id: "desc" }],
+      take,
+      ...(cursorId ? { cursor: { id: cursorId }, skip: 1 } : {}),
+    });
+
+    const nextCursor =
+      notifications.length === take ? notifications[notifications.length - 1].id : null;
+
+    return res.json({
+      items: notifications.map((n) => ({
+        id: n.id,
+        type: n.type,
+        content: n.content,
+        read: n.read,
+        createdAt: n.createdAt,
+      })),
+      pageInfo: { limit: take, nextCursor },
+    });
+  } catch (err) {
+    console.error("List /me/notifications error:", err);
+    return res.status(500).json({ error: "Internal server error while fetching notifications." });
+  }
+});
+
 
 // POST /notifications/:id/read  → mark a single notification as read
-app.post("/notifications/:id/read", authMiddleware, async (req: AuthRequest, res: Response) => {
+app.post(
+  "/notifications/:id/read",
+  authMiddleware,
+  validate({ params: idParamsSchema }),
+  async (req: AuthRequest, res: Response) => {
   try {
     if (!req.user) {
       return res.status(401).json({ error: "Not authenticated" });
     }
 
-    const notifId = Number(req.params.id);
-    if (Number.isNaN(notifId)) {
-      return res.status(400).json({ error: "Invalid notification id." });
-    }
+    const { id: notifId } = (req as any).validated.params as { id: number };
 
     const notif = await prisma.notification.findUnique({
       where: { id: notifId },
@@ -5305,7 +9472,7 @@ app.post("/notifications/:id/read", authMiddleware, async (req: AuthRequest, res
 });
 
 // POST /notifications/read-all  → mark all my notifications as read
-app.post("/notifications/read-all", authMiddleware, async (req: AuthRequest, res: Response) => {
+app.post("/notifications/read-all", authMiddleware, validate({}), async (req: AuthRequest, res: Response) => {
   try {
     if (!req.user) {
       return res.status(401).json({ error: "Not authenticated" });
@@ -5341,16 +9508,17 @@ app.post("/notifications/read-all", authMiddleware, async (req: AuthRequest, res
 });
 
 // POST /users/:id/block → current user blocks another user
-app.post("/users/:id/block", authMiddleware, async (req: AuthRequest, res: Response) => {
+app.post(
+  "/users/:id/block",
+  authMiddleware,
+  validate({ params: idParamsSchema }),
+  async (req: AuthRequest, res: Response) => {
   try {
     if (!req.user) {
       return res.status(401).json({ error: "Not authenticated" });
     }
 
-    const targetId = Number(req.params.id);
-    if (Number.isNaN(targetId)) {
-      return res.status(400).json({ error: "Invalid user id" });
-    }
+    const { id: targetId } = (req as any).validated.params as { id: number };
 
     if (targetId === req.user.userId) {
       return res.status(400).json({ error: "You cannot block yourself." });
@@ -5621,13 +9789,39 @@ function publicWebhookEndpoint(ep: {
 
 
 // POST /admin/webhooks/endpoints
-app.post("/admin/webhooks/endpoints", authMiddleware, async (req: AuthRequest, res: Response) => {
+app.post(
+  "/admin/webhooks/endpoints",
+  authMiddleware,
+  validate({
+    body: z.object({
+      url: z.string().trim().min(1, "url is required"),
+      events: z
+        .array(z.string())
+        .transform((events) =>
+          Array.from(
+            new Set(
+              events
+                .map((e) => String(e).trim())
+                .filter((e) => e.length > 0)
+            )
+          )
+        )
+        .refine((events) => events.length <= 50, {
+          message: "events must contain at most 50 entries",
+        })
+        .refine((events) => events.every((e) => e.length <= 100), {
+          message: "each event must be at most 100 characters",
+        })
+        .refine((events) => events.length > 0, {
+          message: "events[] is required",
+        }),
+    }),
+  }),
+  async (req: AuthRequest, res: Response) => {
   try {
     if (!requireAdmin(req, res)) return;
 
-    const { url, events } = req.body as { url?: string; events?: string[] };
-    if (!url || typeof url !== "string") return res.status(400).json({ error: "url is required." });
-    if (!Array.isArray(events) || events.length === 0) return res.status(400).json({ error: "events[] is required." });
+    const { url, events } = (req as any).validated.body as { url: string; events: string[] };
 
     const secret = crypto.randomBytes(32).toString("hex");
 
@@ -5646,6 +9840,14 @@ app.post("/admin/webhooks/endpoints", authMiddleware, async (req: AuthRequest, r
         },
       })
       .catch(() => null);
+
+    await logSecurityEvent(req, "admin.webhook_endpoint_created", {
+      targetType: "WEBHOOK_ENDPOINT",
+      targetId: ep.id,
+      url: ep.url,
+      enabled: ep.enabled,
+      eventsCount: ep.events.length,
+    });
 
     // ✅ Return secret ONCE, separate from endpoint object
     return res.json({ endpoint: publicWebhookEndpoint(ep), secret });
@@ -5674,14 +9876,52 @@ app.get("/admin/webhooks/endpoints", authMiddleware, async (req: AuthRequest, re
 
 
 // PATCH /admin/webhooks/endpoints/:id
-app.patch("/admin/webhooks/endpoints/:id", authMiddleware, async (req: AuthRequest, res: Response) => {
+app.patch(
+  "/admin/webhooks/endpoints/:id",
+  authMiddleware,
+  validate({
+    params: idParamsSchema,
+    body: z
+      .object({
+        url: z.string().trim().min(1).optional(),
+        enabled: z.coerce.boolean().optional(),
+        events: z
+          .array(z.string())
+          .transform((events) =>
+            Array.from(
+              new Set(
+                events
+                  .map((e) => String(e).trim())
+                  .filter((e) => e.length > 0)
+              )
+            )
+          )
+          .refine((events) => events.length <= 50, {
+            message: "events must contain at most 50 entries",
+          })
+          .refine((events) => events.every((e) => e.length <= 100), {
+            message: "each event must be at most 100 characters",
+          })
+          .refine((events) => events.length > 0, {
+            message: "events must be a non-empty string array",
+          })
+          .optional(),
+      })
+      .refine((b) => b.url != null || b.enabled != null || b.events != null, {
+        message: "At least one field must be provided",
+        path: [],
+      }),
+  }),
+  async (req: AuthRequest, res: Response) => {
   try {
     if (!requireAdmin(req, res)) return;
 
-    const id = Number(req.params.id);
-    if (Number.isNaN(id)) return res.status(400).json({ error: "Invalid endpoint id." });
-
-    const { url, enabled, events } = req.body as { url?: string; enabled?: boolean; events?: string[] };
+    const { id } = (req as any).validated.params as { id: number };
+    const { url, enabled, events } = (req as any).validated.body as {
+      url?: string;
+      enabled?: boolean;
+      events?: string[];
+    };
 
     const before = await prisma.webhookEndpoint.findUnique({
       where: { id },
@@ -5713,6 +9953,16 @@ app.patch("/admin/webhooks/endpoints/:id", authMiddleware, async (req: AuthReque
       },
     }).catch(() => null);
 
+    await logSecurityEvent(req, "admin.webhook_endpoint_updated", {
+      targetType: "WEBHOOK_ENDPOINT",
+      targetId: ep.id,
+      changed: {
+        url: url !== undefined,
+        enabled: enabled !== undefined,
+        events: events !== undefined,
+      },
+    });
+
     return res.json({ endpoint: publicWebhookEndpoint(ep) });
   } catch (err) {
     console.error("Update webhook endpoint error:", err);
@@ -5721,12 +9971,15 @@ app.patch("/admin/webhooks/endpoints/:id", authMiddleware, async (req: AuthReque
 });
 
 // POST /admin/webhooks/endpoints/:id/rotate-secret
-app.post("/admin/webhooks/endpoints/:id/rotate-secret", authMiddleware, async (req: AuthRequest, res: Response) => {
+app.post(
+  "/admin/webhooks/endpoints/:id/rotate-secret",
+  authMiddleware,
+  validate({ params: idParamsSchema }),
+  async (req: AuthRequest, res: Response) => {
   try {
     if (!requireAdmin(req, res)) return;
 
-    const id = Number(req.params.id);
-    if (Number.isNaN(id)) return res.status(400).json({ error: "Invalid endpoint id." });
+    const { id } = (req as any).validated.params as { id: number };
 
     const exists = await prisma.webhookEndpoint.findUnique({
       where: { id },
@@ -5753,6 +10006,12 @@ app.post("/admin/webhooks/endpoints/:id/rotate-secret", authMiddleware, async (r
       })
       .catch(() => null);
 
+    await logSecurityEvent(req, "admin.webhook_endpoint_secret_rotated", {
+      targetType: "WEBHOOK_ENDPOINT",
+      targetId: updated.id,
+      url: updated.url,
+    });
+
     // ✅ Return secret ONCE here
     return res.json({ endpoint: publicWebhookEndpoint(updated), secret: newSecret });
   } catch (err) {
@@ -5764,22 +10023,25 @@ app.post("/admin/webhooks/endpoints/:id/rotate-secret", authMiddleware, async (r
 
 // PATCH /admin/reports/:id
 // Body: { status: "OPEN" | "IN_REVIEW" | "RESOLVED" | "DISMISSED", adminNotes?: string }
-app.patch("/admin/reports/:id", authMiddleware, async (req: AuthRequest, res: Response) => {
+app.patch(
+  "/admin/reports/:id",
+  authMiddleware,
+  validate({
+    params: idParamsSchema,
+    body: z.object({
+      status: z.enum(["OPEN", "IN_REVIEW", "RESOLVED", "DISMISSED"]),
+      adminNotes: z.string().trim().optional(),
+    }),
+  }),
+  async (req: AuthRequest, res: Response) => {
   try {
     if (!requireAdmin(req, res)) return;
 
-    const reportId = Number(req.params.id);
-    if (Number.isNaN(reportId)) {
-      return res.status(400).json({ error: "Invalid report id." });
-    }
-
-    const { status, adminNotes } = req.body as { status?: string; adminNotes?: string };
-
-    if (!status || !["OPEN", "IN_REVIEW", "RESOLVED", "DISMISSED"].includes(status)) {
-      return res.status(400).json({
-        error: 'status is required and must be one of "OPEN", "IN_REVIEW", "RESOLVED", "DISMISSED".',
-      });
-    }
+    const { id: reportId } = (req as any).validated.params as { id: number };
+    const { status, adminNotes } = (req as any).validated.body as {
+      status: "OPEN" | "IN_REVIEW" | "RESOLVED" | "DISMISSED";
+      adminNotes?: string;
+    };
 
     const existing = await prisma.report.findUnique({ where: { id: reportId } });
     if (!existing) {
@@ -6027,16 +10289,22 @@ app.get(
 
 // POST /admin/users/:id/suspend
 // Body: { reason?: string, reportId?: number }
-app.post("/admin/users/:id/suspend", authMiddleware, async (req: AuthRequest, res: Response) => {
+app.post(
+  "/admin/users/:id/suspend",
+  authMiddleware,
+  validate({
+    params: idParamsSchema,
+    body: z.object({
+      reason: z.string().nullable().optional(),
+      reportId: positiveIntSchema.optional(),
+    }),
+  }),
+  async (req: AuthRequest, res: Response) => {
   try {
     if (!requireAdmin(req, res)) return;
 
-    const userId = Number(req.params.id);
-    if (Number.isNaN(userId)) return res.status(400).json({ error: "Invalid user id." });
-
-    const body = (req.body ?? {}) as { reason?: string; reportId?: number };
-    const reason = body.reason;
-    const reportId = body.reportId;
+    const { id: userId } = (req as any).validated.params as { id: number };
+    const { reason, reportId } = (req as any).validated.body as { reason?: string | null; reportId?: number };
 
     const user = await prisma.user.findUnique({
       where: { id: userId },
@@ -6076,6 +10344,13 @@ app.post("/admin/users/:id/suspend", authMiddleware, async (req: AuthRequest, re
       },
     });
 
+    await logSecurityEvent(req, "admin.user_suspended", {
+      targetType: "USER",
+      targetId: userId,
+      reportId: typeof reportId === "number" ? reportId : null,
+      reason: reason?.trim() || null,
+    });
+
     return res.json({
       message: "User suspended.",
       user: {
@@ -6095,14 +10370,15 @@ app.post("/admin/users/:id/suspend", authMiddleware, async (req: AuthRequest, re
 });
 
 // POST /admin/users/:id/unsuspend
-app.post("/admin/users/:id/unsuspend", authMiddleware, async (req: AuthRequest, res: Response) => {
+app.post(
+  "/admin/users/:id/unsuspend",
+  authMiddleware,
+  validate({ params: idParamsSchema }),
+  async (req: AuthRequest, res: Response) => {
   try {
     if (!requireAdmin(req, res)) return;
 
-    const userId = Number(req.params.id);
-    if (Number.isNaN(userId)) {
-      return res.status(400).json({ error: "Invalid user id" });
-    }
+    const { id: userId } = (req as any).validated.params as { id: number };
 
     const user = await prisma.user.findUnique({
       where: { id: userId },
@@ -6149,6 +10425,11 @@ app.post("/admin/users/:id/unsuspend", authMiddleware, async (req: AuthRequest, 
       },
     });
 
+    await logSecurityEvent(req, "admin.user_unsuspended", {
+      targetType: "USER",
+      targetId: userId,
+    });
+
     return res.json({
       message: "User unsuspended",
       user: {
@@ -6166,14 +10447,19 @@ app.post("/admin/users/:id/unsuspend", authMiddleware, async (req: AuthRequest, 
 
 // POST /admin/jobs/:id/hide
 // Body: { reportId?: number, notes?: string }
-app.post("/admin/jobs/:id/hide", authMiddleware, async (req: AuthRequest, res: Response) => {
+app.post(
+  "/admin/jobs/:id/hide",
+  authMiddleware,
+  validate({
+    params: idParamsSchema,
+    body: z.object({ reportId: positiveIntSchema.optional(), notes: z.string().nullable().optional() }),
+  }),
+  async (req: AuthRequest, res: Response) => {
   try {
     if (!requireAdmin(req, res)) return;
 
-    const jobId = Number(req.params.id);
-    if (Number.isNaN(jobId)) return res.status(400).json({ error: "Invalid job id." });
-
-    const { reportId, notes } = req.body as { reportId?: number; notes?: string };
+    const { id: jobId } = (req as any).validated.params as { id: number };
+    const { reportId, notes } = (req as any).validated.body as { reportId?: number; notes?: string | null };
 
     const job = await prisma.job.findUnique({
       where: { id: jobId },
@@ -6235,14 +10521,19 @@ app.post("/admin/jobs/:id/hide", authMiddleware, async (req: AuthRequest, res: R
 });
 
 // POST /admin/jobs/:id/unhide
-app.post("/admin/jobs/:id/unhide", authMiddleware, async (req: AuthRequest, res: Response) => {
+app.post(
+  "/admin/jobs/:id/unhide",
+  authMiddleware,
+  validate({
+    params: idParamsSchema,
+    body: z.object({ reportId: positiveIntSchema.optional(), notes: z.string().nullable().optional() }),
+  }),
+  async (req: AuthRequest, res: Response) => {
   try {
     if (!requireAdmin(req, res)) return;
 
-    const jobId = Number(req.params.id);
-    if (Number.isNaN(jobId)) return res.status(400).json({ error: "Invalid job id." });
-
-    const { reportId, notes } = req.body as { reportId?: number; notes?: string };
+    const { id: jobId } = (req as any).validated.params as { id: number };
+    const { reportId, notes } = (req as any).validated.body as { reportId?: number; notes?: string | null };
 
     const job = await prisma.job.findUnique({
       where: { id: jobId },
@@ -6306,14 +10597,19 @@ app.post("/admin/jobs/:id/unhide", authMiddleware, async (req: AuthRequest, res:
 });
 
 // POST /admin/messages/:id/hide
-app.post("/admin/messages/:id/hide", authMiddleware, async (req: AuthRequest, res: Response) => {
+app.post(
+  "/admin/messages/:id/hide",
+  authMiddleware,
+  validate({
+    params: idParamsSchema,
+    body: z.object({ reportId: positiveIntSchema.optional(), notes: z.string().nullable().optional() }),
+  }),
+  async (req: AuthRequest, res: Response) => {
   try {
     if (!requireAdmin(req, res)) return;
 
-    const messageId = Number(req.params.id);
-    if (Number.isNaN(messageId)) return res.status(400).json({ error: "Invalid message id." });
-
-    const { reportId, notes } = req.body as { reportId?: number; notes?: string };
+    const { id: messageId } = (req as any).validated.params as { id: number };
+    const { reportId, notes } = (req as any).validated.body as { reportId?: number; notes?: string | null };
 
     const msg = await prisma.message.findUnique({
       where: { id: messageId },
@@ -6368,14 +10664,19 @@ app.post("/admin/messages/:id/hide", authMiddleware, async (req: AuthRequest, re
 });
 
 // POST /admin/messages/:id/unhide
-app.post("/admin/messages/:id/unhide", authMiddleware, async (req: AuthRequest, res: Response) => {
+app.post(
+  "/admin/messages/:id/unhide",
+  authMiddleware,
+  validate({
+    params: idParamsSchema,
+    body: z.object({ reportId: positiveIntSchema.optional(), notes: z.string().nullable().optional() }),
+  }),
+  async (req: AuthRequest, res: Response) => {
   try {
     if (!requireAdmin(req, res)) return;
 
-    const messageId = Number(req.params.id);
-    if (Number.isNaN(messageId)) return res.status(400).json({ error: "Invalid message id." });
-
-    const { reportId, notes } = req.body as { reportId?: number; notes?: string };
+    const { id: messageId } = (req as any).validated.params as { id: number };
+    const { reportId, notes } = (req as any).validated.body as { reportId?: number; notes?: string | null };
 
     const msg = await prisma.message.findUnique({
       where: { id: messageId },
@@ -6679,7 +10980,7 @@ app.get(
 
 // POST /admin/impersonate/stop
 // IMPORTANT: Call this USING THE IMPERSONATION TOKEN (not the real admin token).
-app.post("/admin/impersonate/stop", authMiddleware, async (req: AuthRequest, res: Response) => {
+app.post("/admin/impersonate/stop", authMiddleware, validate({}), async (req: AuthRequest, res: Response) => {
   try {
     if (!req.user) return res.status(401).json({ error: "Not authenticated" });
 
@@ -6710,6 +11011,14 @@ app.post("/admin/impersonate/stop", authMiddleware, async (req: AuthRequest, res
       },
     });
 
+    await logSecurityEvent(req, "admin.impersonation_stopped", {
+      actorUserId: adminId,
+      actorRole: "ADMIN",
+      targetType: "USER",
+      targetId: targetUserId,
+      impersonatedUserId: targetUserId,
+    });
+
     return res.json({
       message: "Impersonation stopped (logged). Discard the impersonation token and use the original admin token.",
     });
@@ -6720,14 +11029,15 @@ app.post("/admin/impersonate/stop", authMiddleware, async (req: AuthRequest, res
 });
 
 // POST /admin/impersonate/:userId
-app.post("/admin/impersonate/:userId(\\d+)", authMiddleware, async (req: AuthRequest, res: Response) => {
+app.post(
+  "/admin/impersonate/:userId(\\d+)",
+  authMiddleware,
+  validate({ params: userIdParamsSchema }),
+  async (req: AuthRequest, res: Response) => {
   try {
     if (!requireAdmin(req, res)) return;
 
-    const targetUserId = Number(req.params.userId);
-    if (Number.isNaN(targetUserId)) {
-      return res.status(400).json({ error: "Invalid userId parameter." });
-    }
+    const { userId: targetUserId } = (req as any).validated.params as { userId: number };
 
     const target = await prisma.user.findUnique({
       where: { id: targetUserId },
@@ -6774,6 +11084,14 @@ app.post("/admin/impersonate/:userId(\\d+)", authMiddleware, async (req: AuthReq
         startedAt: new Date(),
         expiresIn: "30m",
       },
+    });
+
+    await logSecurityEvent(req, "admin.impersonation_started", {
+      targetType: "USER",
+      targetId: target.id,
+      targetRole: target.role,
+      targetIsSuspended: target.isSuspended,
+      expiresIn: "30m",
     });
 
     return res.json({
@@ -6971,26 +11289,34 @@ app.get("/admin/webhooks/deliveries/:id", authMiddleware, async (req: AuthReques
   }
 });
 
-// --- Global error handler (keep at the end, after routes) ---
-app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
-  console.error("[error]", err);
-
-  const status = typeof err?.status === "number" ? err.status : 500;
-  const message =
-    err?.message && typeof err.message === "string"
-      ? err.message
-      : "Internal server error";
-
-  res.status(status).json({
-    error: message,
-    ...(process.env.NODE_ENV !== "production" ? { stack: String(err?.stack ?? "") } : {}),
-  });
-});
-
 // GET /admin/webhooks/ui
 // Lightweight admin dashboard (no separate frontend).
 // It expects an Admin JWT in localStorage under "adminToken".
-app.get("/admin/webhooks/ui", async (_req, res) => {
+const requireAdminUiEnabled = createRequireAdminUiEnabled(process.env);
+const basicAuthForAdminUi = createBasicAuthForAdminUi(process.env);
+
+app.get(
+  "/admin/webhooks/ui",
+  // Gate the route entirely (returns 404 when disabled).
+  requireAdminUiEnabled,
+  // Clickjacking protections (explicit for this HTML route)
+  helmet.frameguard({ action: "deny" }),
+  helmet.contentSecurityPolicy({
+    useDefaults: true,
+    directives: {
+      "default-src": ["'self'"],
+      "base-uri": ["'self'"],
+      "frame-ancestors": ["'none'"],
+      "form-action": ["'self'"],
+      "object-src": ["'none'"],
+      "img-src": ["'self'", "data:"],
+      "connect-src": ["'self'"],
+      "script-src": ["'self'", "'unsafe-inline'"],
+      "style-src": ["'self'", "'unsafe-inline'"],
+    },
+  }),
+  basicAuthForAdminUi,
+  async (_req, res) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   return res.send(`<!doctype html>
 <html>
@@ -7338,7 +11664,12 @@ app.get("/admin/webhooks/ui", async (_req, res) => {
 
 </body>
 </html>`);
-});
+  }
+);
+
+
+// --- Single global error handler (keep at the end, after ALL routes) ---
+app.use(createGlobalErrorHandler({ logger, captureException }));
 
 
 // --- Start server + worker (start-once + graceful shutdown) ---
@@ -7363,30 +11694,31 @@ async function startWorkersOnce() {
 // });
 
 const server = app.listen(PORT, () => {
-  console.log(`GoGetter API listening on port ${PORT}`);
+  logger.info("server.listening", { port: PORT });
 });
 
 async function shutdown(signal: string) {
-  console.log(`[shutdown] received ${signal}`);
+  logger.info("shutdown.received", { signal });
 
   try {
 
     // stop accepting new HTTP requests
     await new Promise<void>((resolve) => server.close(() => resolve()));
-    console.log("[shutdown] http server closed");
+    logger.info("shutdown.http_closed");
 
     // disconnect prisma cleanly (prevents hanging in prod)
     try {
       const { prisma } = await import("./prisma"); // adjust path if server.ts is in src/
       await prisma.$disconnect();
-      console.log("[shutdown] prisma disconnected");
+      logger.info("shutdown.prisma_disconnected");
     } catch (e) {
       // If your server.ts imports prisma from "../prisma" etc, just import directly there instead
-      console.log("[shutdown] prisma disconnect skipped/failed:", e);
+      logger.warn("shutdown.prisma_disconnect_failed", { message: String((e as any)?.message ?? e) });
     }
   } catch (e) {
-    console.error("[shutdown] error:", e);
+    logger.error("shutdown.error", { message: String((e as any)?.message ?? e) });
   } finally {
+    await flushSentry().catch(() => null);
     process.exit(0);
   }
 }
@@ -7397,10 +11729,12 @@ process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 // Helpful in some hosting environments
 process.on("uncaughtException", (err) => {
-  console.error("[uncaughtException]", err);
+  logger.error("process.uncaughtException", { message: String((err as any)?.message ?? err) });
+  captureException(err, { kind: "uncaughtException" });
   shutdown("uncaughtException");
 });
 process.on("unhandledRejection", (reason) => {
-  console.error("[unhandledRejection]", reason);
+  logger.error("process.unhandledRejection", { message: String((reason as any)?.message ?? reason) });
+  captureException(reason, { kind: "unhandledRejection" });
   shutdown("unhandledRejection");
 });

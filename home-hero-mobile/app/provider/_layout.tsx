@@ -12,6 +12,7 @@ export default function ProviderLayout() {
       <Stack.Screen name="bid-detail" />
       <Stack.Screen name="bid-templates" />
       <Stack.Screen name="quick-replies" />
+      <Stack.Screen name="saved-searches" />
       <Stack.Screen name="availability" />
       <Stack.Screen name="profile" />
       <Stack.Screen name="verification" />

@@ -55,6 +55,26 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     };
   }, []);
 
+  // Best-effort: if we have a token but no cached user, fetch /me.
+  useEffect(() => {
+    if (!token) return;
+    if (user) return;
+
+    let mounted = true;
+    (async () => {
+      try {
+        const me = await api.get<AuthUser>("/me");
+        if (mounted) setUser(me);
+      } catch {
+        // ignore; user can still operate token-only
+      }
+    })();
+
+    return () => {
+      mounted = false;
+    };
+  }, [token, user]);
+
   const value = useMemo<AuthContextValue>(
     () => ({
       isAuthenticated: !!token,

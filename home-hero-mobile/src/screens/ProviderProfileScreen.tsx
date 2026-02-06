@@ -67,6 +67,15 @@ export default function ProviderProfileScreen(props?: ProviderProfileScreenProps
   const [isBlocked, setIsBlocked] = useState<boolean>(false);
   const [checkingBlocked, setCheckingBlocked] = useState<boolean>(false);
 
+  const responseTimeLabel = (() => {
+    const seconds = (profile as any)?.stats?.medianResponseTimeSeconds30d;
+    if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds < 0) return null;
+    if (seconds < 60) return "<1 min";
+    if (seconds < 60 * 60) return `${Math.round(seconds / 60)} min`;
+    if (seconds < 24 * 60 * 60) return `${Math.round(seconds / 3600)} hr`;
+    return `${Math.round(seconds / 86400)} day`;
+  })();
+
   // Edit form state
   const [formData, setFormData] = useState({
     name: "",
@@ -184,6 +193,14 @@ export default function ProviderProfileScreen(props?: ProviderProfileScreenProps
       });
     }
   }, [profile]);
+
+  // (UI) Render helper: compact stat chip
+  const StatChip = ({ icon, label }: { icon: string; label: string }) => (
+    <View style={styles.statChip}>
+      <MaterialCommunityIcons name={icon as any} size={14} color={COLORS.textMuted} />
+      <Text style={styles.statChipText}>{label}</Text>
+    </View>
+  );
 
   // Initialize selected categories when profile loads
   React.useEffect(() => {
@@ -385,6 +402,12 @@ export default function ProviderProfileScreen(props?: ProviderProfileScreenProps
                     </Text>
                   </View>
                 )}
+
+                {responseTimeLabel ? (
+                  <View style={styles.statChipsRow}>
+                    <StatChip icon="clock-outline" label={`Responds in ${responseTimeLabel}`} />
+                  </View>
+                ) : null}
               </View>
             </View>
           </View>
@@ -432,6 +455,30 @@ export default function ProviderProfileScreen(props?: ProviderProfileScreenProps
                   <Text style={styles.quickToolTitle}>Quick replies</Text>
                   <Text style={styles.quickToolSubtitle}>
                     Tap-to-insert responses in chat
+                  </Text>
+                </View>
+                <MaterialCommunityIcons
+                  name="chevron-right"
+                  size={22}
+                  color={COLORS.textMuted}
+                />
+              </Pressable>
+
+              <View style={styles.quickToolDivider} />
+
+              <Pressable
+                style={styles.quickToolRow}
+                onPress={() => router.push("/provider/saved-searches")}
+              >
+                <MaterialCommunityIcons
+                  name="bookmark-search-outline"
+                  size={20}
+                  color={COLORS.accent}
+                />
+                <View style={styles.quickToolTextWrap}>
+                  <Text style={styles.quickToolTitle}>Saved searches</Text>
+                  <Text style={styles.quickToolSubtitle}>
+                    Get instant job match notifications
                   </Text>
                 </View>
                 <MaterialCommunityIcons
@@ -967,6 +1014,29 @@ const styles = StyleSheet.create({
   ratingText: {
     fontSize: 13,
     color: COLORS.textMuted,
+  },
+
+  statChipsRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8,
+    marginTop: 4,
+  },
+  statChip: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 999,
+    backgroundColor: "rgba(148, 163, 184, 0.12)",
+    borderWidth: 1,
+    borderColor: "rgba(148, 163, 184, 0.22)",
+  },
+  statChipText: {
+    color: COLORS.textMuted,
+    fontSize: 12,
+    fontWeight: "700",
   },
 
   card: {

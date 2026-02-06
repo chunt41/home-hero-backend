@@ -62,7 +62,7 @@ try {
   # Signup a new consumer
   $stamp = Get-Date -Format 'yyyyMMddHHmmss'
   $email = "consumer+$stamp@example.com"
-  $password = 'password123'
+  $password = 'DevTestPassphrase!2345'
 
   $signup = Invoke-RestMethod -Method Post -Uri "$base/auth/signup" -ContentType 'application/json' -Body (@{ role = 'CONSUMER'; name = 'Test Consumer'; email = $email; password = $password } | ConvertTo-Json) -TimeoutSec 30
   $token = $signup.token

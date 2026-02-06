@@ -8,7 +8,7 @@ import {
   ActivityIndicator,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { useFocusEffect } from "expo-router";
+import { router, useFocusEffect } from "expo-router";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { useNotifications } from "../hooks/useNotifications";
 import { formatDistanceToNow } from "date-fns";
@@ -38,6 +38,8 @@ export default function NotificationsScreen() {
 
   const getNotificationIcon = (type: string) => {
     switch (type) {
+      case "job.match":
+        return "briefcase-search-outline";
       case "NEW_BID":
         return "gavel";
       case "COUNTER_OFFER":
@@ -50,6 +52,10 @@ export default function NotificationsScreen() {
         return "message";
       case "JOB_COMPLETED":
         return "star";
+      case "JOB_COMPLETION_CONFIRM_REQUIRED":
+        return "check-decagram";
+      case "JOB_COMPLETION_MARKED":
+        return "timer-sand";
       default:
         return "bell";
     }
@@ -57,6 +63,8 @@ export default function NotificationsScreen() {
 
   const getNotificationColor = (type: string) => {
     switch (type) {
+      case "job.match":
+        return "#38bdf8";
       case "NEW_BID":
         return "#3b82f6";
       case "COUNTER_OFFER":
@@ -69,6 +77,10 @@ export default function NotificationsScreen() {
         return "#8b5cf6";
       case "JOB_COMPLETED":
         return "#ec4899";
+      case "JOB_COMPLETION_CONFIRM_REQUIRED":
+        return "#f59e0b";
+      case "JOB_COMPLETION_MARKED":
+        return "#38bdf8";
       default:
         return "#38bdf8";
     }
@@ -87,6 +99,10 @@ export default function NotificationsScreen() {
         onPress={() => {
           if (!item.isRead) {
             markRead(item.id);
+          }
+
+          if (item.type === "job.match" && typeof item.jobId === "number") {
+            router.push(`/job/${item.jobId}`);
           }
         }}
       >

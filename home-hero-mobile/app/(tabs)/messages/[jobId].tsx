@@ -658,11 +658,36 @@ export default function JobMessagesThreadScreen() {
           )
         );
 
+        const details = e?.details;
+        const detailCode = details && typeof details === "object" ? (details as any)?.code : null;
+        const appealUrl = details && typeof details === "object" ? (details as any)?.appealUrl : null;
+
         if (e?.status === 403 && e?.details?.code === "RESTRICTED") {
           const msg =
             e?.message ??
             "Your account is temporarily restricted from sending messages. Please try again later.";
           Alert.alert("Temporarily restricted", msg);
+          setError(msg);
+        } else if (e?.status === 400 && (detailCode === "MESSAGE_BLOCKED" || detailCode === "CONTACT_INFO_NOT_ALLOWED")) {
+          const msg =
+            e?.message ??
+            "Your message was blocked for your safety. Please keep communication in-app.";
+
+          const buttons: any[] = [{ text: "OK" }];
+          if (typeof appealUrl === "string" && appealUrl.trim()) {
+            buttons.unshift({
+              text: "Appeal",
+              onPress: () => {
+                try {
+                  Linking.openURL(appealUrl);
+                } catch {
+                  // ignore
+                }
+              },
+            });
+          }
+
+          Alert.alert("Message blocked", msg, buttons);
           setError(msg);
         } else {
           setError(e?.message ?? "Failed to send.");

@@ -12,6 +12,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { useLocalSearchParams, router, useFocusEffect } from "expo-router";
 import { api } from "../../src/lib/apiClient";
 import { addEventToDeviceCalendar } from "../../src/lib/calendarIntegration";
+import { useAuth } from "../../src/context/AuthContext";
 
 type JobDetail = {
   id: number;
@@ -22,6 +23,8 @@ type JobDetail = {
   status: string;
   location: string | null;
   createdAt: string;
+  completionPendingForUserId?: number | null;
+  completedAt?: string | null;
 };
 
 type CounterOffer = {
@@ -81,6 +84,8 @@ export default function ProviderJobDetailScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const jobId = useMemo(() => Number(id), [id]);
 
+  const { user } = useAuth();
+
   const [job, setJob] = useState<JobDetail | null>(null);
   const [myBid, setMyBid] = useState<MyBid | null>(null);
 
@@ -93,6 +98,7 @@ export default function ProviderJobDetailScreen() {
   const [error, setError] = useState<string | null>(null);
 
   const [acting, setActing] = useState<"accept" | "decline" | null>(null);
+  const [completionActing, setCompletionActing] = useState<"mark" | "confirm" | null>(null);
 
   const fetchJob = useCallback(async () => {
     if (!Number.isFinite(jobId)) {
@@ -174,9 +180,74 @@ export default function ProviderJobDetailScreen() {
 
   const canOpenDispute = useMemo(() => {
     if (!job) return false;
-    if (job.status !== "COMPLETED") return false;
+    if (job.status !== "COMPLETED" && job.status !== "COMPLETED_PENDING_CONFIRMATION") return false;
     return myBid?.status === "ACCEPTED";
   }, [job, myBid?.status]);
+
+  const canMarkComplete = useMemo(() => {
+    if (!job) return false;
+    if (job.status !== "IN_PROGRESS") return false;
+    return myBid?.status === "ACCEPTED";
+  }, [job, myBid?.status]);
+
+  const canConfirmComplete = useMemo(() => {
+    if (!job) return false;
+    if (job.status !== "COMPLETED_PENDING_CONFIRMATION") return false;
+    if (!user?.id) return false;
+    if (job.completionPendingForUserId !== user.id) return false;
+    return myBid?.status === "ACCEPTED";
+  }, [job, myBid?.status, user?.id]);
+
+  const onMarkComplete = useCallback(() => {
+    if (!job) return;
+    Alert.alert(
+      "Mark complete?",
+      "This requests completion confirmation from the other participant.",
+      [
+        { text: "Not yet", style: "cancel" },
+        {
+          text: "Yes",
+          onPress: async () => {
+            try {
+              setCompletionActing("mark");
+              await api.post(`/jobs/${job.id}/mark-complete`, {});
+              await fetchJob();
+              Alert.alert(
+                "Requested",
+                "Waiting for the other participant to confirm completion."
+              );
+            } catch (e: any) {
+              Alert.alert("Error", e?.message ?? "Could not request completion.");
+            } finally {
+              setCompletionActing(null);
+            }
+          },
+        },
+      ]
+    );
+  }, [job, fetchJob]);
+
+  const onConfirmComplete = useCallback(() => {
+    if (!job) return;
+    Alert.alert("Confirm completion?", "Confirm that the work is finished.", [
+      { text: "Not yet", style: "cancel" },
+      {
+        text: "Yes",
+        onPress: async () => {
+          try {
+            setCompletionActing("confirm");
+            await api.post(`/jobs/${job.id}/confirm-complete`, {});
+            await fetchJob();
+            Alert.alert("Completed", "Job has been marked completed.");
+          } catch (e: any) {
+            Alert.alert("Error", e?.message ?? "Could not confirm completion.");
+          } finally {
+            setCompletionActing(null);
+          }
+        },
+      },
+    ]);
+  }, [job, fetchJob]);
 
   const onAcceptCounter = useCallback(async () => {
     if (!myBid?.id) return;
@@ -514,6 +585,40 @@ export default function ProviderJobDetailScreen() {
                   })}
                 </View>
               )}
+            </View>
+          ) : null}
+
+          {(canMarkComplete || canConfirmComplete) ? (
+            <View style={styles.card}>
+              <Text style={styles.sectionTitle}>Completion</Text>
+
+              {canMarkComplete ? (
+                <Pressable
+                  style={[styles.primaryBtn, completionActing && styles.btnDisabled]}
+                  disabled={!!completionActing}
+                  onPress={onMarkComplete}
+                >
+                  <Text style={styles.primaryText}>
+                    {completionActing === "mark" ? "Requesting…" : "Mark Complete"}
+                  </Text>
+                </Pressable>
+              ) : null}
+
+              {canConfirmComplete ? (
+                <Pressable
+                  style={[
+                    styles.primaryBtn,
+                    completionActing && styles.btnDisabled,
+                    canMarkComplete ? { marginTop: 10 } : null,
+                  ]}
+                  disabled={!!completionActing}
+                  onPress={onConfirmComplete}
+                >
+                  <Text style={styles.primaryText}>
+                    {completionActing === "confirm" ? "Confirming…" : "Confirm Completion"}
+                  </Text>
+                </Pressable>
+              ) : null}
             </View>
           ) : null}
 

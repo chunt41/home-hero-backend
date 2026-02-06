@@ -1,0 +1,25 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      NODE_ENV: test
+      # These are dummy values for CI so imports that require env vars don't crash.
+      DATABASE_URL: postgresql://user:pass@localhost:5432/db?sslmode=disable
+      JWT_SECRET: ci_dummy_secret
+      STRIPE_SECRET_KEY: sk_test_ci_dummy
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      - run: npm run audit

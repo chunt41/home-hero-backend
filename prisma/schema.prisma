@@ -12,12 +12,19 @@ model User {
   name                        String
   email                       String                @unique
   passwordHash                String
+  emailVerifiedAt             DateTime?
+  emailVerificationTokenHash  String?               @unique
+  emailVerificationExpiresAt  DateTime?
+  passwordResetTokenHash      String?               @unique
+  passwordResetExpiresAt      DateTime?
   phone                       String?
   location                    String?
   createdAt                   DateTime              @default(now())
   isSuspended                 Boolean               @default(false)
   suspendedAt                 DateTime?
   suspendedReason             String?
+  riskScore                    Int                   @default(0)
+  restrictedUntil              DateTime?
   adminActions                AdminAction[]         @relation("AdminActions")
   bids                        Bid[]                 @relation("UserBids")
   blocksReceived              Block[]               @relation("UserBlocksBlocked")
@@ -26,33 +33,150 @@ model User {
   favoriteProvidersAsConsumer FavoriteProvider[]    @relation("FavoriteProviderConsumer")
   favoriteProvidersAsProvider FavoriteProvider[]    @relation("FavoriteProviderProvider")
   jobs                        Job[]                 @relation("UserJobs")
+  awardedJobs                 Job[]                 @relation("JobAwardedProvider")
+  completionConfirmationsPending Job[]              @relation("JobCompletionPendingForUser")
   hiddenJobs                  Job[]                 @relation("HiddenJobsByAdmin")
   messageReadStates           JobMessageReadState[]
   hiddenMessages              Message[]             @relation("HiddenMessagesByAdmin")
   messagesSent                Message[]
   notifications               Notification[]
+  pushTokens                  PushToken[]
+  jobMatchNotifications       JobMatchNotification[]
   providerProfile             ProviderProfile?
+  bidTemplates                BidTemplate[]
+  quickReplies                ProviderQuickReply[]
+  providerAvailabilities      ProviderAvailability[]
+  appointmentsAsProvider      Appointment[]         @relation("AppointmentsProvider")
+  appointmentsAsConsumer      Appointment[]         @relation("AppointmentsConsumer")
+  providerVerification        ProviderVerification?
+  providerVerificationUploads ProviderVerificationAttachment[] @relation("ProviderVerificationUploader")
   reportsHandled              Report[]              @relation("ReportHandledByAdmin")
   reportsGiven                Report[]              @relation("ReportReporter")
   reportsAgainst              Report[]              @relation("ReportTargetUser")
-  reviewsGiven                Review[]              @relation("ConsumerReviews")
-  reviewsReceived             Review[]              @relation("ProviderReviews")
+  reviewsGiven                Review[]              @relation("ReviewsGiven")
+  reviewsReceived             Review[]              @relation("ReviewsReceived")
+  disputesOpened              Dispute[]
   subscription                Subscription?
   subscriptionPayments        SubscriptionPayment[]
   stripePayments              StripePayment[]
+  providerEntitlement         ProviderEntitlement?
+  addonPurchases              AddonPurchase[]
+  providerStats               ProviderStats?
   adRevenue                   AdRevenue[]
   payouts                     Payout[]
+  securityEvents              SecurityEvent[]
+  savedSearches               ProviderSavedSearch[]
+
+  // AI usage guardrails (monthly quota)
+  aiMonthlyTokenLimit          Int?
+  aiTokensUsedThisMonth        Int                   @default(0)
+  aiUsageMonthKey              String?
+}
+
+model AiCacheEntry {
+  key             String   @id
+  taskType        String
+  normalizedInput String
+  response        Json
+  model           String
+  createdAt       DateTime @default(now())
+  expiresAt       DateTime?
+
+  @@index([taskType])
+  @@index([createdAt])
+  @@index([expiresAt])
+}
+
+model ProviderSavedSearch {
+  id          Int      @id @default(autoincrement())
+  providerId  Int
+  categories  String[] @default([])
+  radiusMiles Int
+  zipCode     String
+  minBudget   Int?
+  maxBudget   Int?
+  isEnabled   Boolean  @default(true)
+  createdAt   DateTime @default(now())
+
+  provider    User     @relation(fields: [providerId], references: [id], onDelete: Cascade)
+
+  @@index([providerId])
+  @@index([providerId, isEnabled])
+  @@index([createdAt])
+}
+
+model BidTemplate {
+  id            Int      @id @default(autoincrement())
+  providerId    Int
+  title         String
+  body          String
+  defaultAmount Int?
+  tags          String[] @default([])
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  provider      User     @relation(fields: [providerId], references: [id], onDelete: Cascade)
+
+  @@index([providerId])
+  @@index([createdAt])
+}
+
+model ProviderQuickReply {
+  id         Int      @id @default(autoincrement())
+  providerId Int
+  title      String
+  body       String
+  tags       String[] @default([])
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  provider   User     @relation(fields: [providerId], references: [id], onDelete: Cascade)
+
+  @@index([providerId])
+  @@index([createdAt])
+}
+
+model SecurityEvent {
+  id          String    @id @default(cuid())
+  actionType  String    @map("type")
+  actorUserId Int?      @map("userId")
+  actorRole   UserRole?
+  actorEmail  String?   @map("email")
+  targetType  String?
+  targetId    String?
+  ip          String?
+  userAgent   String?
+  metadataJson Json?    @map("details")
+  createdAt   DateTime  @default(now())
+
+  actor       User?     @relation(fields: [actorUserId], references: [id])
+
+  @@index([actionType])
+  @@index([actorUserId])
+  @@index([createdAt])
 }
 
 model Job {
   id          Int                   @id @default(autoincrement())
   consumerId  Int
+  awardedProviderId Int?
+  completionPendingForUserId Int?
   title       String
   description String
   budgetMin   Int?
   budgetMax   Int?
   status      JobStatus             @default(OPEN)
   location    String?
+  category    String?
+  trade       String?
+  urgency     String?
+  suggestedTags String[]            @default([])
+  suggestedMinPrice Int?
+  suggestedMaxPrice Int?
+  suggestedReason   String?
+  riskScore    Int                   @default(0)
+  awardedAt   DateTime?
+  completedAt DateTime?
   createdAt   DateTime              @default(now())
   hiddenAt    DateTime?
   hiddenById  Int?
@@ -60,13 +184,65 @@ model Job {
   bids        Bid[]
   favorites   FavoriteJob[]         @relation("FavoriteJobJob")
   consumer    User                  @relation("UserJobs", fields: [consumerId], references: [id])
+  awardedProvider User?             @relation("JobAwardedProvider", fields: [awardedProviderId], references: [id])
+  completionPendingForUser User?    @relation("JobCompletionPendingForUser", fields: [completionPendingForUserId], references: [id])
   hiddenBy    User?                 @relation("HiddenJobsByAdmin", fields: [hiddenById], references: [id])
   attachments JobAttachment[]
   readStates  JobMessageReadState[]
   photos      JobPhoto[]
   messages    Message[]
+  appointments Appointment[]
   reports     Report[]              @relation("ReportTargetJob")
-  review      Review?
+  reviews     Review[]
+  disputes    Dispute[]
+  matchNotifications JobMatchNotification[]
+
+  @@index([awardedProviderId])
+  @@index([completionPendingForUserId])
+  @@index([completedAt])
+}
+
+enum AppointmentStatus {
+  PROPOSED
+  CONFIRMED
+  CANCELLED
+}
+
+model ProviderAvailability {
+  id         Int      @id @default(autoincrement())
+  providerId Int
+  dayOfWeek  Int      // 0=Sun ... 6=Sat
+  startTime  String   // "HH:MM"
+  endTime    String   // "HH:MM"
+  timezone   String
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  provider   User     @relation(fields: [providerId], references: [id], onDelete: Cascade)
+
+  @@index([providerId])
+  @@index([providerId, dayOfWeek])
+}
+
+model Appointment {
+  id         Int               @id @default(autoincrement())
+  jobId      Int
+  providerId Int
+  consumerId Int
+  startAt    DateTime
+  endAt      DateTime
+  status     AppointmentStatus @default(PROPOSED)
+  calendarEventId String?
+  createdAt  DateTime          @default(now())
+  updatedAt  DateTime          @updatedAt
+
+  job        Job               @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  provider   User              @relation("AppointmentsProvider", fields: [providerId], references: [id], onDelete: Cascade)
+  consumer   User              @relation("AppointmentsConsumer", fields: [consumerId], references: [id], onDelete: Cascade)
+
+  @@index([jobId])
+  @@index([providerId, startAt])
+  @@index([consumerId, startAt])
 }
 
 model JobPhoto {
@@ -117,8 +293,58 @@ model ProviderProfile {
   specialties String?
   rating      Float?
   reviewCount Int?
+  verificationBadge Boolean   @default(false)
+  featuredZipCodes   String[]  @default([])
   provider    User       @relation(fields: [providerId], references: [id])
   categories  Category[] @relation("CategoryToProviderProfile")
+}
+
+enum ProviderVerificationStatus {
+  NONE
+  PENDING
+  VERIFIED
+  REJECTED
+}
+
+enum ProviderVerificationMethod {
+  ID
+  BACKGROUND_CHECK
+}
+
+model ProviderVerification {
+  providerId           Int                        @id
+  status               ProviderVerificationStatus  @default(NONE)
+  method               ProviderVerificationMethod?
+  providerSubmittedAt  DateTime?
+  verifiedAt           DateTime?
+  metadataJson         Json?
+  createdAt            DateTime                   @default(now())
+  updatedAt            DateTime                   @updatedAt
+
+  provider             User                       @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  attachments          ProviderVerificationAttachment[]
+
+  @@index([status])
+  @@index([providerSubmittedAt])
+  @@index([verifiedAt])
+}
+
+model ProviderVerificationAttachment {
+  id              Int      @id @default(autoincrement())
+  providerId       Int
+  uploaderUserId   Int
+  filename         String?
+  mimeType         String?
+  sizeBytes        Int?
+  diskPath         String?
+  createdAt        DateTime @default(now())
+
+  verification     ProviderVerification @relation(fields: [providerId], references: [providerId], onDelete: Cascade)
+  uploader         User                 @relation("ProviderVerificationUploader", fields: [uploaderUserId], references: [id], onDelete: Cascade)
+
+  @@index([providerId])
+  @@index([uploaderUserId])
+  @@index([createdAt])
 }
 
 model Subscription {
@@ -126,6 +352,9 @@ model Subscription {
   userId    Int                   @unique
   tier      SubscriptionTier      @default(FREE)
   renewsAt  DateTime?
+  usageMonthKey            String   @default("")
+  leadsUsedThisMonth       Int      @default(0)
+  extraLeadCreditsThisMonth Int     @default(0)
   createdAt DateTime              @default(now())
   user      User                  @relation(fields: [userId], references: [id])
   payments  SubscriptionPayment[]
@@ -136,23 +365,110 @@ model Notification {
   id        Int      @id @default(autoincrement())
   userId    Int
   type      String
-  content   String
+  content   Json
   read      Boolean  @default(false)
   createdAt DateTime @default(now())
   user      User     @relation(fields: [userId], references: [id])
 }
 
-model Review {
+model PushToken {
   id         Int      @id @default(autoincrement())
-  jobId      Int      @unique
-  consumerId Int
-  providerId Int
-  rating     Int
-  comment    String?
+  userId     Int
+  token      String   @unique
+  platform   String?
+  lastSeenAt DateTime?
   createdAt  DateTime @default(now())
-  consumer   User     @relation("ConsumerReviews", fields: [consumerId], references: [id])
-  job        Job      @relation(fields: [jobId], references: [id])
-  provider   User     @relation("ProviderReviews", fields: [providerId], references: [id])
+  updatedAt  DateTime @updatedAt
+
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+enum BackgroundJobStatus {
+  PENDING
+  PROCESSING
+  SUCCESS
+  FAILED
+}
+
+model BackgroundJob {
+  id          Int                @id @default(autoincrement())
+  type        String
+  payload     Json
+  status      BackgroundJobStatus @default(PENDING)
+  runAt       DateTime           @default(now())
+  attempts    Int                @default(0)
+  maxAttempts Int                @default(8)
+  lockedAt    DateTime?
+  lockedBy    String?
+  lastError   String?
+  createdAt   DateTime           @default(now())
+  updatedAt   DateTime           @updatedAt
+
+  @@index([status, runAt])
+  @@index([lockedAt])
+  @@index([createdAt])
+}
+
+model JobMatchNotification {
+  id         Int      @id @default(autoincrement())
+  jobId      Int
+  providerId Int
+  score      Float?
+  createdAt  DateTime @default(now())
+
+  job        Job      @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  provider   User     @relation(fields: [providerId], references: [id], onDelete: Cascade)
+
+  @@unique([jobId, providerId])
+  @@index([providerId, createdAt])
+  @@index([jobId, createdAt])
+}
+
+model Review {
+  id             Int      @id @default(autoincrement())
+  jobId          Int
+  reviewerUserId Int
+  revieweeUserId Int
+  rating         Int
+  text           String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @default(now()) @updatedAt
+
+  job            Job      @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  reviewer       User     @relation("ReviewsGiven", fields: [reviewerUserId], references: [id], onDelete: Cascade)
+  reviewee       User     @relation("ReviewsReceived", fields: [revieweeUserId], references: [id], onDelete: Cascade)
+
+  @@unique([jobId, reviewerUserId])
+  @@index([jobId])
+  @@index([revieweeUserId])
+}
+
+enum DisputeStatus {
+  OPEN
+  INVESTIGATING
+  RESOLVED
+}
+
+model Dispute {
+  id              Int           @id @default(autoincrement())
+  jobId           Int
+  openedByUserId  Int
+  reasonCode      String
+  description     String?
+  status          DisputeStatus @default(OPEN)
+  createdAt       DateTime      @default(now())
+  resolvedAt      DateTime?
+  resolutionNotes String?
+
+  job             Job           @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  openedBy        User          @relation(fields: [openedByUserId], references: [id], onDelete: Cascade)
+
+  @@index([jobId])
+  @@index([openedByUserId])
+  @@index([status])
+  @@index([createdAt])
 }
 
 model FavoriteProvider {
@@ -198,6 +514,10 @@ model StripePayment {
   amount               Int
   currency             String           @default("usd")
   stripePaymentIntentId String          @unique
+  kind                 StripePaymentKind @default(SUBSCRIPTION)
+  addonType            ProviderAddonType?
+  addonQuantity        Int?
+  addonZipCodes        String[]          @default([])
   status               PaymentStatus    @default(PENDING)
   createdAt            DateTime         @default(now())
   updatedAt            DateTime         @updatedAt
@@ -205,6 +525,62 @@ model StripePayment {
   user                 User             @relation(fields: [userId], references: [id])
 
   @@index([userId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model ProviderEntitlement {
+  id               String   @id @default(cuid())
+  providerId        Int     @unique
+  verificationBadge Boolean @default(false)
+  featuredZipCodes  String[] @default([])
+  leadCredits       Int     @default(0)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  provider          User    @relation(fields: [providerId], references: [id], onDelete: Cascade)
+
+  @@index([providerId])
+}
+
+model ProviderStats {
+  id                            String   @id @default(cuid())
+  providerId                    Int      @unique
+
+  avgRating                     Float?
+  ratingCount                   Int      @default(0)
+
+  jobsCompletedAllTime          Int      @default(0)
+  jobsCompleted30d              Int      @default(0)
+
+  medianResponseTimeSeconds30d  Int?
+
+  cancellationRate30d           Float    @default(0)
+  disputeRate30d                Float    @default(0)
+  reportRate30d                 Float    @default(0)
+
+  updatedAt                     DateTime @updatedAt
+
+  provider                      User     @relation(fields: [providerId], references: [id], onDelete: Cascade)
+
+  @@index([providerId])
+  @@index([updatedAt])
+}
+
+model AddonPurchase {
+  id                   String     @id @default(cuid())
+  providerId            Int
+  addonType             AddonType
+  amountCents           Int
+  currency              String     @default("usd")
+  stripePaymentIntentId String     @unique
+  status                PaymentStatus @default(PENDING)
+  metadataJson          Json?
+  createdAt             DateTime   @default(now())
+
+  provider              User       @relation(fields: [providerId], references: [id], onDelete: Cascade)
+
+  @@index([providerId])
   @@index([status])
   @@index([createdAt])
 }
@@ -248,18 +624,24 @@ model JobAttachment {
   id        Int      @id @default(autoincrement())
   jobId     Int
   url       String
+  diskPath  String?
+  uploaderUserId Int?
   type      String?
   mimeType  String?
   filename  String?
   sizeBytes Int?
   createdAt DateTime @default(now())
   job       Job      @relation(fields: [jobId], references: [id])
+
+  @@index([jobId])
 }
 
 model MessageAttachment {
   id        Int      @id @default(autoincrement())
   messageId Int
   url       String
+  diskPath  String?
+  uploaderUserId Int?
   mimeType  String?
   filename  String?
   sizeBytes Int?
@@ -410,6 +792,7 @@ enum UserRole {
 enum JobStatus {
   OPEN
   IN_PROGRESS
+  COMPLETED_PENDING_CONFIRMATION
   COMPLETED
   CANCELLED
 }
@@ -430,6 +813,23 @@ enum PaymentStatus {
   PENDING
   SUCCEEDED
   FAILED
+}
+
+enum StripePaymentKind {
+  SUBSCRIPTION
+  ADDON
+}
+
+enum ProviderAddonType {
+  EXTRA_LEADS
+  VERIFICATION_BADGE
+  FEATURED_ZIP_CODES
+}
+
+enum AddonType {
+  VERIFICATION_BADGE
+  FEATURED_ZIP
+  LEAD_PACK
 }
 
 enum ReportTargetType {

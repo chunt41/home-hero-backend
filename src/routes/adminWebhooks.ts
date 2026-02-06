@@ -1,11 +1,19 @@
-import { Router } from "express";
+import express from "express";
 import { prisma } from "../prisma";
 import { authMiddleware } from "../middleware/authMiddleware";
 import { requireAdmin } from "../middleware/requireAdmin";
 import { WebhookDeliveryStatus } from "@prisma/client";
 import * as jwt from "jsonwebtoken";
+import { UrlValidationError, validateAndNormalizeWebhookUrl } from "../utils/ssrfGuard";
+import { z } from "zod";
+import { validate, type ValidatedRequest } from "../middleware/validate";
+import { logSecurityEvent } from "../services/securityEventLogger";
+import { createAsyncRouter } from "../middleware/asyncWrap";
 
-const router = Router();
+const router = createAsyncRouter(express);
+
+const idParamSchema = z.object({ id: z.coerce.number().int().positive() });
+const userIdParamSchema = z.object({ userId: z.coerce.number().int().positive() });
 
 // List admin notifications (latest 50)
 router.get("/notifications", authMiddleware, requireAdmin, async (_req, res) => {
@@ -39,6 +47,58 @@ router.get("/logs", authMiddleware, requireAdmin, async (_req, res) => {
     res.status(500).json({ error: "Failed to fetch logs" });
   }
 });
+
+// List recent security/audit events (admin-only)
+const listSecurityEventsSchema = {
+  query: z.object({
+    actionType: z.string().trim().min(1).optional(),
+    actorUserId: z.coerce.number().int().positive().optional(),
+    actorRole: z.enum(["CONSUMER", "PROVIDER", "ADMIN"]).optional(),
+    targetType: z.string().trim().min(1).optional(),
+    targetId: z.string().trim().min(1).optional(),
+    since: z.coerce.date().optional(),
+    take: z.coerce.number().int().min(1).max(200).optional().default(50),
+  }),
+};
+
+router.get(
+  "/security-events",
+  authMiddleware,
+  requireAdmin,
+  validate(listSecurityEventsSchema),
+  async (req: ValidatedRequest<typeof listSecurityEventsSchema>, res) => {
+    const { actionType, actorUserId, actorRole, targetType, targetId, since, take } = req.validated.query;
+
+    const where: any = {};
+    if (actionType) where.actionType = actionType;
+    if (actorUserId) where.actorUserId = actorUserId;
+    if (actorRole) where.actorRole = actorRole;
+    if (targetType) where.targetType = targetType;
+    if (targetId) where.targetId = targetId;
+    if (since) where.createdAt = { gte: since };
+
+    const events = await prisma.securityEvent.findMany({
+      where,
+      orderBy: { createdAt: "desc" },
+      take,
+      select: {
+        id: true,
+        actionType: true,
+        actorUserId: true,
+        actorRole: true,
+        actorEmail: true,
+        targetType: true,
+        targetId: true,
+        ip: true,
+        userAgent: true,
+        metadataJson: true,
+        createdAt: true,
+      },
+    });
+
+    return res.json({ events });
+  }
+);
 
 // List users for admin management (with optional search and pagination)
 router.get("/users", authMiddleware, requireAdmin, async (req, res) => {
@@ -98,9 +158,13 @@ router.get("/flagged-jobs", authMiddleware, requireAdmin, async (_req, res) => {
 });
 
 // Admin impersonate user: returns a JWT for the target user if admin
-router.post("/impersonate/:userId", authMiddleware, requireAdmin, async (req: any, res) => {
-  const userId = Number(req.params.userId);
-  if (!Number.isFinite(userId)) return res.status(400).json({ error: "Invalid userId" });
+router.post(
+  "/impersonate/:userId",
+  authMiddleware,
+  requireAdmin,
+  validate({ params: userIdParamSchema }),
+  async (req: any, res) => {
+  const userId = (req as any).validated.params.userId as number;
 
   const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true, email: true, role: true } });
   if (!user) return res.status(404).json({ error: "User not found" });
@@ -235,26 +299,10 @@ router.get("/stats", authMiddleware, requireAdmin, async (req, res) => {
 
 
 
-function normalizeEvents(events: unknown) {
-  if (!Array.isArray(events)) return null;
-  const cleaned = events
-    .map((e) => String(e).trim())
-    .filter((e) => e.length > 0);
-  return cleaned.length > 0 ? cleaned : null;
-}
-
-function normalizeUrl(url: unknown) {
-  if (typeof url !== "string") return null;
-  const trimmed = url.trim();
-  if (!trimmed) return null;
-
-  try {
-    const u = new URL(trimmed);
-    if (u.protocol !== "http:" && u.protocol !== "https:") return null;
-    return u.toString();
-  } catch {
-    return null;
-  }
+function normalizeEvents(events: string[]): string[] {
+  return Array.from(
+    new Set(events.map((e) => String(e).trim()).filter((e) => e.length > 0))
+  );
 }
 
 /**
@@ -263,9 +311,13 @@ function normalizeUrl(url: unknown) {
 
 
 // Test an endpoint (sends a synthetic event immediately)
-router.post("/webhooks/endpoints/:id/test", authMiddleware, requireAdmin, async (req, res) => {
-  const id = Number(req.params.id);
-  if (Number.isNaN(id)) return res.status(400).json({ error: "Invalid id" });
+router.post(
+  "/webhooks/endpoints/:id/test",
+  authMiddleware,
+  requireAdmin,
+  validate({ params: idParamSchema }),
+  async (req, res) => {
+  const { id } = (req as any).validated.params as { id: number };
 
   const endpoint = await prisma.webhookEndpoint.findUnique({ where: { id } });
   if (!endpoint) return res.status(404).json({ error: "Endpoint not found" });
@@ -289,6 +341,13 @@ router.post("/webhooks/endpoints/:id/test", authMiddleware, requireAdmin, async 
     },
   });
 
+  await logSecurityEvent(req, "admin.webhook_endpoint_test", {
+    targetType: "WEBHOOK_ENDPOINT",
+    targetId: endpoint.id,
+    event,
+    deliveryId: delivery.id,
+  });
+
   res.json({ ok: true, deliveryId: delivery.id });
 });
 
@@ -301,26 +360,42 @@ router.get("/webhooks/endpoints", authMiddleware, requireAdmin, async (_req, res
 });
 
 // Create endpoint
-router.post("/webhooks/endpoints", authMiddleware, requireAdmin, async (req, res) => {
-  const { url, secret, enabled = true, events } = req.body as {
-    url?: unknown;
-    secret?: unknown;
-    enabled?: unknown;
-    events?: unknown;
-  };
+const createWebhookEndpointSchema = {
+  body: z.object({
+    url: z.string().trim().min(1, "url is required"),
+    secret: z.string().trim().min(8, "secret is required (min 8 chars)"),
+    enabled: z.coerce.boolean().optional().default(true),
+    events: z
+      .array(z.string())
+      .transform(normalizeEvents)
+      .refine((events) => events.length <= 50, {
+        message: "events must contain at most 50 entries",
+      })
+      .refine((events) => events.every((e) => e.length <= 100), {
+        message: "each event must be at most 100 characters",
+      })
+      .refine((events) => events.length > 0, {
+        message: "events must be a non-empty string array",
+      }),
+  }),
+};
 
-  const normalizedUrl = normalizeUrl(url);
-  if (!normalizedUrl) {
-    return res.status(400).json({ error: "url is required and must be a valid http(s) URL" });
-  }
+router.post(
+  "/webhooks/endpoints",
+  authMiddleware,
+  requireAdmin,
+  validate(createWebhookEndpointSchema),
+  async (req: ValidatedRequest<typeof createWebhookEndpointSchema>, res) => {
+  const { url, secret, enabled, events } = req.validated.body;
 
-  if (!secret || typeof secret !== "string" || secret.trim().length < 8) {
-    return res.status(400).json({ error: "secret is required (min 8 chars)" });
-  }
-
-  const normalizedEvents = normalizeEvents(events);
-  if (!normalizedEvents) {
-    return res.status(400).json({ error: "events must be a non-empty string array" });
+  let normalizedUrl: string;
+  try {
+    normalizedUrl = await validateAndNormalizeWebhookUrl(url);
+  } catch (e: any) {
+    if (e instanceof UrlValidationError) {
+      return res.status(400).json({ error: "URL not allowed" });
+    }
+    throw e;
   }
 
   const endpoint = await prisma.webhookEndpoint.create({
@@ -328,8 +403,16 @@ router.post("/webhooks/endpoints", authMiddleware, requireAdmin, async (req, res
       url: normalizedUrl,
       secret: secret.trim(),
       enabled: Boolean(enabled),
-      events: normalizedEvents,
+      events,
     },
+  });
+
+  await logSecurityEvent(req, "admin.webhook_endpoint_created", {
+    targetType: "WEBHOOK_ENDPOINT",
+    targetId: endpoint.id,
+    url: endpoint.url,
+    enabled: endpoint.enabled,
+    eventsCount: endpoint.events.length,
   });
 
   res.status(201).json(endpoint);
@@ -337,51 +420,77 @@ router.post("/webhooks/endpoints", authMiddleware, requireAdmin, async (req, res
 
 
 // Update endpoint
-router.patch("/webhooks/endpoints/:id", authMiddleware, requireAdmin, async (req, res) => {
-  const id = Number(req.params.id);
-  if (Number.isNaN(id)) return res.status(400).json({ error: "Invalid id" });
+const updateWebhookEndpointSchema = {
+  params: z.object({ id: z.coerce.number().int().positive() }),
+  body: z
+    .object({
+      url: z.string().trim().min(1).optional(),
+      secret: z.string().trim().min(8).optional(),
+      enabled: z.coerce.boolean().optional(),
+      events: z
+        .array(z.string())
+        .transform(normalizeEvents)
+        .refine((events) => events.length <= 50, {
+          message: "events must contain at most 50 entries",
+        })
+        .refine((events) => events.every((e) => e.length <= 100), {
+          message: "each event must be at most 100 characters",
+        })
+        .refine((events) => events.length > 0, {
+          message: "events must be a non-empty string array",
+        })
+        .optional(),
+    })
+    .refine((b) => Object.keys(b).length > 0, { message: "At least one field must be provided" }),
+};
 
-  const { url, secret, enabled, events } = req.body as {
-    url?: unknown;
-    secret?: unknown;
-    enabled?: unknown;
-    events?: unknown;
-  };
+router.patch(
+  "/webhooks/endpoints/:id",
+  authMiddleware,
+  requireAdmin,
+  validate(updateWebhookEndpointSchema),
+  async (req: ValidatedRequest<typeof updateWebhookEndpointSchema>, res) => {
+  const id = req.validated.params.id;
+  const { url, secret, enabled, events } = req.validated.body;
 
   const data: any = {};
 
   if (url !== undefined) {
-    const normalizedUrl = normalizeUrl(url);
-    if (!normalizedUrl) {
-      return res.status(400).json({ error: "url must be a valid http(s) URL" });
+    try {
+      data.url = await validateAndNormalizeWebhookUrl(url);
+    } catch (e: any) {
+      if (e instanceof UrlValidationError) {
+        return res.status(400).json({ error: "URL not allowed" });
+      }
+      throw e;
     }
-    data.url = normalizedUrl;
   }
 
-  if (secret !== undefined) {
-    const s = String(secret).trim();
-    if (s.length < 8) {
-      return res.status(400).json({ error: "secret must be at least 8 characters" });
-    }
-    data.secret = s;
-  }
+  if (secret !== undefined) data.secret = String(secret).trim();
 
   if (enabled !== undefined) {
     data.enabled = Boolean(enabled);
   }
 
   if (events !== undefined) {
-    const normalizedEvents = normalizeEvents(events);
-    if (!normalizedEvents) {
-      return res.status(400).json({ error: "events must be a non-empty string array" });
-    }
-    data.events = normalizedEvents;
+    data.events = events;
   }
 
   try {
     const endpoint = await prisma.webhookEndpoint.update({
       where: { id },
       data,
+    });
+
+    await logSecurityEvent(req, "admin.webhook_endpoint_updated", {
+      targetType: "WEBHOOK_ENDPOINT",
+      targetId: id,
+      changed: {
+        url: url !== undefined,
+        secretChanged: secret !== undefined,
+        enabled: enabled !== undefined,
+        events: events !== undefined,
+      },
     });
 
     res.json(endpoint);
@@ -396,12 +505,23 @@ router.patch("/webhooks/endpoints/:id", authMiddleware, requireAdmin, async (req
 
 
 // Delete endpoint
-router.delete("/webhooks/endpoints/:id", authMiddleware, requireAdmin, async (req, res) => {
-  const id = Number(req.params.id);
-  if (Number.isNaN(id)) return res.status(400).json({ error: "Invalid id" });
+const deleteWebhookEndpointSchema = { params: idParamSchema };
+
+router.delete(
+  "/webhooks/endpoints/:id",
+  authMiddleware,
+  requireAdmin,
+  validate(deleteWebhookEndpointSchema),
+  async (req: ValidatedRequest<typeof deleteWebhookEndpointSchema>, res) => {
+  const id = req.validated.params.id;
 
   try {
     await prisma.webhookEndpoint.delete({ where: { id } });
+
+    await logSecurityEvent(req, "admin.webhook_endpoint_deleted", {
+      targetType: "WEBHOOK_ENDPOINT",
+      targetId: id,
+    });
     res.json({ ok: true, deleted: id });
   } catch (e: any) {
     if (e?.code === "P2025") {
@@ -455,9 +575,13 @@ router.get("/webhooks/deliveries/:id", authMiddleware, requireAdmin, async (req,
 });
 
 // Retry (same delivery)
-router.post("/webhooks/deliveries/:id/retry", authMiddleware, requireAdmin, async (req, res) => {
-  const id = Number(req.params.id);
-  if (Number.isNaN(id)) return res.status(400).json({ error: "Invalid id" });
+router.post(
+  "/webhooks/deliveries/:id/retry",
+  authMiddleware,
+  requireAdmin,
+  validate({ params: idParamSchema }),
+  async (req, res) => {
+  const { id } = (req as any).validated.params as { id: number };
 
   const existing = await prisma.webhookDelivery.findUnique({ where: { id } });
   if (!existing) return res.status(404).json({ error: "Delivery not found" });
@@ -475,11 +599,17 @@ router.post("/webhooks/deliveries/:id/retry", authMiddleware, requireAdmin, asyn
 });
 
 // Replay (new delivery, same payload)
-router.post("/webhooks/deliveries/:id/replay", authMiddleware, requireAdmin, async (req, res) => {
-  const id = Number(req.params.id);
-  if (Number.isNaN(id)) return res.status(400).json({ error: "Invalid id" });
-
-  const { endpointId } = req.body as { endpointId?: number };
+router.post(
+  "/webhooks/deliveries/:id/replay",
+  authMiddleware,
+  requireAdmin,
+  validate({
+    params: idParamSchema,
+    body: z.object({ endpointId: z.coerce.number().int().positive().optional() }),
+  }),
+  async (req, res) => {
+  const { id } = (req as any).validated.params as { id: number };
+  const { endpointId } = (req as any).validated.body as { endpointId?: number };
 
   const existing = await prisma.webhookDelivery.findUnique({ where: { id } });
   if (!existing) return res.status(404).json({ error: "Delivery not found" });

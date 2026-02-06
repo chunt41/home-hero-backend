@@ -1,8 +1,18 @@
 import express from "express";
 import { prisma } from "../prisma";
 import { authMiddleware } from "../middleware/authMiddleware";
+import { z } from "zod";
+import { validate } from "../middleware/validate";
+import { createAsyncRouter } from "../middleware/asyncWrap";
 
-const router = express.Router();
+const router = createAsyncRouter(express);
+
+const requestPayoutSchema = {
+  body: z.object({
+    amount: z.coerce.number().positive("amount must be a positive number"),
+    type: z.enum(["subscription", "ad_revenue"]),
+  }),
+};
 
 /**
  * GET /payouts/me
@@ -65,18 +75,10 @@ router.get("/summary/me", authMiddleware, async (req, res) => {
  * POST /payouts/request
  * Request a payout (admin will review and process)
  */
-router.post("/request", authMiddleware, async (req, res) => {
+router.post("/request", authMiddleware, validate(requestPayoutSchema), async (req, res) => {
   try {
     const userId = req.user!.userId;
-    const { amount, type } = req.body;
-
-    if (!amount || amount <= 0) {
-      return res.status(400).json({ error: "Invalid amount" });
-    }
-
-    if (!["subscription", "ad_revenue"].includes(type)) {
-      return res.status(400).json({ error: "Invalid payout type" });
-    }
+    const { amount, type } = (req as any).validated.body as { amount: number; type: "subscription" | "ad_revenue" };
 
     // Check if user has pending payouts
     const pending = await prisma.payout.findFirst({

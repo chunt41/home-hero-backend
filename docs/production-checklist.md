@@ -53,4 +53,5 @@ Make sure `EXPO_PUBLIC_ADMOB_USE_TEST_IDS` is not `true` in production.
 
 ## Notes
 - Keep `.env` local only; use Railway/EAS for production secrets.
+- DB schema changes ship via Prisma migrations; production deploys should run `prisma migrate deploy` (already part of the backend `start` flow).
 - Rotate any keys that were ever pasted into chat/logs.

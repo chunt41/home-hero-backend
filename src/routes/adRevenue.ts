@@ -6,25 +6,36 @@ import {
   getUserAdRevenue,
   stripe,
 } from "../services/stripeService";
+import { z } from "zod";
+import { validate } from "../middleware/validate";
+import { createAsyncRouter } from "../middleware/asyncWrap";
 
-const router = express.Router();
+const router = createAsyncRouter(express);
+
+const recordAdRevenueSchema = {
+  body: z.object({
+    adFormat: z.enum(["banner", "interstitial"]),
+    revenue: z.coerce.number().min(0, "revenue must be >= 0"),
+  }),
+};
+
+const admobWebhookSchema = {
+  body: z.object({
+    userId: z.coerce.number().int().positive(),
+    adFormat: z.enum(["banner", "interstitial"]),
+    revenue: z.coerce.number(),
+    date: z.string().optional(),
+  }),
+};
 
 /**
  * POST /ad-revenue/record
  * Record ad impression or click (called from mobile app)
  */
-router.post("/record", authMiddleware, async (req, res) => {
+router.post("/record", authMiddleware, validate(recordAdRevenueSchema), async (req, res) => {
   try {
-    const { adFormat, revenue } = req.body;
+    const { adFormat, revenue } = (req as any).validated.body as { adFormat: "banner" | "interstitial"; revenue: number };
     const userId = req.user!.userId;
-
-    if (!adFormat || !["banner", "interstitial"].includes(adFormat)) {
-      return res.status(400).json({ error: "Invalid ad format" });
-    }
-
-    if (typeof revenue !== "number" || revenue < 0) {
-      return res.status(400).json({ error: "Invalid revenue amount" });
-    }
 
     const result = await recordAdRevenue(userId, adFormat, revenue);
 
@@ -121,13 +132,13 @@ router.get("/history/:userId", authMiddleware, async (req, res) => {
  * Handle AdMob webhook events
  * (Google sends revenue data via webhooks)
  */
-router.post("/webhook/admob", async (req, res) => {
+router.post("/webhook/admob", validate(admobWebhookSchema), async (req, res) => {
   try {
-    const { userId, adFormat, revenue, date } = req.body;
-
-    if (!userId || !adFormat || typeof revenue !== "number") {
-      return res.status(400).json({ error: "Invalid payload" });
-    }
+    const { userId, adFormat, revenue } = (req as any).validated.body as {
+      userId: number;
+      adFormat: "banner" | "interstitial";
+      revenue: number;
+    };
 
     await recordAdRevenue(userId, adFormat, revenue);
 

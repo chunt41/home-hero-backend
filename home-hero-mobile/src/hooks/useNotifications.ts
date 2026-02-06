@@ -18,6 +18,7 @@ export type NotificationItem = {
   type: string;
   title: string;
   body: string | null;
+  jobId?: number;
   isRead: boolean;
   createdAt: string;
 };
@@ -33,6 +34,7 @@ function toUiItem(n: ApiNotification): NotificationItem {
 
   let title = n.type;
   let body: string | null = null;
+  let jobId: number | undefined;
 
   if (typeof content === "string") {
     body = content;
@@ -41,6 +43,8 @@ function toUiItem(n: ApiNotification): NotificationItem {
     if (typeof content.body === "string") body = content.body;
     if (!body && typeof content.message === "string") body = content.message;
     if (!body && typeof content.text === "string") body = content.text;
+    if (typeof content.jobId === "number") jobId = content.jobId;
+    if (typeof content.jobId === "string" && /^\d+$/.test(content.jobId)) jobId = Number(content.jobId);
   }
 
   return {
@@ -48,6 +52,7 @@ function toUiItem(n: ApiNotification): NotificationItem {
     type: n.type,
     title,
     body,
+    jobId,
     isRead: !!n.read,
     createdAt: n.createdAt,
   };

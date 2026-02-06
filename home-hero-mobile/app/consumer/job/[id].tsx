@@ -13,6 +13,7 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useLocalSearchParams, router } from "expo-router";
 import { api } from "../../../src/lib/apiClient";
+import { useAuth } from "../../../src/context/AuthContext";
 
 type Attachment = {
   id: number;
@@ -44,10 +45,19 @@ type ConsumerJobDetail = {
   budgetMin: number | null;
   budgetMax: number | null;
   location: string | null;
-  status: "OPEN" | "IN_PROGRESS" | "COMPLETED" | "CANCELLED" | string;
+  status:
+    | "OPEN"
+    | "IN_PROGRESS"
+    | "COMPLETED_PENDING_CONFIRMATION"
+    | "COMPLETED"
+    | "CANCELLED"
+    | string;
   createdAt: string;
   bidCount: number;
   attachments: Attachment[];
+
+  completionPendingForUserId: number | null;
+  completedAt: string | null;
 
   // ✅ new field from backend
   awardedBid: AwardedBid | null;
@@ -92,9 +102,11 @@ export default function ConsumerJobDetailScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const jobId = useMemo(() => Number(id), [id]);
 
+  const { user } = useAuth();
+
   const [job, setJob] = useState<ConsumerJobDetail | null>(null);
   const [loading, setLoading] = useState(true);
-  const [busyAction, setBusyAction] = useState<null | "cancel" | "complete">(null);
+  const [busyAction, setBusyAction] = useState<null | "cancel" | "markComplete" | "confirmComplete">(null);
   const [error, setError] = useState<string | null>(null);
 
   const [appointments, setAppointments] = useState<Appointment[]>([]);
@@ -160,6 +172,10 @@ export default function ConsumerJobDetailScreen() {
 
   const canCancel = job?.status === "OPEN" || job?.status === "IN_PROGRESS";
   const canComplete = job?.status === "IN_PROGRESS";
+  const canConfirmComplete =
+    job?.status === "COMPLETED_PENDING_CONFIRMATION" &&
+    !!user?.id &&
+    job?.completionPendingForUserId === user.id;
 
   const doCancel = useCallback(() => {
     if (!job) return;
@@ -193,12 +209,12 @@ export default function ConsumerJobDetailScreen() {
     );
   }, [job, fetchJob]);
 
-  const doComplete = useCallback(() => {
+  const doMarkComplete = useCallback(() => {
     if (!job) return;
 
     Alert.alert(
       "Mark as completed?",
-      "Only do this when the work is finished.",
+      "This requests completion confirmation from the other participant.",
       [
         { text: "Not yet", style: "cancel" },
         {
@@ -206,28 +222,25 @@ export default function ConsumerJobDetailScreen() {
           style: "default",
           onPress: async () => {
             try {
-              setBusyAction("complete");
+              setBusyAction("markComplete");
 
               // optimistic UI (safe; fetchJob will normalize)
-              setJob((prev) => (prev ? { ...prev, status: "COMPLETED" } : prev));
+              setJob((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      status: "COMPLETED_PENDING_CONFIRMATION",
+                    }
+                  : prev
+              );
 
-              await api.post(`/jobs/${job.id}/complete`, {});
+              await api.post(`/jobs/${job.id}/mark-complete`, {});
               await fetchJob();
 
-              // Prompt for review after successful completion
-              if (job.awardedBid) {
-                Alert.alert(
-                  "Job completed",
-                  "Would you like to leave a review for the provider?",
-                  [
-                    { text: "Later", style: "cancel" },
-                    {
-                      text: "Leave review",
-                      onPress: () => router.push(`/consumer/leave-review?jobId=${job.id}`),
-                    },
-                  ]
-                );
-              }
+              Alert.alert(
+                "Completion requested",
+                "Waiting for the other participant to confirm completion."
+              );
             } catch (e: any) {
               await fetchJob();
               Alert.alert("Complete failed", e?.message ?? "Could not complete job.");
@@ -238,6 +251,50 @@ export default function ConsumerJobDetailScreen() {
         },
       ]
     );
+  }, [job, fetchJob]);
+
+  const doConfirmComplete = useCallback(() => {
+    if (!job) return;
+
+    Alert.alert("Confirm completion?", "Confirm that the work is finished.", [
+      { text: "Not yet", style: "cancel" },
+      {
+        text: "Yes, confirm",
+        style: "default",
+        onPress: async () => {
+          try {
+            setBusyAction("confirmComplete");
+            const resp = await api.post<{ job: ConsumerJobDetail }>(
+              `/jobs/${job.id}/confirm-complete`,
+              {}
+            );
+            await fetchJob();
+
+            if (resp?.job?.status === "COMPLETED" && job.awardedBid) {
+              Alert.alert(
+                "Job completed",
+                "Would you like to leave a review for the provider?",
+                [
+                  { text: "Later", style: "cancel" },
+                  {
+                    text: "Leave review",
+                    onPress: () => router.push(`/consumer/leave-review?jobId=${job.id}`),
+                  },
+                ]
+              );
+            }
+          } catch (e: any) {
+            await fetchJob();
+            Alert.alert(
+              "Confirm failed",
+              e?.message ?? "Could not confirm completion."
+            );
+          } finally {
+            setBusyAction(null);
+          }
+        },
+      },
+    ]);
   }, [job, fetchJob]);
 
   const goToBids = useCallback(() => {
@@ -599,7 +656,8 @@ export default function ConsumerJobDetailScreen() {
           <View style={styles.card}>
             <Text style={styles.sectionTitle}>Safety</Text>
 
-            {job.awardedBid && job.status === "COMPLETED" ? (
+            {job.awardedBid &&
+            (job.status === "COMPLETED" || job.status === "COMPLETED_PENDING_CONFIRMATION") ? (
               <Pressable style={styles.dangerBtn} onPress={goToOpenDispute}>
                 <Text style={styles.dangerText}>Open Dispute</Text>
               </Pressable>
@@ -623,7 +681,7 @@ export default function ConsumerJobDetailScreen() {
           <View style={styles.card}>
             <Text style={styles.sectionTitle}>Job Actions</Text>
 
-            {!canCancel && !canComplete ? (
+            {!canCancel && !canComplete && !canConfirmComplete ? (
               <Text style={styles.bodyMuted}>No actions available for this status.</Text>
             ) : null}
 
@@ -631,10 +689,26 @@ export default function ConsumerJobDetailScreen() {
               <Pressable
                 style={[styles.primaryBtn, busyAction && styles.btnDisabled]}
                 disabled={!!busyAction}
-                onPress={doComplete}
+                onPress={doMarkComplete}
               >
                 <Text style={styles.primaryText}>
-                  {busyAction === "complete" ? "Marking completed…" : "Mark Completed"}
+                  {busyAction === "markComplete" ? "Requesting completion…" : "Mark Complete"}
+                </Text>
+              </Pressable>
+            ) : null}
+
+            {canConfirmComplete ? (
+              <Pressable
+                style={[
+                  styles.primaryBtn,
+                  busyAction && styles.btnDisabled,
+                  canComplete ? { marginTop: 10 } : { marginTop: 0 },
+                ]}
+                disabled={!!busyAction}
+                onPress={doConfirmComplete}
+              >
+                <Text style={styles.primaryText}>
+                  {busyAction === "confirmComplete" ? "Confirming…" : "Confirm Completion"}
                 </Text>
               </Pressable>
             ) : null}
@@ -644,7 +718,7 @@ export default function ConsumerJobDetailScreen() {
                 style={[
                   styles.dangerBtn,
                   busyAction && styles.btnDisabled,
-                  canComplete ? { marginTop: 10 } : { marginTop: 0 },
+                  canComplete || canConfirmComplete ? { marginTop: 10 } : { marginTop: 0 },
                 ]}
                 disabled={!!busyAction}
                 onPress={doCancel}

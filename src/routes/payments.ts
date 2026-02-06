@@ -1,6 +1,8 @@
 import express from "express";
 import { prisma } from "../prisma";
 import { authMiddleware } from "../middleware/authMiddleware";
+import { requireAttestation } from "../middleware/requireAttestation";
+import { requireVerifiedEmail } from "../middleware/requireVerifiedEmail";
 import { requireAdmin } from "../middleware/requireAdmin";
 import {
   createPaymentIntent,
@@ -9,8 +11,24 @@ import {
   stripe,
 } from "../services/stripeService";
 import { env } from "../config/env";
+import { z } from "zod";
+import { validate } from "../middleware/validate";
+import { logSecurityEvent } from "../services/securityEventLogger";
+import { createAsyncRouter } from "../middleware/asyncWrap";
 
-const router = express.Router();
+const router = createAsyncRouter(express);
+
+const createIntentSchema = {
+  body: z.object({
+    tier: z.enum(["BASIC", "PRO"]),
+  }),
+};
+
+const confirmPaymentSchema = {
+  body: z.object({
+    paymentIntentId: z.string().trim().min(1, "paymentIntentId is required"),
+  }),
+};
 
 /**
  * GET /payments/health
@@ -53,19 +71,25 @@ router.get("/health", authMiddleware, requireAdmin, async (_req, res) => {
  * POST /payments/create-intent
  * Create a Stripe payment intent for subscription upgrade
  */
-router.post("/create-intent", authMiddleware, async (req, res) => {
+router.post(
+  "/create-intent",
+  authMiddleware,
+  requireVerifiedEmail,
+  requireAttestation,
+  validate(createIntentSchema),
+  async (req, res) => {
   try {
-    const { tier } = req.body;
+    const { tier } = (req as any).validated.body as { tier: z.infer<typeof createIntentSchema.body.shape.tier> };
     const userId = req.user!.userId;
 
-    if (!tier || !["BASIC", "PRO"].includes(tier)) {
-      return res.status(400).json({ error: "Invalid tier" });
-    }
+    const { clientSecret, paymentIntentId } = await createPaymentIntent(userId, tier);
 
-    const { clientSecret, paymentIntentId } = await createPaymentIntent(
-      userId,
-      tier
-    );
+    await logSecurityEvent(req, "payment.create_intent", {
+      targetType: "USER",
+      targetId: userId,
+      tier,
+      paymentIntentId,
+    });
 
     res.json({
       clientSecret,
@@ -81,19 +105,28 @@ router.post("/create-intent", authMiddleware, async (req, res) => {
  * POST /payments/confirm
  * Confirm payment and update subscription
  */
-router.post("/confirm", authMiddleware, async (req, res) => {
+router.post(
+  "/confirm",
+  authMiddleware,
+  requireVerifiedEmail,
+  requireAttestation,
+  validate(confirmPaymentSchema),
+  async (req, res) => {
   try {
-    const { paymentIntentId } = req.body;
+    const { paymentIntentId } = (req as any).validated.body as { paymentIntentId: string };
     const userId = req.user!.userId;
-
-    if (!paymentIntentId) {
-      return res.status(400).json({ error: "Payment intent ID required" });
-    }
 
     // Verify the payment intent
     const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
 
     if (paymentIntent.status !== "succeeded") {
+      await logSecurityEvent(req, "payment.confirm_failed", {
+        targetType: "USER",
+        targetId: userId,
+        paymentIntentId,
+        reason: "not_succeeded",
+        status: paymentIntent.status,
+      });
       return res.status(400).json({
         error: "Payment not completed",
         status: paymentIntent.status,
@@ -102,11 +135,24 @@ router.post("/confirm", authMiddleware, async (req, res) => {
 
     // Check that the payment belongs to this user
     if (paymentIntent.metadata?.userId !== String(userId)) {
+      await logSecurityEvent(req, "payment.confirm_failed", {
+        targetType: "USER",
+        targetId: userId,
+        paymentIntentId,
+        reason: "payment_mismatch",
+      });
       return res.status(403).json({ error: "Payment mismatch" });
     }
 
     // Update subscription
     const result = await handlePaymentIntentSucceeded(paymentIntentId);
+
+    await logSecurityEvent(req, "payment.confirm_succeeded", {
+      targetType: "USER",
+      targetId: userId,
+      paymentIntentId,
+      subscriptionTier: (result as any)?.subscription?.tier ?? null,
+    });
 
     res.json({
       success: true,
@@ -125,15 +171,22 @@ router.post("/confirm", authMiddleware, async (req, res) => {
 router.post(
   "/webhook",
   express.raw({ type: "application/json" }),
+  validate({}),
   async (req, res) => {
     try {
       const sig = req.headers["stripe-signature"];
 
       if (!sig) {
+        await logSecurityEvent(req, "payment.webhook_failed", {
+          reason: "missing_signature",
+        });
         return res.status(400).json({ error: "Missing stripe signature" });
       }
 
       if (!env.STRIPE_WEBHOOK_SECRET) {
+        await logSecurityEvent(req, "payment.webhook_failed", {
+          reason: "webhook_secret_not_configured",
+        });
         return res.status(500).json({
           error:
             "Stripe webhook secret not configured (set STRIPE_WEBHOOK_SECRET)",
@@ -146,6 +199,11 @@ router.post(
         env.STRIPE_WEBHOOK_SECRET
       );
 
+      await logSecurityEvent(req, "payment.webhook_received", {
+        stripeEventType: event.type,
+        stripeEventId: (event as any)?.id ?? null,
+      });
+
       if (event.type === "payment_intent.succeeded") {
         const paymentIntent = event.data.object as any;
         await handlePaymentIntentSucceeded(paymentIntent.id);
@@ -157,6 +215,10 @@ router.post(
       res.json({ received: true });
     } catch (error: any) {
       console.error("Webhook error:", error);
+      await logSecurityEvent(req, "payment.webhook_failed", {
+        reason: "exception",
+        message: String(error?.message ?? error),
+      });
       res.status(400).json({ error: error.message });
     }
   }
@@ -166,7 +228,7 @@ router.post(
  * GET /payments/subscription/:userId
  * Get user's subscription status and payment history
  */
-router.get("/subscription/:userId", authMiddleware, async (req, res) => {
+router.get("/subscription/:userId", authMiddleware, requireVerifiedEmail, requireAttestation, async (req, res) => {
   try {
     const { userId } = req.params;
     const requestUserId = req.user!.userId;

@@ -17,6 +17,11 @@ export type ProviderProfile = {
   specialties: string | null;
   rating: number | null;
   reviewCount: number;
+  stats?: {
+    medianResponseTimeSeconds30d?: number | null;
+    jobsCompleted30d?: number;
+    updatedAt?: string;
+  } | null;
   verificationBadge?: boolean;
   verificationStatus?: "NONE" | "PENDING" | "VERIFIED" | "REJECTED";
   isVerified?: boolean;
@@ -35,7 +40,7 @@ export function useProviderProfile(providerId?: number) {
     setLoading(true);
     setError(null);
     try {
-      const endpoint = providerId ? `/providers/${providerId}` : "/me";
+      const endpoint = providerId ? `/providers/${providerId}` : "/providers/me";
       const user = await api.get<ProviderProfile>(endpoint);
       setProfile(user);
       if (user.categories) {
