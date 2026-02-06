@@ -9,7 +9,7 @@ import {
   Alert,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { useFocusEffect, useRouter } from "expo-router";
+import { useFocusEffect } from "expo-router";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { useCombinedEarnings } from "../hooks/useCombinedEarnings";
 import { format } from "date-fns";
@@ -17,7 +17,6 @@ import { format } from "date-fns";
 type TabType = "overview" | "subscriptions" | "ads" | "payouts";
 
 export default function AdminEarningsScreen() {
-  const router = useRouter();
   const [activeTab, setActiveTab] = useState<TabType>("overview");
   const { earnings, loading, error, refetch } = useCombinedEarnings();
 

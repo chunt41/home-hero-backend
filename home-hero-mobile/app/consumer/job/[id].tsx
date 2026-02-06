@@ -7,6 +7,7 @@ import {
   ScrollView,
   StyleSheet,
   Text,
+  TextInput,
   View,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
@@ -52,10 +53,39 @@ type ConsumerJobDetail = {
   awardedBid: AwardedBid | null;
 };
 
+type Appointment = {
+  id: number;
+  jobId: number;
+  providerId: number;
+  consumerId: number;
+  startAt: string;
+  endAt: string;
+  status: "PROPOSED" | "CONFIRMED" | "CANCELLED" | string;
+  createdAt: string;
+  updatedAt: string;
+};
+
 function formatDate(iso: string) {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;
   return d.toLocaleString();
+}
+
+function formatLocalRange(startIso: string, endIso: string) {
+  const start = new Date(startIso);
+  const end = new Date(endIso);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+    return `${startIso} - ${endIso}`;
+  }
+  return `${start.toLocaleString()} – ${end.toLocaleTimeString()}`;
+}
+
+function isHHMM(s: string) {
+  return /^([01]\d|2[0-3]):[0-5]\d$/.test(s.trim());
+}
+
+function isYYYYMMDD(s: string) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(s.trim());
 }
 
 export default function ConsumerJobDetailScreen() {
@@ -66,6 +96,21 @@ export default function ConsumerJobDetailScreen() {
   const [loading, setLoading] = useState(true);
   const [busyAction, setBusyAction] = useState<null | "cancel" | "complete">(null);
   const [error, setError] = useState<string | null>(null);
+
+  const [appointments, setAppointments] = useState<Appointment[]>([]);
+  const [appointmentsLoading, setAppointmentsLoading] = useState(false);
+  const [appointmentsError, setAppointmentsError] = useState<string | null>(null);
+  const [appointmentsActing, setAppointmentsActing] = useState<null | { id: number; action: "propose" | "cancel" }>(null);
+
+  const [proposeDate, setProposeDate] = useState(() => {
+    const d = new Date();
+    const yyyy = d.getFullYear();
+    const mm = String(d.getMonth() + 1).padStart(2, "0");
+    const dd = String(d.getDate()).padStart(2, "0");
+    return `${yyyy}-${mm}-${dd}`;
+  });
+  const [proposeStartTime, setProposeStartTime] = useState("09:00");
+  const [proposeDurationMins, setProposeDurationMins] = useState("60");
 
   const fetchJob = useCallback(async () => {
     if (!Number.isFinite(jobId)) {
@@ -88,9 +133,25 @@ export default function ConsumerJobDetailScreen() {
     }
   }, [jobId]);
 
+  const fetchAppointments = useCallback(async () => {
+    if (!Number.isFinite(jobId)) return;
+    setAppointmentsLoading(true);
+    setAppointmentsError(null);
+    try {
+      const data = await api.get<{ items: Appointment[] }>(`/jobs/${jobId}/appointments`);
+      setAppointments(data.items ?? []);
+    } catch (e: any) {
+      setAppointmentsError(e?.message ?? "Failed to load appointments.");
+      setAppointments([]);
+    } finally {
+      setAppointmentsLoading(false);
+    }
+  }, [jobId]);
+
   useEffect(() => {
     fetchJob();
-  }, [fetchJob]);
+    fetchAppointments();
+  }, [fetchJob, fetchAppointments]);
 
   const budgetText =
     job?.budgetMin != null || job?.budgetMax != null
@@ -152,6 +213,21 @@ export default function ConsumerJobDetailScreen() {
 
               await api.post(`/jobs/${job.id}/complete`, {});
               await fetchJob();
+
+              // Prompt for review after successful completion
+              if (job.awardedBid) {
+                Alert.alert(
+                  "Job completed",
+                  "Would you like to leave a review for the provider?",
+                  [
+                    { text: "Later", style: "cancel" },
+                    {
+                      text: "Leave review",
+                      onPress: () => router.push(`/consumer/leave-review?jobId=${job.id}`),
+                    },
+                  ]
+                );
+              }
             } catch (e: any) {
               await fetchJob();
               Alert.alert("Complete failed", e?.message ?? "Could not complete job.");
@@ -189,6 +265,85 @@ export default function ConsumerJobDetailScreen() {
     if (!job?.awardedBid?.provider?.id) return;
     router.push(`/report?type=USER&targetId=${job.awardedBid.provider.id}`);
   }, [job]);
+
+  const goToOpenDispute = useCallback(() => {
+    if (!job) return;
+    router.push({ pathname: "/open-dispute", params: { jobId: String(job.id) } } as any);
+  }, [job]);
+
+  const onProposeAppointment = useCallback(async () => {
+    if (!job) return;
+    if (!job.awardedBid) {
+      Alert.alert("Not awarded", "Award a provider before scheduling.");
+      return;
+    }
+    if (job.status !== "IN_PROGRESS") {
+      Alert.alert("Not ready", "Scheduling opens once the job is IN_PROGRESS.");
+      return;
+    }
+
+    const dateStr = proposeDate.trim();
+    const timeStr = proposeStartTime.trim();
+    const duration = Number(proposeDurationMins.trim());
+
+    if (!isYYYYMMDD(dateStr)) {
+      Alert.alert("Invalid date", "Use YYYY-MM-DD.");
+      return;
+    }
+    if (!isHHMM(timeStr)) {
+      Alert.alert("Invalid time", "Use HH:MM in 24-hour format.");
+      return;
+    }
+    if (!Number.isFinite(duration) || duration <= 0 || duration > 24 * 60) {
+      Alert.alert("Invalid duration", "Enter minutes between 1 and 1440.");
+      return;
+    }
+
+    const startLocal = new Date(`${dateStr}T${timeStr}:00`);
+    if (Number.isNaN(startLocal.getTime())) {
+      Alert.alert("Invalid start", "Could not parse the provided date/time.");
+      return;
+    }
+    const endLocal = new Date(startLocal.getTime() + duration * 60_000);
+
+    setAppointmentsActing({ id: -1, action: "propose" });
+    try {
+      await api.post(`/jobs/${job.id}/appointments/propose`, {
+        startAt: startLocal.toISOString(),
+        endAt: endLocal.toISOString(),
+      });
+      await fetchAppointments();
+      Alert.alert("Proposed", "Sent proposed appointment to the provider.");
+    } catch (e: any) {
+      Alert.alert("Propose failed", e?.message ?? "Could not propose appointment");
+    } finally {
+      setAppointmentsActing(null);
+    }
+  }, [job, proposeDate, proposeStartTime, proposeDurationMins, fetchAppointments]);
+
+  const onCancelAppointment = useCallback(
+    (appt: Appointment) => {
+      Alert.alert("Cancel appointment?", "This will mark the appointment as cancelled.", [
+        { text: "No", style: "cancel" },
+        {
+          text: "Yes, cancel",
+          style: "destructive",
+          onPress: async () => {
+            setAppointmentsActing({ id: appt.id, action: "cancel" });
+            try {
+              await api.post(`/appointments/${appt.id}/cancel`, {});
+              await fetchAppointments();
+            } catch (e: any) {
+              Alert.alert("Cancel failed", e?.message ?? "Could not cancel appointment");
+            } finally {
+              setAppointmentsActing(null);
+            }
+          },
+        },
+      ]);
+    },
+    [fetchAppointments]
+  );
 
   return (
     <SafeAreaView style={styles.container} edges={["top"]}>
@@ -283,6 +438,107 @@ export default function ConsumerJobDetailScreen() {
             </View>
           )}
 
+          {/* Scheduling */}
+          {job.awardedBid ? (
+            <View style={styles.card}>
+              <View style={styles.cardHeaderRow}>
+                <Text style={styles.sectionTitle}>Scheduling</Text>
+                <Pressable onPress={fetchAppointments} disabled={appointmentsLoading}>
+                  <Text style={styles.sectionLink}>{appointmentsLoading ? "…" : "Refresh"}</Text>
+                </Pressable>
+              </View>
+
+              {job.status !== "IN_PROGRESS" ? (
+                <Text style={styles.bodyMuted}>Available once the job is in progress.</Text>
+              ) : (
+                <>
+                  <Text style={styles.bodyMuted}>Propose a time (scaffold: uses your device timezone).</Text>
+
+                  <Text style={styles.label}>Date (YYYY-MM-DD)</Text>
+                  <TextInput
+                    value={proposeDate}
+                    onChangeText={setProposeDate}
+                    placeholder="2026-02-05"
+                    placeholderTextColor="#94a3b8"
+                    style={styles.input}
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                  />
+
+                  <View style={styles.rowGap}>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.label}>Start (HH:MM)</Text>
+                      <TextInput
+                        value={proposeStartTime}
+                        onChangeText={setProposeStartTime}
+                        placeholder="09:00"
+                        placeholderTextColor="#94a3b8"
+                        style={styles.input}
+                        autoCapitalize="none"
+                        autoCorrect={false}
+                      />
+                    </View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.label}>Duration (mins)</Text>
+                      <TextInput
+                        value={proposeDurationMins}
+                        onChangeText={setProposeDurationMins}
+                        placeholder="60"
+                        placeholderTextColor="#94a3b8"
+                        style={styles.input}
+                        keyboardType="number-pad"
+                      />
+                    </View>
+                  </View>
+
+                  <Pressable
+                    style={[styles.primaryBtn, appointmentsActing?.action === "propose" && styles.btnDisabled]}
+                    onPress={onProposeAppointment}
+                    disabled={appointmentsActing?.action === "propose"}
+                  >
+                    <Text style={styles.primaryText}>
+                      {appointmentsActing?.action === "propose" ? "Proposing…" : "Propose Appointment"}
+                    </Text>
+                  </Pressable>
+                </>
+              )}
+
+              {appointmentsError ? <Text style={styles.errorText}>{appointmentsError}</Text> : null}
+
+              {appointmentsLoading ? (
+                <View style={styles.inlineCenter}>
+                  <ActivityIndicator />
+                  <Text style={styles.bodyMuted}>Loading appointments…</Text>
+                </View>
+              ) : appointments.length === 0 ? (
+                <Text style={styles.bodyMuted}>No appointments yet.</Text>
+              ) : (
+                <View style={{ gap: 10, marginTop: 10 }}>
+                  {appointments.map((a) => {
+                    const isActing = appointmentsActing?.id === a.id;
+                    return (
+                      <View key={String(a.id)} style={styles.apptRow}>
+                        <View style={{ flex: 1 }}>
+                          <Text style={styles.bodyStrong}>{a.status}</Text>
+                          <Text style={styles.bodyMuted}>{formatLocalRange(a.startAt, a.endAt)}</Text>
+                        </View>
+                        {a.status !== "CANCELLED" ? (
+                          <Pressable
+                            style={[styles.dangerBtnSm, isActing && styles.btnDisabled]}
+                            onPress={() => onCancelAppointment(a)}
+                            disabled={isActing}
+                          >
+                            <Text style={styles.dangerTextSm}>Cancel</Text>
+                          </Pressable>
+                        ) : null}
+                      </View>
+                    );
+                  })}
+                </View>
+              )}
+            </View>
+          ) : null}
+
           <View style={styles.card}>
             <Text style={styles.sectionTitle}>Budget</Text>
             <Text style={styles.body}>{budgetText}</Text>
@@ -342,6 +598,13 @@ export default function ConsumerJobDetailScreen() {
           {/* Safety */}
           <View style={styles.card}>
             <Text style={styles.sectionTitle}>Safety</Text>
+
+            {job.awardedBid && job.status === "COMPLETED" ? (
+              <Pressable style={styles.dangerBtn} onPress={goToOpenDispute}>
+                <Text style={styles.dangerText}>Open Dispute</Text>
+              </Pressable>
+            ) : null}
+
             <Pressable style={styles.dangerBtn} onPress={goToReportJob}>
               <Text style={styles.dangerText}>Report Job</Text>
             </Pressable>
@@ -446,11 +709,48 @@ const styles = StyleSheet.create({
   title: { color: "#fff", fontSize: 22, fontWeight: "900", marginBottom: 10 },
 
   card: { backgroundColor: "#0f172a", borderRadius: 14, padding: 14, marginTop: 12 },
+  cardHeaderRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
   sectionTitle: { color: "#fff", fontWeight: "900", marginBottom: 6, fontSize: 14 },
+  sectionLink: { color: "#38bdf8", fontWeight: "900" },
   body: { color: "#e2e8f0", fontSize: 14, lineHeight: 20 },
   bodyStrong: { color: "#fff", fontSize: 16, fontWeight: "900" },
   bodyMuted: { color: "#94a3b8", fontSize: 13, lineHeight: 18 },
   metaSmall: { color: "#94a3b8", marginTop: 8, fontSize: 12 },
+
+  label: { color: "#94a3b8", fontSize: 12, marginTop: 10, marginBottom: 6 },
+  input: {
+    backgroundColor: "#020617",
+    borderWidth: 1,
+    borderColor: "#1e293b",
+    borderRadius: 12,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    color: "#e2e8f0",
+  },
+  rowGap: { flexDirection: "row", gap: 10, marginTop: 10 },
+  inlineCenter: { flexDirection: "row", alignItems: "center", gap: 10, marginTop: 10 },
+  errorText: { color: "#fca5a5", marginTop: 10 },
+
+  apptRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    padding: 12,
+    borderRadius: 12,
+    backgroundColor: "#020617",
+    borderWidth: 1,
+    borderColor: "#1e293b",
+    gap: 10,
+  },
+
+  dangerBtnSm: {
+    backgroundColor: "#ef4444",
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 10,
+    alignItems: "center",
+  },
+  dangerTextSm: { color: "#0b1220", fontWeight: "900" },
 
   attachmentRow: {
     paddingVertical: 10,

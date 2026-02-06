@@ -83,6 +83,26 @@ export default function PlaceBidScreen() {
       router.back();
     } catch (e: any) {
       const msg = e?.message ?? "Failed to place bid.";
+      const code = e?.details?.code;
+
+      if (e?.status === 403 && code === "RESTRICTED") {
+        Alert.alert(
+          "Temporarily restricted",
+          "Your account is temporarily restricted due to suspicious activity. Please try again later."
+        );
+        setError(msg);
+        return;
+      }
+
+      if (e?.status === 400 && code === "CONTACT_INFO_NOT_ALLOWED") {
+        Alert.alert(
+          "Contact info not allowed",
+          "For safety, please don’t include phone numbers or email addresses in bids."
+        );
+        setError(msg);
+        return;
+      }
+
       setError(msg);
       if (String(msg).toLowerCase().includes("free tier limit")) {
         Alert.alert("Bid limit reached", msg);

@@ -1,5 +1,6 @@
 import * as SecureStore from "expo-secure-store";
 import { API_BASE_URL } from "../config";
+import { getAppAttestationToken } from "./attestation";
 
 // Set in home-hero-mobile/.env as EXPO_PUBLIC_API_BASE_URL=https://...
 // Falls back to src/config.ts default when not provided.
@@ -103,9 +104,11 @@ async function request<T>(
   }
 
   const token = await readToken();
+  const attestationToken = await getAppAttestationToken();
 
   const headers: Record<string, string> = {
     Accept: "application/json",
+    "X-App-Attestation": attestationToken,
   };
   if (body !== undefined) headers["Content-Type"] = "application/json";
   if (token) headers.Authorization = `Bearer ${token}`;
@@ -166,9 +169,11 @@ async function requestForm<T>(
   }
 
   const token = await readToken();
+  const attestationToken = await getAppAttestationToken();
 
   const headers: Record<string, string> = {
     Accept: "application/json",
+    "X-App-Attestation": attestationToken,
     ...(token ? { Authorization: `Bearer ${token}` } : {}),
   };
 

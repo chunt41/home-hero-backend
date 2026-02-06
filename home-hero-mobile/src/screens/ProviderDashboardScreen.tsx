@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useState } from "react";
 import {
   ActivityIndicator,
   FlatList,
@@ -58,7 +58,7 @@ export default function ProviderDashboardScreen() {
           size={48}
           color={COLORS.danger}
         />
-        <Text style={styles.errorTitle}>Couldn't load dashboard</Text>
+        <Text style={styles.errorTitle}>Couldn’t load dashboard</Text>
         <Text style={styles.errorText}>{error}</Text>
         <Pressable
           style={styles.retryButton}

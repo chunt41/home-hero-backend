@@ -17,6 +17,9 @@ export type ProviderProfile = {
   specialties: string | null;
   rating: number | null;
   reviewCount: number;
+  verificationBadge?: boolean;
+  verificationStatus?: "NONE" | "PENDING" | "VERIFIED" | "REJECTED";
+  isVerified?: boolean;
   isFavorited?: boolean;
   categories?: Category[];
 };

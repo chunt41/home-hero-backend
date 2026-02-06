@@ -1,6 +1,5 @@
 import React from "react";
-import { View, StyleSheet } from "react-native";
-import { NativeModules } from "react-native";
+import { NativeModules, StyleSheet, View } from "react-native";
 
 let BannerAd: any;
 let BannerAdSize: any;
@@ -23,6 +22,7 @@ function ensureBannerAdsLoaded(): boolean {
   if (!hasGoogleMobileAdsNativeModule()) return false;
 
   try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
     const gma = require("react-native-google-mobile-ads");
     BannerAd = gma.BannerAd;
     BannerAdSize = gma.BannerAdSize;
@@ -89,8 +89,6 @@ export const BannerAdComponent: React.FC<BannerAdComponentProps> = ({
   style,
   placement,
 }) => {
-  const [adHeight, setAdHeight] = React.useState(0);
-
   const unitIds = parseUnitIds(process.env.EXPO_PUBLIC_ADMOB_BANNER_UNIT_IDS);
   const unitId = pickUnitId(unitIds, placement ?? "default");
 
@@ -100,7 +98,7 @@ export const BannerAdComponent: React.FC<BannerAdComponentProps> = ({
   }
 
   return (
-    <View style={[styles.adContainer, style]}>
+    <View style={[styles.adContainer, { minHeight: 50 }, style]}>
       <BannerAd
         unitId={unitId}
         size={BannerAdSize.ANCHORED_ADAPTIVE_BANNER}
@@ -111,7 +109,6 @@ export const BannerAdComponent: React.FC<BannerAdComponentProps> = ({
             vertical: "tools_outdoors",
           },
         }}
-        onAdLoaded={() => setAdHeight(50)}
         onAdFailedToLoad={(error: unknown) =>
           console.log("Banner ad failed to load:", error)
         }

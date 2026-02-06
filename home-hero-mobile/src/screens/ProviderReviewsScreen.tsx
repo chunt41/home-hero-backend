@@ -17,8 +17,7 @@ export default function ProviderReviewsScreen() {
   const { providerId } = useLocalSearchParams<{ providerId: string }>();
 
   const providerIdNum = providerId ? Number(providerId) : 0;
-  const { summary, loading, error, refetch, ratingDistribution } =
-    useProviderReviews(providerIdNum);
+  const { summary, loading, error, refetch } = useProviderReviews(providerIdNum);
 
   useFocusEffect(
     useCallback(() => {
@@ -27,34 +26,6 @@ export default function ProviderReviewsScreen() {
       }
     }, [providerIdNum, refetch])
   );
-
-  const renderRatingBar = (count: number, stars: number, total: number) => {
-    const percentage = total > 0 ? (count / total) * 100 : 0;
-
-    return (
-      <View key={stars} style={styles.ratingBarRow}>
-        <View style={styles.starGroup}>
-          {[...Array(stars)].map((_, i) => (
-            <MaterialCommunityIcons
-              key={i}
-              name="star"
-              size={14}
-              color="#f59e0b"
-            />
-          ))}
-        </View>
-        <View style={styles.barContainer}>
-          <View
-            style={[
-              styles.bar,
-              { width: `${percentage}%`, backgroundColor: "#f59e0b" },
-            ]}
-          />
-        </View>
-        <Text style={styles.barCount}>{count}</Text>
-      </View>
-    );
-  };
 
   const renderReviewItem = ({ item }: { item: any }) => (
     <View style={styles.reviewCard}>
@@ -68,7 +39,7 @@ export default function ProviderReviewsScreen() {
             />
           </View>
           <View style={styles.consumerDetails}>
-            <Text style={styles.consumerName}>{item.consumer.name}</Text>
+            <Text style={styles.consumerName}>{item.reviewer?.name ?? "User"}</Text>
             <Text style={styles.jobTitle} numberOfLines={1}>
               {item.job.title}
             </Text>
@@ -87,9 +58,9 @@ export default function ProviderReviewsScreen() {
         </View>
       </View>
 
-      {item.comment && (
+      {item.text && (
         <Text style={styles.comment} numberOfLines={4}>
-          {item.comment}
+          {item.text}
         </Text>
       )}
 

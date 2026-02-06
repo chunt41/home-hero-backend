@@ -13,11 +13,18 @@ import { useFocusEffect, useRouter } from "expo-router";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { useSubscription } from "../hooks/useSubscription";
 import { StripeCheckoutModal } from "../components/StripeCheckoutModal";
+import { ExtraLeadsCheckoutModal } from "../components/ExtraLeadsCheckoutModal";
+import { VerificationBadgeCheckoutModal } from "../components/VerificationBadgeCheckoutModal";
+import { FeaturedZipCodesCheckoutModal } from "../components/FeaturedZipCodesCheckoutModal";
 import { getErrorMessage } from "../lib/getErrorMessage";
 
 export default function SubscriptionScreen() {
   const router = useRouter();
   const [checkoutTier, setCheckoutTier] = useState<"BASIC" | "PRO" | null>(null);
+  const [extraLeadsOpen, setExtraLeadsOpen] = useState(false);
+  const [extraLeadsQty, setExtraLeadsQty] = useState(10);
+  const [verificationOpen, setVerificationOpen] = useState(false);
+  const [featuredZipsOpen, setFeaturedZipsOpen] = useState(false);
   const {
     subscription,
     loading,
@@ -64,6 +71,57 @@ export default function SubscriptionScreen() {
     Alert.alert("Success!", "Your subscription has been upgraded.");
     fetchSubscription();
   };
+
+  const handleExtraLeadsSuccess = () => {
+    Alert.alert("Success!", "Extra leads have been added to your account.");
+    fetchSubscription();
+  };
+
+  const handleVerificationSuccess = () => {
+    Alert.alert("Success!", "Your verification badge is now active.");
+    fetchSubscription();
+  };
+
+  const handleFeaturedZipsSuccess = (purchasedZipCodes: string[]) => {
+    Alert.alert(
+      "Success!",
+      `Purchased ${purchasedZipCodes.length} featured zip code${
+        purchasedZipCodes.length === 1 ? "" : "s"
+      }.`
+    );
+    fetchSubscription();
+  };
+
+  const usage = subscription
+    ? (() => {
+        const base =
+          typeof subscription.baseLeadLimitThisMonth === "number"
+            ? subscription.baseLeadLimitThisMonth
+            : null;
+        const extra =
+          typeof subscription.extraLeadCreditsThisMonth === "number"
+            ? subscription.extraLeadCreditsThisMonth
+            : null;
+        const totalLimit =
+          base !== null ? base + Math.max(0, extra ?? 0) : subscription.bidLimitPer30Days;
+
+        const used =
+          typeof subscription.leadsUsedThisMonth === "number"
+            ? subscription.leadsUsedThisMonth
+            : subscription.bidsUsedLast30Days;
+
+        const remaining =
+          typeof subscription.remainingLeadsThisMonth === "number"
+            ? subscription.remainingLeadsThisMonth
+            : subscription.remainingBids;
+
+        return { totalLimit, used, remaining };
+      })()
+    : null;
+
+  const providerAddons = subscription?.providerAddons ?? null;
+  const verificationActive = !!providerAddons?.verificationBadge;
+  const featuredZipCodes = providerAddons?.featuredZipCodes ?? [];
 
   const getTierHierarchy = (tier: "FREE" | "BASIC" | "PRO"): number => {
     switch (tier) {
@@ -220,35 +278,28 @@ export default function SubscriptionScreen() {
             <Text style={styles.currentTierLabel}>Current Plan</Text>
             <Text style={styles.currentTier}>{subscription.tier}</Text>
 
-            {subscription.tier === "FREE" &&
-              subscription.remainingBids !== null && (
-                <View style={styles.bidUsageSection}>
-                  <Text style={styles.bidUsageLabel}>
-                    Bids Used This Month
-                  </Text>
-                  <View style={styles.progressBar}>
-                    <View
-                      style={[
-                        styles.progressFill,
-                        {
-                          width: `${
-                            subscription.bidsUsedLast30Days &&
-                            subscription.bidLimitPer30Days
-                              ? (subscription.bidsUsedLast30Days /
-                                  subscription.bidLimitPer30Days) *
-                                100
-                              : 0
-                          }%`,
-                        },
-                      ]}
-                    />
-                  </View>
-                  <Text style={styles.bidUsageText}>
-                    {subscription.bidsUsedLast30Days} of{" "}
-                    {subscription.bidLimitPer30Days} used
-                  </Text>
+            {usage?.totalLimit !== null && typeof usage?.used === "number" && (
+              <View style={styles.bidUsageSection}>
+                <Text style={styles.bidUsageLabel}>Bids Used This Month</Text>
+                <View style={styles.progressBar}>
+                  <View
+                    style={[
+                      styles.progressFill,
+                      {
+                        width: `${
+                          usage.totalLimit
+                            ? Math.min(100, (usage.used / usage.totalLimit) * 100)
+                            : 0
+                        }%`,
+                      },
+                    ]}
+                  />
                 </View>
-              )}
+                <Text style={styles.bidUsageText}>
+                  {usage.used} of {usage.totalLimit} used
+                </Text>
+              </View>
+            )}
           </View>
 
           {/* Tier Cards */}
@@ -256,6 +307,103 @@ export default function SubscriptionScreen() {
             {renderTierCard("FREE", subscription.tier === "FREE")}
             {renderTierCard("BASIC", subscription.tier === "BASIC")}
             {renderTierCard("PRO", subscription.tier === "PRO")}
+          </View>
+
+          {/* Add-ons */}
+          <View style={styles.addonsSection}>
+            <Text style={styles.addonsTitle}>Add-ons</Text>
+
+            <View style={styles.addonCard}>
+              <View style={styles.addonHeader}>
+                <View style={styles.addonIconWrap}>
+                  <MaterialCommunityIcons name="ticket-percent" size={18} color="#38bdf8" />
+                </View>
+                <View style={styles.addonHeaderText}>
+                  <Text style={styles.addonName}>Extra leads</Text>
+                  <Text style={styles.addonSubtitle}>$0.50 per lead (one-time)</Text>
+                </View>
+              </View>
+
+              <View style={styles.qtyRow}>
+                <Pressable
+                  style={styles.qtyBtn}
+                  onPress={() => setExtraLeadsQty((q) => Math.max(1, q - 5))}
+                >
+                  <Text style={styles.qtyBtnText}>-5</Text>
+                </Pressable>
+
+                <Pressable
+                  style={styles.qtyBtn}
+                  onPress={() => setExtraLeadsQty((q) => Math.max(1, q - 1))}
+                >
+                  <Text style={styles.qtyBtnText}>-1</Text>
+                </Pressable>
+
+                <View style={styles.qtyValueWrap}>
+                  <Text style={styles.qtyValue}>{extraLeadsQty}</Text>
+                  <Text style={styles.qtyLabel}>leads</Text>
+                </View>
+
+                <Pressable style={styles.qtyBtn} onPress={() => setExtraLeadsQty((q) => q + 1)}>
+                  <Text style={styles.qtyBtnText}>+1</Text>
+                </Pressable>
+
+                <Pressable style={styles.qtyBtn} onPress={() => setExtraLeadsQty((q) => q + 5)}>
+                  <Text style={styles.qtyBtnText}>+5</Text>
+                </Pressable>
+              </View>
+
+              <Pressable style={styles.buyAddonBtn} onPress={() => setExtraLeadsOpen(true)}>
+                <Text style={styles.buyAddonBtnText}>Buy {extraLeadsQty} extra leads</Text>
+              </Pressable>
+            </View>
+
+            <View style={styles.addonCard}>
+              <View style={styles.addonHeader}>
+                <View style={styles.addonIconWrap}>
+                  <MaterialCommunityIcons name="shield-check" size={18} color="#38bdf8" />
+                </View>
+                <View style={styles.addonHeaderText}>
+                  <View style={styles.addonTitleRow}>
+                    <Text style={styles.addonName}>Verification badge</Text>
+                    {verificationActive ? (
+                      <View style={styles.addonStatusPill}>
+                        <Text style={styles.addonStatusText}>Active</Text>
+                      </View>
+                    ) : null}
+                  </View>
+                  <Text style={styles.addonSubtitle}>$10.00 (one-time)</Text>
+                </View>
+              </View>
+
+              <Pressable
+                style={[styles.buyAddonBtn, verificationActive && styles.buyAddonBtnDisabled]}
+                onPress={() => setVerificationOpen(true)}
+                disabled={verificationActive}
+              >
+                <Text style={styles.buyAddonBtnText}>
+                  {verificationActive ? "Already purchased" : "Buy verification badge"}
+                </Text>
+              </Pressable>
+            </View>
+
+            <View style={styles.addonCard}>
+              <View style={styles.addonHeader}>
+                <View style={styles.addonIconWrap}>
+                  <MaterialCommunityIcons name="map-marker" size={18} color="#38bdf8" />
+                </View>
+                <View style={styles.addonHeaderText}>
+                  <Text style={styles.addonName}>Featured zip codes</Text>
+                  <Text style={styles.addonSubtitle}>
+                    $2.00 per zip (one-time) • {featuredZipCodes.length} active
+                  </Text>
+                </View>
+              </View>
+
+              <Pressable style={styles.buyAddonBtn} onPress={() => setFeaturedZipsOpen(true)}>
+                <Text style={styles.buyAddonBtnText}>Add featured zip codes</Text>
+              </Pressable>
+            </View>
           </View>
 
           {/* FAQ Section */}
@@ -277,7 +425,7 @@ export default function SubscriptionScreen() {
                 What happens if I exceed my bid limit?
               </Text>
               <Text style={styles.faqAnswer}>
-                For FREE tier, you won't be able to place new bids once you
+                For FREE tier, you won{"'"}t be able to place new bids once you
                 reach your monthly limit. Upgrade to place more bids.
               </Text>
             </View>
@@ -301,6 +449,26 @@ export default function SubscriptionScreen() {
         tier={checkoutTier}
         onClose={() => setCheckoutTier(null)}
         onSuccess={handlePaymentSuccess}
+      />
+
+      <ExtraLeadsCheckoutModal
+        visible={extraLeadsOpen}
+        quantity={extraLeadsQty}
+        onClose={() => setExtraLeadsOpen(false)}
+        onSuccess={handleExtraLeadsSuccess}
+      />
+
+      <VerificationBadgeCheckoutModal
+        visible={verificationOpen}
+        onClose={() => setVerificationOpen(false)}
+        onSuccess={handleVerificationSuccess}
+      />
+
+      <FeaturedZipCodesCheckoutModal
+        visible={featuredZipsOpen}
+        existingZipCodes={featuredZipCodes}
+        onClose={() => setFeaturedZipsOpen(false)}
+        onSuccess={handleFeaturedZipsSuccess}
       />
     </SafeAreaView>
   );
@@ -436,6 +604,119 @@ const styles = StyleSheet.create({
 
   tiersContainer: {
     marginBottom: 24,
+  },
+
+  addonsSection: {
+    marginBottom: 24,
+  },
+  addonsTitle: {
+    color: "#fff",
+    fontSize: 18,
+    fontWeight: "800",
+    marginBottom: 12,
+  },
+  addonCard: {
+    backgroundColor: "#0f172a",
+    borderRadius: 16,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: "#1e293b",
+    marginBottom: 12,
+  },
+  addonHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginBottom: 14,
+  },
+  addonIconWrap: {
+    width: 34,
+    height: 34,
+    borderRadius: 10,
+    backgroundColor: "#020617",
+    borderWidth: 1,
+    borderColor: "#38bdf8",
+    justifyContent: "center",
+    alignItems: "center",
+    marginRight: 12,
+  },
+  addonHeaderText: {
+    flex: 1,
+  },
+  addonName: {
+    color: "#e2e8f0",
+    fontSize: 16,
+    fontWeight: "800",
+  },
+  addonTitleRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  addonStatusPill: {
+    backgroundColor: "#10b981",
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 999,
+    marginLeft: 10,
+  },
+  addonStatusText: {
+    color: "#fff",
+    fontSize: 11,
+    fontWeight: "800",
+  },
+  addonSubtitle: {
+    color: "#94a3b8",
+    fontSize: 12,
+    marginTop: 2,
+  },
+  qtyRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 14,
+  },
+  qtyBtn: {
+    paddingVertical: 10,
+    paddingHorizontal: 10,
+    borderRadius: 10,
+    backgroundColor: "#1e293b",
+    borderWidth: 1,
+    borderColor: "#334155",
+    minWidth: 44,
+    alignItems: "center",
+  },
+  qtyBtnText: {
+    color: "#e2e8f0",
+    fontWeight: "800",
+    fontSize: 12,
+  },
+  qtyValueWrap: {
+    flex: 1,
+    alignItems: "center",
+  },
+  qtyValue: {
+    color: "#38bdf8",
+    fontSize: 26,
+    fontWeight: "900",
+  },
+  qtyLabel: {
+    color: "#94a3b8",
+    fontSize: 12,
+    marginTop: 2,
+  },
+  buyAddonBtn: {
+    backgroundColor: "#38bdf8",
+    paddingVertical: 12,
+    borderRadius: 12,
+    alignItems: "center",
+  },
+  buyAddonBtnDisabled: {
+    opacity: 0.6,
+  },
+  buyAddonBtnText: {
+    color: "#020617",
+    fontWeight: "900",
+    fontSize: 14,
   },
 
   tierCard: {

@@ -1,4 +1,4 @@
-import React, { useCallback, useState } from "react";
+import React, { useCallback, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   ScrollView,
@@ -13,6 +13,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { useFocusEffect, useLocalSearchParams, useRouter } from "expo-router";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { api } from "../lib/apiClient";
+import { UpgradeRequiredModal, type UpgradeRequiredDetails } from "../components/UpgradeRequiredModal";
 
 const COLORS = {
   bg: "#0f172a",
@@ -59,9 +60,23 @@ type JobDetailsResponse = {
   myBid: BidDetail | null;
 };
 
+type BidTemplate = {
+  id: number;
+  title: string;
+  body: string;
+  defaultAmount: number | null;
+  tags: string[];
+  createdAt: string;
+  updatedAt: string;
+};
+
+type BidTemplatesResponse = {
+  items: BidTemplate[];
+};
+
 export default function BidDetailScreen() {
   const router = useRouter();
-  const { bidId, jobId } = useLocalSearchParams();
+  const { jobId } = useLocalSearchParams();
   const numJobId = Number(jobId);
 
   const [jobData, setJobData] = useState<JobDetailsResponse | null>(null);
@@ -73,6 +88,14 @@ export default function BidDetailScreen() {
   const [editMessage, setEditMessage] = useState("");
   const [updating, setUpdating] = useState(false);
   const [counterActionLoading, setCounterActionLoading] = useState(false);
+
+  const [templates, setTemplates] = useState<BidTemplate[]>([]);
+  const [templatesLoading, setTemplatesLoading] = useState(false);
+  const [templatesError, setTemplatesError] = useState<string | null>(null);
+  const [selectedTemplateId, setSelectedTemplateId] = useState<number | null>(null);
+
+  const [upgradeModalVisible, setUpgradeModalVisible] = useState(false);
+  const [upgradeDetails, setUpgradeDetails] = useState<UpgradeRequiredDetails | null>(null);
 
   const fetchJobDetails = useCallback(async () => {
     setLoading(true);
@@ -91,33 +114,95 @@ export default function BidDetailScreen() {
     }
   }, [numJobId]);
 
+  const fetchBidTemplates = useCallback(async () => {
+    setTemplatesLoading(true);
+    setTemplatesError(null);
+    try {
+      const data = await api.get<BidTemplatesResponse>("/provider/bid-templates");
+      setTemplates(data.items ?? []);
+    } catch (err: any) {
+      setTemplatesError(err?.message ?? "Failed to load bid templates");
+    } finally {
+      setTemplatesLoading(false);
+    }
+  }, []);
+
   useFocusEffect(
     useCallback(() => {
       fetchJobDetails();
-    }, [fetchJobDetails])
+      fetchBidTemplates();
+    }, [fetchJobDetails, fetchBidTemplates])
   );
 
-  const handleUpdateBid = useCallback(async () => {
-    if (!editAmount || Number(editAmount) <= 0) {
-      Alert.alert("Invalid amount", "Please enter a positive amount");
-      return;
+  const selectedTemplate = useMemo(() => {
+    if (!selectedTemplateId) return null;
+    return templates.find((t) => t.id === selectedTemplateId) ?? null;
+  }, [selectedTemplateId, templates]);
+
+  const applyTemplate = useCallback(
+    (template: BidTemplate | null) => {
+      if (!template) {
+        setSelectedTemplateId(null);
+        return;
+      }
+      setSelectedTemplateId(template.id);
+      if (typeof template.defaultAmount === "number") {
+        setEditAmount(String(template.defaultAmount));
+      } else {
+        setEditAmount("");
+      }
+      setEditMessage(template.body ?? "");
+    },
+    []
+  );
+
+  const handleSubmitBid = useCallback(async () => {
+    const hasTemplate = typeof selectedTemplateId === "number" && selectedTemplateId > 0;
+
+    const hasAmount = editAmount.trim().length > 0;
+    if (!hasTemplate) {
+      if (!hasAmount || Number(editAmount) <= 0) {
+        Alert.alert("Invalid amount", "Please enter a positive amount");
+        return;
+      }
+    } else {
+      // Template is selected; allow amount to be blank if template provides defaultAmount.
+      if (!hasAmount && !selectedTemplate?.defaultAmount) {
+        Alert.alert("Amount required", "This template has no default amount.");
+        return;
+      }
+      if (hasAmount && Number(editAmount) <= 0) {
+        Alert.alert("Invalid amount", "Please enter a positive amount");
+        return;
+      }
     }
 
     setUpdating(true);
     try {
-      await api.post(`/jobs/${numJobId}/bids`, {
-        amount: Number(editAmount),
+      const payload: any = {
+        templateId: hasTemplate ? selectedTemplateId : undefined,
+        amount: hasAmount ? Number(editAmount) : undefined,
         message: editMessage,
-      });
-      Alert.alert("Success", "Bid updated successfully");
+      };
+
+      await api.post(`/jobs/${numJobId}/bids`, payload);
+
+      Alert.alert("Success", jobData?.myBid ? "Bid updated successfully" : "Bid submitted successfully");
       setEditMode(false);
       await fetchJobDetails();
     } catch (err: any) {
-      Alert.alert("Error", err?.message ?? "Failed to update bid");
+      const details = err?.details;
+      if (details && typeof details === "object" && (details as any)?.code === "LIMIT_REACHED") {
+        setUpgradeDetails(details as any);
+        setUpgradeModalVisible(true);
+        return;
+      }
+
+      Alert.alert("Error", err?.message ?? "Failed to submit bid");
     } finally {
       setUpdating(false);
     }
-  }, [editAmount, editMessage, numJobId, fetchJobDetails]);
+  }, [editAmount, editMessage, numJobId, fetchJobDetails, jobData?.myBid, selectedTemplate?.defaultAmount, selectedTemplateId]);
 
   const handleAcceptCounter = useCallback(async () => {
     if (!jobData?.myBid?.id) return;
@@ -192,7 +277,7 @@ export default function BidDetailScreen() {
           size={48}
           color={COLORS.danger}
         />
-        <Text style={styles.errorTitle}>Couldn't load details</Text>
+        <Text style={styles.errorTitle}>Couldn’t load details</Text>
         <Text style={styles.errorText}>{error}</Text>
         <Pressable style={styles.retryButton} onPress={fetchJobDetails}>
           <Text style={styles.retryButtonText}>Retry</Text>
@@ -211,6 +296,15 @@ export default function BidDetailScreen() {
 
   return (
     <SafeAreaView style={styles.container} edges={["top", "left", "right"]}>
+      <UpgradeRequiredModal
+        visible={upgradeModalVisible}
+        details={upgradeDetails}
+        onClose={() => setUpgradeModalVisible(false)}
+        onUpgrade={() => {
+          setUpgradeModalVisible(false);
+          router.push("/provider/subscription");
+        }}
+      />
       <ScrollView contentContainerStyle={styles.scrollContent}>
         {/* Header */}
         <View style={styles.header}>
@@ -324,6 +418,55 @@ export default function BidDetailScreen() {
             <Text style={styles.sectionTitle}>Update Your Bid</Text>
             <View style={styles.card}>
               <View style={styles.formGroup}>
+                <View style={styles.rowBetween}>
+                  <Text style={styles.label}>Template (Optional)</Text>
+                  <Pressable onPress={() => router.push("/provider/bid-templates")} disabled={updating}>
+                    <Text style={styles.linkText}>Manage</Text>
+                  </Pressable>
+                </View>
+                {templatesLoading ? (
+                  <Text style={styles.mutedText}>Loading templates…</Text>
+                ) : templatesError ? (
+                  <Text style={[styles.mutedText, { color: COLORS.warning }]}>
+                    {templatesError}
+                  </Text>
+                ) : templates.length === 0 ? (
+                  <Text style={styles.mutedText}>No templates yet.</Text>
+                ) : (
+                  <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginTop: 8 }}>
+                    <Pressable
+                      style={[
+                        styles.templateChip,
+                        selectedTemplateId === null && styles.templateChipActive,
+                      ]}
+                      onPress={() => applyTemplate(null)}
+                      disabled={updating}
+                    >
+                      <Text style={styles.templateChipText}>None</Text>
+                    </Pressable>
+                    {templates.map((t) => (
+                      <Pressable
+                        key={t.id}
+                        style={[
+                          styles.templateChip,
+                          selectedTemplateId === t.id && styles.templateChipActive,
+                        ]}
+                        onPress={() => applyTemplate(t)}
+                        disabled={updating}
+                      >
+                        <Text style={styles.templateChipText}>{t.title}</Text>
+                      </Pressable>
+                    ))}
+                  </ScrollView>
+                )}
+                {selectedTemplate ? (
+                  <Text style={styles.mutedText} numberOfLines={2}>
+                    Using: {selectedTemplate.title}
+                  </Text>
+                ) : null}
+              </View>
+
+              <View style={styles.formGroup}>
                 <Text style={styles.label}>Amount</Text>
                 <View style={styles.inputContainer}>
                   <Text style={styles.currencySymbol}>$</Text>
@@ -355,7 +498,7 @@ export default function BidDetailScreen() {
 
               <Pressable
                 style={[styles.submitButton, updating && styles.submitButtonDisabled]}
-                onPress={handleUpdateBid}
+                onPress={handleSubmitBid}
                 disabled={updating}
               >
                 {updating ? (
@@ -368,6 +511,103 @@ export default function BidDetailScreen() {
                       color={COLORS.bg}
                     />
                     <Text style={styles.submitButtonText}>Update Bid</Text>
+                  </>
+                )}
+              </Pressable>
+            </View>
+          </View>
+        )}
+
+        {/* Place Bid Form (if no bid yet) */}
+        {!bid && (
+          <View style={styles.section}>
+            <Text style={styles.sectionTitle}>Place a Bid</Text>
+            <View style={styles.card}>
+              <View style={styles.formGroup}>
+                <View style={styles.rowBetween}>
+                  <Text style={styles.label}>Template (Optional)</Text>
+                  <Pressable onPress={() => router.push("/provider/bid-templates")} disabled={updating}>
+                    <Text style={styles.linkText}>Manage</Text>
+                  </Pressable>
+                </View>
+                {templatesLoading ? (
+                  <Text style={styles.mutedText}>Loading templates…</Text>
+                ) : templatesError ? (
+                  <Text style={[styles.mutedText, { color: COLORS.warning }]}>
+                    {templatesError}
+                  </Text>
+                ) : templates.length === 0 ? (
+                  <Text style={styles.mutedText}>No templates yet.</Text>
+                ) : (
+                  <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginTop: 8 }}>
+                    <Pressable
+                      style={[
+                        styles.templateChip,
+                        selectedTemplateId === null && styles.templateChipActive,
+                      ]}
+                      onPress={() => applyTemplate(null)}
+                      disabled={updating}
+                    >
+                      <Text style={styles.templateChipText}>None</Text>
+                    </Pressable>
+                    {templates.map((t) => (
+                      <Pressable
+                        key={t.id}
+                        style={[
+                          styles.templateChip,
+                          selectedTemplateId === t.id && styles.templateChipActive,
+                        ]}
+                        onPress={() => applyTemplate(t)}
+                        disabled={updating}
+                      >
+                        <Text style={styles.templateChipText}>{t.title}</Text>
+                      </Pressable>
+                    ))}
+                  </ScrollView>
+                )}
+              </View>
+
+              <View style={styles.formGroup}>
+                <Text style={styles.label}>Amount</Text>
+                <View style={styles.inputContainer}>
+                  <Text style={styles.currencySymbol}>$</Text>
+                  <TextInput
+                    style={styles.input}
+                    placeholder={selectedTemplate?.defaultAmount ? String(selectedTemplate.defaultAmount) : "0.00"}
+                    placeholderTextColor={COLORS.textMuted}
+                    keyboardType="decimal-pad"
+                    value={editAmount}
+                    onChangeText={setEditAmount}
+                    editable={!updating}
+                  />
+                </View>
+              </View>
+
+              <View style={styles.formGroup}>
+                <Text style={styles.label}>Message (Optional)</Text>
+                <TextInput
+                  style={[styles.input, styles.textarea]}
+                  placeholder="Add a message to your bid…"
+                  placeholderTextColor={COLORS.textMuted}
+                  multiline
+                  numberOfLines={4}
+                  value={editMessage}
+                  onChangeText={setEditMessage}
+                  editable={!updating}
+                />
+              </View>
+
+              <Pressable
+                style={[styles.submitButton, updating && styles.submitButtonDisabled]}
+                onPress={handleSubmitBid}
+                disabled={updating}
+              >
+                {updating ? (
+                  <ActivityIndicator color={COLORS.bg} size="small" />
+                ) : (
+                  <>
+                    <MaterialCommunityIcons name="send" size={16} color={COLORS.bg} />
+                    <Text style={styles.submitButtonText}>Submit Bid</Text>
                   </>
                 )}
               </Pressable>
@@ -573,6 +813,11 @@ const styles = StyleSheet.create({
     color: COLORS.textMuted,
     fontWeight: "500",
   },
+  mutedText: {
+    fontSize: 12,
+    color: COLORS.textMuted,
+    marginTop: 6,
+  },
   value: {
     fontSize: 13,
     color: COLORS.text,
@@ -630,6 +875,34 @@ const styles = StyleSheet.create({
 
   formGroup: {
     gap: 8,
+  },
+  rowBetween: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  linkText: {
+    color: COLORS.accent,
+    fontSize: 12,
+    fontWeight: "700",
+  },
+  templateChip: {
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.bg,
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    borderRadius: 999,
+    marginRight: 8,
+  },
+  templateChipActive: {
+    borderColor: COLORS.accent,
+    backgroundColor: COLORS.accent + "20",
+  },
+  templateChipText: {
+    color: COLORS.text,
+    fontWeight: "600",
+    fontSize: 12,
   },
   inputContainer: {
     flexDirection: "row",

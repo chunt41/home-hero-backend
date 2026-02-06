@@ -1,4 +1,4 @@
-import React, { useEffect } from "react";
+import React from "react";
 import {
   Modal,
   Pressable,
@@ -9,14 +9,6 @@ import {
   ScrollView,
 } from "react-native";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
-
-let useStripe: any = null;
-try {
-  const stripeModule = require("@stripe/stripe-react-native");
-  useStripe = stripeModule.useStripe;
-} catch (e) {
-  console.log("Stripe not available");
-}
 
 import { useStripePayment } from "../hooks/useStripePayment";
 
@@ -48,15 +40,10 @@ export const StripeCheckoutModal: React.FC<StripeCheckoutModalProps> = ({
   onClose,
   onSuccess,
 }) => {
-  const stripeHooks = useStripe ? useStripe() : { initPaymentSheet: null, presentPaymentSheet: null };
-  const { initPaymentSheet, presentPaymentSheet } = stripeHooks;
   const { initiatePayment, status, error, reset } = useStripePayment();
 
   const handlePayment = async () => {
-    if (!tier || !useStripe) {
-      alert("Payment processing is not available. Please try again later.");
-      return;
-    }
+    if (!tier) return;
 
     const result = await initiatePayment(tier);
 
@@ -147,7 +134,7 @@ export const StripeCheckoutModal: React.FC<StripeCheckoutModalProps> = ({
             {/* Terms */}
             <View style={styles.termsSection}>
               <Text style={styles.termsText}>
-                By clicking "Pay Now", you agree to subscribe to this plan.
+                By clicking “Pay Now”, you agree to subscribe to this plan.
                 Your subscription will renew automatically each month unless you
                 cancel.
               </Text>

@@ -72,7 +72,7 @@ export default function MyBidsScreen() {
           size={48}
           color={COLORS.danger}
         />
-        <Text style={styles.errorTitle}>Couldn't load bids</Text>
+        <Text style={styles.errorTitle}>Couldn’t load bids</Text>
         <Text style={styles.errorText}>{error}</Text>
         <Pressable style={styles.retryButton} onPress={fetch}>
           <Text style={styles.retryButtonText}>Retry</Text>

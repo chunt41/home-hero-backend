@@ -1,6 +1,6 @@
 
 import React from "react";
-import { View, Text, FlatList, ActivityIndicator, StyleSheet, ScrollView } from "react-native";
+import { View, Text, ActivityIndicator, StyleSheet, ScrollView } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useFlaggedJobs } from "../../src/hooks/useFlaggedJobs";
 

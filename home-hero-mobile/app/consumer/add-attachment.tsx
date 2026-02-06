@@ -10,18 +10,9 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useLocalSearchParams, router } from "expo-router";
 import * as FileSystem from "expo-file-system/legacy";
+import * as ImagePicker from "expo-image-picker";
 import { api } from "../../src/lib/apiClient";
 import { getErrorMessage } from "../../src/lib/getErrorMessage";
-
-function getImagePicker(): any | null {
-  try {
-    const mod = require("expo-image-picker");
-    if (!mod?.launchImageLibraryAsync) return null;
-    return mod;
-  } catch {
-    return null;
-  }
-}
 
 const DEFAULT_MAX_ATTACHMENT_BYTES = 15 * 1024 * 1024;
 const MAX_ATTACHMENT_BYTES = (() => {
@@ -51,15 +42,6 @@ export default function AddAttachmentScreen() {
     if (!Number.isFinite(numericJobId)) return;
 
     try {
-      const ImagePicker = getImagePicker();
-      if (!ImagePicker) {
-        Alert.alert(
-          "Not available",
-          "Media picking isn't available in this build. If you're using a development build, rebuild it after adding expo-image-picker. Expo Go should include it by default."
-        );
-        return;
-      }
-
       const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
       if (!perm.granted) {
         Alert.alert(

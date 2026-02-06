@@ -285,7 +285,7 @@ export default function ConsumerJobBidsScreen() {
               </Text>
             </>
           ) : (
-            <Text style={styles.metaSmall}>You haven't sent a counter yet.</Text>
+            <Text style={styles.metaSmall}>You haven’t sent a counter yet.</Text>
           )}
         </View>
 

@@ -40,5 +40,26 @@ export default ({ config }: ConfigContext): ExpoConfig => {
     next.plugins.push(gmaPlugin);
   }
 
+  next.ios = {
+    ...(next.ios ?? {}),
+    infoPlist: {
+      ...((next.ios as any)?.infoPlist ?? {}),
+      NSCalendarsUsageDescription:
+        ((next.ios as any)?.infoPlist?.NSCalendarsUsageDescription as string | undefined) ??
+        "Home Hero would like to add appointments to your calendar.",
+    },
+  };
+
+  next.android = {
+    ...(next.android ?? {}),
+    permissions: Array.from(
+      new Set([
+        ...(((next.android as any)?.permissions as string[] | undefined) ?? []),
+        "READ_CALENDAR",
+        "WRITE_CALENDAR",
+      ])
+    ),
+  };
+
   return next as ExpoConfig;
 };

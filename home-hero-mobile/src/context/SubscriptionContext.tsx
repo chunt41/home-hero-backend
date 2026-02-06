@@ -18,6 +18,17 @@ export type SubscriptionInfo = {
   bidLimitPer30Days: number | null;
   bidsUsedLast30Days: number | null;
   remainingBids: number | null;
+  usageMonthKey?: string;
+  baseLeadLimitThisMonth?: number | null;
+  extraLeadCreditsThisMonth?: number | null;
+  leadsUsedThisMonth?: number | null;
+  remainingLeadsThisMonth?: number | null;
+  providerAddons?:
+    | {
+        verificationBadge: boolean;
+        featuredZipCodes: string[];
+      }
+    | null;
 };
 
 type SubscriptionContextValue = {

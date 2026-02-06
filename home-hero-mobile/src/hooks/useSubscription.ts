@@ -1,4 +1,4 @@
-import { useSubscriptionContext, type SubscriptionInfo } from "../context/SubscriptionContext";
+import { useSubscriptionContext } from "../context/SubscriptionContext";
 
 const TIER_FEATURES = {
   FREE: {

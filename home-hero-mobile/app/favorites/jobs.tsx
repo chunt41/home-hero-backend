@@ -62,7 +62,7 @@ export default function FavoriteJobsScreen() {
       setItems((cur) => cur.filter((x) => x.job.id !== jobId));
       try {
         await api.delete(`/jobs/${jobId}/favorite`);
-      } catch (e) {
+      } catch {
         // rollback if it failed
         setItems(prev);
       }

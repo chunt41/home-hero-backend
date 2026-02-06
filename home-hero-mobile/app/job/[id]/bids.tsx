@@ -184,7 +184,7 @@ export default function ProviderJobBidsScreen() {
 
             {!data.myBid ? (
               <>
-                <Text style={styles.metaSmall}>You haven't placed a bid yet.</Text>
+                <Text style={styles.metaSmall}>You haven’t placed a bid yet.</Text>
                 <Pressable
                   style={styles.primaryBtn}
                   onPress={() => router.push(`/job/${data.job.id}/bid`)}

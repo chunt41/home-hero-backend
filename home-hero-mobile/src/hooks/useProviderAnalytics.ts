@@ -11,16 +11,16 @@ export type AnalyticsData = {
   averageEarningsPerJob: number;
 
   // Earnings by month (last 6 months)
-  earningsByMonth: Array<{
+  earningsByMonth: {
     month: string; // "Jan", "Feb", etc.
     earnings: number;
-  }>;
+  }[];
 
   // Jobs by category
-  jobsByCategory: Array<{
+  jobsByCategory: {
     name: string;
     count: number;
-  }>;
+  }[];
 
   // Bid status breakdown
   bidStats: {
@@ -31,14 +31,14 @@ export type AnalyticsData = {
   };
 
   // Recent jobs (last 10)
-  recentJobs: Array<{
+  recentJobs: {
     id: number;
     title: string;
     bidAmount: number;
     status: string;
     completedAt?: string;
     categoryName?: string;
-  }>;
+  }[];
 };
 
 export function useProviderAnalytics() {

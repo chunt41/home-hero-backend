@@ -15,6 +15,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { useFocusEffect, useRouter } from "expo-router";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { useProviderProfile } from "../hooks/useProviderProfile";
+import { useProviderReviews } from "../hooks/useProviderReviews";
 import { api } from "../lib/apiClient";
 import { getErrorMessage } from "../lib/getErrorMessage";
 
@@ -50,6 +51,14 @@ export default function ProviderProfileScreen(props?: ProviderProfileScreenProps
     updateCategories,
   } = useProviderProfile(props?.providerId);
 
+  const providerIdForReviews = profile?.id ?? props?.providerId ?? 0;
+  const {
+    summary: reviewsSummary,
+    loading: reviewsLoading,
+    error: reviewsError,
+    refetch: refetchReviews,
+  } = useProviderReviews(providerIdForReviews, { limit: 10 });
+
   const [editMode, setEditMode] = useState(false);
   const [saving, setSaving] = useState(false);
   const [categoryModalVisible, setCategoryModalVisible] = useState(false);
@@ -73,6 +82,14 @@ export default function ProviderProfileScreen(props?: ProviderProfileScreenProps
       fetchProfile();
       fetchCategories();
     }, [fetchProfile, fetchCategories])
+  );
+
+  useFocusEffect(
+    useCallback(() => {
+      if (providerIdForReviews) {
+        refetchReviews();
+      }
+    }, [providerIdForReviews, refetchReviews])
   );
 
   const refreshBlockedState = useCallback(async () => {
@@ -236,7 +253,7 @@ export default function ProviderProfileScreen(props?: ProviderProfileScreenProps
           size={48}
           color={COLORS.danger}
         />
-        <Text style={styles.errorTitle}>Couldn't load profile</Text>
+        <Text style={styles.errorTitle}>Couldn’t load profile</Text>
         <Text style={styles.errorText}>{error}</Text>
         <Pressable style={styles.retryButton} onPress={fetchProfile}>
           <Text style={styles.retryButtonText}>Retry</Text>
@@ -273,6 +290,17 @@ export default function ProviderProfileScreen(props?: ProviderProfileScreenProps
                 color={COLORS.accent}
               />
             </Pressable>
+
+            {!isViewingOther ? (
+              <Pressable onPress={() => router.push("/provider/verification")}
+              >
+                <MaterialCommunityIcons
+                  name={profile?.isVerified ? "check-decagram" : "badge-account-horizontal-outline"}
+                  size={24}
+                  color={profile?.isVerified ? COLORS.success : COLORS.accent}
+                />
+              </Pressable>
+            ) : null}
 
             {isViewingOther && profile?.id ? (
               <>
@@ -328,9 +356,23 @@ export default function ProviderProfileScreen(props?: ProviderProfileScreenProps
                 </Text>
               </View>
               <View style={styles.profileInfo}>
-                <Text style={styles.profileName}>
-                  {profile?.name || "Provider"}
-                </Text>
+                <View style={styles.profileNameRow}>
+                  <Text style={styles.profileName}>
+                    {profile?.name || "Provider"}
+                  </Text>
+
+                  {profile?.isVerified ? (
+                    <View style={[styles.verificationPill, styles.verificationPillVerified]}>
+                      <MaterialCommunityIcons name="check-decagram" size={14} color={COLORS.success} />
+                      <Text style={styles.verificationPillText}>Verified</Text>
+                    </View>
+                  ) : profile?.verificationStatus === "PENDING" ? (
+                    <View style={[styles.verificationPill, styles.verificationPillPending]}>
+                      <MaterialCommunityIcons name="clock-outline" size={14} color={COLORS.warning} />
+                      <Text style={styles.verificationPillText}>Pending</Text>
+                    </View>
+                  ) : null}
+                </View>
                 {profile?.rating !== null && (
                   <View style={styles.ratingRow}>
                     <MaterialCommunityIcons
@@ -345,6 +387,141 @@ export default function ProviderProfileScreen(props?: ProviderProfileScreenProps
                 )}
               </View>
             </View>
+          </View>
+        </View>
+
+        {/* Quick Tools (provider only) */}
+        {!isViewingOther ? (
+          <View style={styles.section}>
+            <Text style={styles.sectionTitle}>Quick Tools</Text>
+            <View style={styles.card}>
+              <Pressable
+                style={styles.quickToolRow}
+                onPress={() => router.push("/provider/bid-templates")}
+              >
+                <MaterialCommunityIcons
+                  name="file-document-edit-outline"
+                  size={20}
+                  color={COLORS.accent}
+                />
+                <View style={styles.quickToolTextWrap}>
+                  <Text style={styles.quickToolTitle}>Bid templates</Text>
+                  <Text style={styles.quickToolSubtitle}>
+                    Reuse messages and default pricing
+                  </Text>
+                </View>
+                <MaterialCommunityIcons
+                  name="chevron-right"
+                  size={22}
+                  color={COLORS.textMuted}
+                />
+              </Pressable>
+
+              <View style={styles.quickToolDivider} />
+
+              <Pressable
+                style={styles.quickToolRow}
+                onPress={() => router.push("/provider/quick-replies")}
+              >
+                <MaterialCommunityIcons
+                  name="message-reply-text-outline"
+                  size={20}
+                  color={COLORS.accent}
+                />
+                <View style={styles.quickToolTextWrap}>
+                  <Text style={styles.quickToolTitle}>Quick replies</Text>
+                  <Text style={styles.quickToolSubtitle}>
+                    Tap-to-insert responses in chat
+                  </Text>
+                </View>
+                <MaterialCommunityIcons
+                  name="chevron-right"
+                  size={22}
+                  color={COLORS.textMuted}
+                />
+              </Pressable>
+
+              <View style={styles.quickToolDivider} />
+
+              <Pressable
+                style={styles.quickToolRow}
+                onPress={() => router.push("/provider/availability")}
+              >
+                <MaterialCommunityIcons
+                  name="calendar-clock"
+                  size={20}
+                  color={COLORS.accent}
+                />
+                <View style={styles.quickToolTextWrap}>
+                  <Text style={styles.quickToolTitle}>Availability</Text>
+                  <Text style={styles.quickToolSubtitle}>
+                    Set times you can take appointments
+                  </Text>
+                </View>
+                <MaterialCommunityIcons
+                  name="chevron-right"
+                  size={22}
+                  color={COLORS.textMuted}
+                />
+              </Pressable>
+            </View>
+          </View>
+        ) : null}
+
+        {/* Recent Reviews */}
+        <View style={styles.section}>
+          <View style={styles.sectionHeaderRow}>
+            <Text style={styles.sectionTitle}>Recent Reviews</Text>
+            {profile?.id ? (
+              <Pressable onPress={() => router.push(`/provider/reviews?providerId=${profile.id}`)}>
+                <Text style={styles.sectionLink}>See all</Text>
+              </Pressable>
+            ) : null}
+          </View>
+
+          <View style={styles.card}>
+            {reviewsLoading ? (
+              <View style={styles.inlineCenterRow}>
+                <ActivityIndicator color={COLORS.accent} />
+                <Text style={styles.inlineMuted}>Loading reviews…</Text>
+              </View>
+            ) : reviewsError ? (
+              <Text style={styles.inlineMuted}>{reviewsError}</Text>
+            ) : reviewsSummary?.reviews?.length ? (
+              <View style={{ gap: 12 }}>
+                {reviewsSummary.reviews.slice(0, 10).map((r) => (
+                  <View key={String(r.id)} style={styles.reviewItem}>
+                    <View style={styles.reviewHeaderRow}>
+                      <Text style={styles.reviewerName} numberOfLines={1}>
+                        {r.reviewer?.name ?? "User"}
+                      </Text>
+                      <View style={styles.reviewStars}>
+                        {[...Array(5)].map((_, i) => (
+                          <MaterialCommunityIcons
+                            key={i}
+                            name={i < r.rating ? "star" : "star-outline"}
+                            size={14}
+                            color={i < r.rating ? COLORS.warning : COLORS.textMuted}
+                          />
+                        ))}
+                      </View>
+                    </View>
+
+                    {r.text ? (
+                      <Text style={styles.reviewText} numberOfLines={4}>
+                        {r.text}
+                      </Text>
+                    ) : null}
+
+                    <Text style={styles.reviewMeta}>
+                      {new Date(r.createdAt).toLocaleDateString()}
+                    </Text>
+                  </View>
+                ))}
+              </View>
+            ) : (
+              <Text style={styles.inlineMuted}>No reviews yet.</Text>
+            )}
           </View>
         </View>
 
@@ -488,7 +665,7 @@ export default function ProviderProfileScreen(props?: ProviderProfileScreenProps
               </View>
             ) : (
               <Text style={styles.noCategoriesText}>
-                No categories selected. Tap "Edit" to add services.
+                No categories selected. Tap “Edit” to add services.
               </Text>
             )}
           </View>
@@ -669,6 +846,56 @@ const styles = StyleSheet.create({
     fontWeight: "700",
     color: COLORS.text,
   },
+  sectionHeaderRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  sectionLink: {
+    color: COLORS.accent,
+    fontWeight: "700",
+  },
+
+  inlineCenterRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+  },
+  inlineMuted: {
+    color: COLORS.textMuted,
+  },
+
+  reviewItem: {
+    paddingBottom: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: COLORS.border,
+  },
+  reviewHeaderRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 12,
+  },
+  reviewerName: {
+    color: COLORS.text,
+    fontWeight: "700",
+    flex: 1,
+  },
+  reviewStars: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 2,
+  },
+  reviewText: {
+    color: COLORS.text,
+    marginTop: 8,
+    lineHeight: 18,
+  },
+  reviewMeta: {
+    color: COLORS.textMuted,
+    marginTop: 8,
+    fontSize: 12,
+  },
 
   profileCard: {
     backgroundColor: COLORS.card,
@@ -699,8 +926,36 @@ const styles = StyleSheet.create({
     flex: 1,
     gap: 6,
   },
+  profileNameRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    flexWrap: "wrap",
+  },
   profileName: {
     fontSize: 18,
+    fontWeight: "700",
+    color: COLORS.text,
+  },
+  verificationPill: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 999,
+    borderWidth: 1,
+  },
+  verificationPillVerified: {
+    backgroundColor: "rgba(16, 185, 129, 0.14)",
+    borderColor: "rgba(16, 185, 129, 0.35)",
+  },
+  verificationPillPending: {
+    backgroundColor: "rgba(245, 158, 11, 0.14)",
+    borderColor: "rgba(245, 158, 11, 0.35)",
+  },
+  verificationPillText: {
+    fontSize: 12,
     fontWeight: "700",
     color: COLORS.text,
   },
@@ -721,6 +976,30 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: COLORS.border,
     gap: 12,
+  },
+  quickToolRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+    paddingVertical: 8,
+  },
+  quickToolTextWrap: {
+    flex: 1,
+    gap: 2,
+  },
+  quickToolTitle: {
+    color: COLORS.text,
+    fontWeight: "800",
+    fontSize: 14,
+  },
+  quickToolSubtitle: {
+    color: COLORS.textMuted,
+    fontWeight: "600",
+    fontSize: 12,
+  },
+  quickToolDivider: {
+    height: 1,
+    backgroundColor: COLORS.border,
   },
   infoRow: {
     flexDirection: "row",

@@ -5,6 +5,7 @@ import {
   Alert,
   FlatList,
   Linking,
+  ScrollView,
   Pressable,
   StyleSheet,
   Text,
@@ -20,17 +21,8 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { useLocalSearchParams, router, useFocusEffect } from "expo-router";
 import { api } from "../../../src/lib/apiClient";
 import * as FileSystem from "expo-file-system/legacy";
+import * as ImagePicker from "expo-image-picker";
 import { StatusBar } from "expo-status-bar";
-
-function getImagePicker(): any | null {
-  try {
-    const mod = require("expo-image-picker");
-    if (!mod?.launchImageLibraryAsync) return null;
-    return mod;
-  } catch {
-    return null;
-  }
-}
 
 type Sender = { id: number; name: string | null; role: string };
 
@@ -140,6 +132,7 @@ export default function JobMessagesThreadScreen() {
   const numericJobId = useMemo(() => Number(jobId), [jobId]);
 
   const [myUserId, setMyUserId] = useState<number | null>(null);
+  const [myRole, setMyRole] = useState<string | null>(null);
   const tempIdRef = useRef(-1);
 
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -173,15 +166,6 @@ export default function JobMessagesThreadScreen() {
 
   const pickAttachment = useCallback(async () => {
     try {
-      const ImagePicker = getImagePicker();
-      if (!ImagePicker) {
-        Alert.alert(
-          "Not available",
-          "Media picking isn't available in this build. If you're using a development build, rebuild it after adding expo-image-picker. Expo Go should include it by default."
-        );
-        return;
-      }
-
       const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
       if (!perm.granted) {
         Alert.alert(
@@ -245,13 +229,48 @@ export default function JobMessagesThreadScreen() {
   // -------------------------
   // 1) LOAD ME
   // -------------------------
-  type MeResponse = { id: number };
-  const loadMe = useCallback(async () => {
+  type MeResponse = { id: number; role: string };
+  const loadMe = useCallback(async (): Promise<MeResponse | null> => {
     try {
       const me = await api.get<MeResponse>("/me");
       setMyUserId(me.id);
+      setMyRole(me.role);
+      return me;
     } catch {
       setMyUserId(null);
+      setMyRole(null);
+      return null;
+    }
+  }, []);
+
+  // -------------------------
+  // 1b) QUICK REPLIES (provider)
+  // -------------------------
+  type QuickReply = {
+    id: number;
+    title: string;
+    body: string;
+    tags: string[];
+    createdAt: string;
+    updatedAt: string;
+  };
+  type QuickRepliesResponse = { items: QuickReply[] };
+
+  const [quickReplies, setQuickReplies] = useState<QuickReply[]>([]);
+  const [quickRepliesLoading, setQuickRepliesLoading] = useState(false);
+  const [quickRepliesError, setQuickRepliesError] = useState<string | null>(null);
+
+  const fetchQuickReplies = useCallback(async () => {
+    setQuickRepliesLoading(true);
+    setQuickRepliesError(null);
+    try {
+      const data = await api.get<QuickRepliesResponse>("/provider/quick-replies");
+      setQuickReplies(data.items ?? []);
+    } catch (e: any) {
+      setQuickRepliesError(e?.message ?? "Failed to load quick replies");
+      setQuickReplies([]);
+    } finally {
+      setQuickRepliesLoading(false);
     }
   }, []);
 
@@ -282,9 +301,10 @@ export default function JobMessagesThreadScreen() {
   type ReadStatesResponse = { states: { userId: number; lastReadAt: string }[] };
   const [othersLastReadAt, setOthersLastReadAt] = useState<Date | null>(null);
 
-  const fetchReadStates = useCallback(async () => {
+  const fetchReadStates = useCallback(async (userIdOverride?: number) => {
     if (!Number.isFinite(numericJobId)) return;
-    if (!myUserId) return;
+    const uid = userIdOverride ?? myUserId;
+    if (!uid) return;
 
     try {
       const data = await api.get<ReadStatesResponse>(
@@ -292,7 +312,7 @@ export default function JobMessagesThreadScreen() {
       );
 
       const otherDates = (data.states ?? [])
-        .filter((s) => s.userId !== myUserId)
+        .filter((s) => s.userId !== uid)
         .map((s) => new Date(s.lastReadAt))
         .filter((d) => !Number.isNaN(d.getTime()));
 
@@ -488,8 +508,13 @@ export default function JobMessagesThreadScreen() {
   useFocusEffect(
     useCallback(() => {
       (async () => {
-        await loadMe();
-        await fetchReadStates();
+        const me = await loadMe();
+        await fetchReadStates(me?.id);
+        if (me?.role === "PROVIDER") {
+          await fetchQuickReplies();
+        } else {
+          setQuickReplies([]);
+        }
         await fetchPage("initial");
         await markRead();
         startPolling();
@@ -498,7 +523,7 @@ export default function JobMessagesThreadScreen() {
       return () => {
         stopPolling();
       };
-    }, [loadMe, fetchReadStates, fetchPage, markRead, startPolling, stopPolling])
+    }, [loadMe, fetchReadStates, fetchQuickReplies, fetchPage, markRead, startPolling, stopPolling])
   );
 
   // -------------------------
@@ -633,7 +658,15 @@ export default function JobMessagesThreadScreen() {
           )
         );
 
-        setError(e?.message ?? "Failed to send.");
+        if (e?.status === 403 && e?.details?.code === "RESTRICTED") {
+          const msg =
+            e?.message ??
+            "Your account is temporarily restricted from sending messages. Please try again later.";
+          Alert.alert("Temporarily restricted", msg);
+          setError(msg);
+        } else {
+          setError(e?.message ?? "Failed to send.");
+        }
       }
     },
     [
@@ -929,6 +962,48 @@ export default function JobMessagesThreadScreen() {
                   </View>
                 ) : null}
 
+                {myRole === "PROVIDER" ? (
+                  <View style={styles.quickRepliesWrap}>
+                    <View style={styles.quickRepliesHeader}>
+                      <Text style={styles.quickRepliesTitle}>Quick replies</Text>
+                      <Pressable
+                        onPress={() => router.push("/provider/quick-replies")}
+                        hitSlop={8}
+                      >
+                        <Text style={styles.quickRepliesManage}>Manage</Text>
+                      </Pressable>
+                    </View>
+
+                    {quickRepliesLoading ? (
+                      <Text style={styles.quickRepliesMuted}>Loading…</Text>
+                    ) : quickRepliesError ? (
+                      <Text style={[styles.quickRepliesMuted, { color: "#f59e0b" }]}>
+                        {quickRepliesError}
+                      </Text>
+                    ) : quickReplies.length === 0 ? (
+                      <Text style={styles.quickRepliesMuted}>No quick replies yet.</Text>
+                    ) : (
+                      <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+                        {quickReplies.map((qr) => (
+                          <Pressable
+                            key={qr.id}
+                            style={styles.quickReplyChip}
+                            onPress={() =>
+                              setText((prev) =>
+                                prev.trim().length
+                                  ? `${prev.trim()}\n${qr.body}`
+                                  : qr.body
+                              )
+                            }
+                          >
+                            <Text style={styles.quickReplyChipText}>{qr.title}</Text>
+                          </Pressable>
+                        ))}
+                      </ScrollView>
+                    )}
+                  </View>
+                ) : null}
+
                 <View style={styles.composerRow}>
                   <Pressable
                     style={[styles.attachBtn, sending && styles.btnDisabled]}
@@ -1079,6 +1154,46 @@ const styles = StyleSheet.create({
     borderTopWidth: 1,
     borderTopColor: "#0f172a",
     backgroundColor: "#020617",
+  },
+  quickRepliesWrap: {
+    marginBottom: 10,
+    backgroundColor: "#020617",
+  },
+  quickRepliesHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 8,
+  },
+  quickRepliesTitle: {
+    color: "#94a3b8",
+    fontSize: 12,
+    fontWeight: "900",
+  },
+  quickRepliesManage: {
+    color: "#38bdf8",
+    fontSize: 12,
+    fontWeight: "900",
+  },
+  quickRepliesMuted: {
+    color: "#94a3b8",
+    fontSize: 12,
+    fontWeight: "700",
+    marginBottom: 6,
+  },
+  quickReplyChip: {
+    backgroundColor: "#0f172a",
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderWidth: 1,
+    borderColor: "#1e293b",
+    marginRight: 8,
+  },
+  quickReplyChipText: {
+    color: "#e2e8f0",
+    fontSize: 12,
+    fontWeight: "900",
   },
   composerRow: {
     flexDirection: "row",

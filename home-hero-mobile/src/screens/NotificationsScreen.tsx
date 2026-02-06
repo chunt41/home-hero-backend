@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect } from "react";
+import React, { useCallback } from "react";
 import {
   StyleSheet,
   Text,
@@ -8,13 +8,12 @@ import {
   ActivityIndicator,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { useFocusEffect, useRouter } from "expo-router";
+import { useFocusEffect } from "expo-router";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { useNotifications } from "../hooks/useNotifications";
 import { formatDistanceToNow } from "date-fns";
 
 export default function NotificationsScreen() {
-  const router = useRouter();
   const {
     items,
     loading,
@@ -181,7 +180,7 @@ export default function NotificationsScreen() {
               />
               <Text style={styles.emptyText}>No notifications yet</Text>
               <Text style={styles.emptySubText}>
-                We'll notify you when something happens
+                We’ll notify you when something happens
               </Text>
             </View>
           }

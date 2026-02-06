@@ -11,7 +11,7 @@ import {
   View,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { router, useFocusEffect } from "expo-router";
+import { router } from "expo-router";
 import { api } from "../../src/lib/apiClient";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 
@@ -26,7 +26,9 @@ type ProviderItem = {
   rating: number | null;
   reviewCount: number;
   isFavorited: boolean;
-  categories: Array<{ id: number; name: string; slug: string }>;
+  verificationStatus?: "NONE" | "PENDING" | "VERIFIED" | "REJECTED";
+  isVerified?: boolean;
+  categories: { id: number; name: string; slug: string }[];
 };
 
 type ProvidersResponse = {
@@ -59,11 +61,6 @@ export default function ProviderDiscoveryScreen() {
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Fetch categories on mount
-  useEffect(() => {
-    fetchCategories();
-  }, []);
-
   const fetchCategories = useCallback(async () => {
     try {
       const res = await api.get<Category[]>("/categories");
@@ -72,6 +69,11 @@ export default function ProviderDiscoveryScreen() {
       console.error("Failed to fetch categories:", err);
     }
   }, []);
+
+  // Fetch categories on mount
+  useEffect(() => {
+    fetchCategories();
+  }, [fetchCategories]);
 
   const fetchPage = useCallback(
     async (pageNum: number, mode: "initial" | "refresh" | "more") => {
@@ -161,7 +163,7 @@ export default function ProviderDiscoveryScreen() {
   // First load
   useEffect(() => {
     fetchPage(1, "initial");
-  }, []);
+  }, [fetchPage]);
 
   const onRefresh = useCallback(() => {
     setPage(1);
@@ -198,9 +200,21 @@ export default function ProviderDiscoveryScreen() {
             </Text>
           </View>
           <View style={styles.details}>
-            <Text style={styles.name} numberOfLines={1}>
-              {item.name}
-            </Text>
+            <View style={styles.nameRow}>
+              <Text style={styles.name} numberOfLines={1}>
+                {item.name}
+              </Text>
+              {item.isVerified ? (
+                <View style={styles.verifiedBadge}>
+                  <MaterialCommunityIcons
+                    name="check-decagram"
+                    size={14}
+                    color="#34d399"
+                  />
+                  <Text style={styles.verifiedText}>Verified</Text>
+                </View>
+              ) : null}
+            </View>
             {item.location && (
               <Text style={styles.location} numberOfLines={1}>
                 📍 {item.location}
@@ -550,9 +564,33 @@ const styles = StyleSheet.create({
     flex: 1,
   },
 
+  nameRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+
   name: {
     color: "#e2e8f0",
     fontSize: 14,
+    fontWeight: "700",
+  },
+
+  verifiedBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    borderRadius: 999,
+    backgroundColor: "rgba(16, 185, 129, 0.15)",
+    borderWidth: 1,
+    borderColor: "rgba(16, 185, 129, 0.35)",
+  },
+
+  verifiedText: {
+    color: "#a7f3d0",
+    fontSize: 12,
     fontWeight: "700",
   },
 

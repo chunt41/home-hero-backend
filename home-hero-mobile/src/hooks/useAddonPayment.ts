@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useCallback, useState } from "react";
 import { api } from "../lib/apiClient";
 
 type StripeHooks = {
@@ -15,39 +15,41 @@ try {
   useStripeHook = stripeModule.useStripe;
   stripeAvailable = true;
 } catch {
-  console.log("Stripe not available");
+  // Stripe not available (e.g. web without native module)
 }
 
 export type PaymentStatus = "idle" | "processing" | "success" | "error";
 
-export function useStripePayment() {
+export type AddonPurchase =
+  | { type: "EXTRA_LEADS"; quantity: number }
+  | { type: "VERIFICATION_BADGE" }
+  | { type: "FEATURED_ZIP_CODES"; zipCodes: string[] };
+
+export function useAddonPayment() {
   const { initPaymentSheet, presentPaymentSheet } = useStripeHook();
+
   const [status, setStatus] = useState<PaymentStatus>("idle");
   const [error, setError] = useState<string | null>(null);
 
-  const initiatePayment = useCallback(
-    async (tier: "BASIC" | "PRO") => {
+  const initiateAddonPayment = useCallback(
+    async (addon: AddonPurchase) => {
       if (!stripeAvailable || !initPaymentSheet || !presentPaymentSheet) {
         setError("Payment processing is not available");
         setStatus("error");
-        return { success: false, subscription: null };
+        return { success: false as const };
       }
 
       setStatus("processing");
       setError(null);
 
       try {
-        // Step 1: Create payment intent on backend
         const response = await api.post<{
           clientSecret: string;
           paymentIntentId: string;
-        }>("/payments/create-intent", {
-          tier,
-        });
+        }>("/provider/addons/purchase", addon);
 
         const { clientSecret } = response;
 
-        // Step 2: Initialize payment sheet
         const { error: initError } = await initPaymentSheet({
           paymentIntentClientSecret: clientSecret,
           merchantDisplayName: "Home Hero",
@@ -60,19 +62,17 @@ export function useStripePayment() {
           throw new Error(initError.message || "Failed to initialize payment");
         }
 
-        // Step 3: Present payment sheet to user
         const { error: presentError } = await presentPaymentSheet();
 
         if (presentError?.code === "Cancelled") {
           setStatus("idle");
-          return { success: false, cancelled: true };
+          return { success: false as const, cancelled: true as const };
         }
 
         if (presentError) {
           throw new Error(presentError.message || "Payment failed");
         }
 
-        // Step 4: Confirm payment on backend
         const confirmResponse = await api.post<{
           success: boolean;
           subscription: any;
@@ -81,12 +81,12 @@ export function useStripePayment() {
         });
 
         setStatus("success");
-        return { success: true, subscription: confirmResponse.subscription };
+        return { success: true as const, subscription: confirmResponse.subscription };
       } catch (err: any) {
         const message = err?.message || "Payment failed. Please try again.";
         setError(message);
         setStatus("error");
-        return { success: false, error: message };
+        return { success: false as const, error: message };
       }
     },
     [initPaymentSheet, presentPaymentSheet]
@@ -98,7 +98,7 @@ export function useStripePayment() {
   }, []);
 
   return {
-    initiatePayment,
+    initiateAddonPayment,
     status,
     error,
     reset,

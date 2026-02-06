@@ -20,6 +20,8 @@ type ConsumerJobItem = {
   title: string;
   status: string; // "OPEN" | "IN_PROGRESS" | "COMPLETED" | "CANCELLED" | ...
   location: string | null;
+  category?: string | null;
+  urgency?: string | null;
   createdAt: string;
   bidCount: number;
 };
@@ -45,21 +47,38 @@ function normalizeStatus(s: string | null | undefined) {
   return (s ?? "").toUpperCase().trim();
 }
 
+function normalizeUrgency(s: string | null | undefined) {
+  return (s ?? "").toUpperCase().trim();
+}
+
+function urgencyLabel(u?: string | null) {
+  const v = normalizeUrgency(u);
+  if (v === "URGENT") return "Urgent";
+  if (v === "SOON") return "Soon";
+  if (v === "NORMAL") return "Normal";
+  return u ?? null;
+}
+
+function urgencyPillStyle(u?: string | null) {
+  const v = normalizeUrgency(u);
+  if (v === "URGENT") return styles.pillUrgent;
+  if (v === "SOON") return styles.pillSoon;
+  if (v === "NORMAL") return styles.pillNormal;
+  return styles.pillNormal;
+}
+
 export default function ConsumerJobsScreen() {
   const { user } = useAuth();
   const { showBannerAds, showInterstitialAds, inlineBannerEvery, showFooterBanner } =
     useAdConfig();
   const { showAd } = useInterstitialAd(showInterstitialAds);
 
-  // Only consumers should access this screen
-  if (user?.role !== "CONSUMER") {
-    return <Redirect href="/" />;
-  }
+  const isConsumer = user?.role === "CONSUMER";
+
   const [items, setItems] = useState<ConsumerJobItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [jobIndex, setJobIndex] = useState(0);
 
   const [filter, setFilter] = useState<FilterKey>("ACTIVE");
 
@@ -159,8 +178,15 @@ export default function ConsumerJobsScreen() {
               {item.title}
             </Text>
 
-            <View style={styles.badge}>
-              <Text style={styles.badgeText}>{normalizeStatus(item.status)}</Text>
+            <View style={styles.topBadgesRow}>
+              {item.urgency ? (
+                <View style={[styles.pill, urgencyPillStyle(item.urgency)]}>
+                  <Text style={styles.pillText}>{urgencyLabel(item.urgency)}</Text>
+                </View>
+              ) : null}
+              <View style={styles.badge}>
+                <Text style={styles.badgeText}>{normalizeStatus(item.status)}</Text>
+              </View>
             </View>
           </View>
 
@@ -168,6 +194,16 @@ export default function ConsumerJobsScreen() {
             <Text style={styles.meta} numberOfLines={1}>
               📍 {item.location}
             </Text>
+          ) : null}
+
+          {item.category ? (
+            <View style={styles.pillsRow}>
+              <View style={[styles.pill, styles.pillCategory]}>
+                <Text style={styles.pillText} numberOfLines={1}>
+                  {item.category}
+                </Text>
+              </View>
+            </View>
           ) : null}
 
           <Text style={styles.meta}>🧾 {item.bidCount} bids</Text>
@@ -178,7 +214,9 @@ export default function ConsumerJobsScreen() {
             style={styles.viewBidsButton}
             onPress={() => router.push(`/consumer/job-bids?jobId=${item.id}`)}
           >
-            <Text style={styles.viewBidsButtonText}>View {item.bidCount} Bid{item.bidCount !== 1 ? 's' : ''}</Text>
+            <Text style={styles.viewBidsButtonText}>
+              View {item.bidCount} Bid{item.bidCount !== 1 ? "s" : ""}
+            </Text>
           </Pressable>
         )}
 
@@ -194,6 +232,11 @@ export default function ConsumerJobsScreen() {
       </View>
     );
   };
+
+  // Only consumers should access this screen.
+  if (!isConsumer) {
+    return <Redirect href="/" />;
+  }
 
   return (
     <SafeAreaView style={styles.container} edges={["top"]}>
@@ -351,8 +394,18 @@ const styles = StyleSheet.create({
   topRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 10 },
   title: { color: "#fff", fontSize: 16, fontWeight: "900", flex: 1 },
 
+  topBadgesRow: { flexDirection: "row", alignItems: "center", gap: 8, flexShrink: 0 },
+
   badge: { backgroundColor: "#1e293b", paddingVertical: 4, paddingHorizontal: 10, borderRadius: 999 },
   badgeText: { color: "#cbd5e1", fontSize: 12, fontWeight: "800" },
+
+  pillsRow: { flexDirection: "row", gap: 8, marginTop: 6, marginBottom: 4, flexWrap: "wrap" },
+  pill: { paddingVertical: 4, paddingHorizontal: 10, borderRadius: 999 },
+  pillText: { color: "#fff", fontSize: 12, fontWeight: "800" },
+  pillCategory: { backgroundColor: "#1d4ed8" },
+  pillUrgent: { backgroundColor: "#dc2626" },
+  pillSoon: { backgroundColor: "#f59e0b" },
+  pillNormal: { backgroundColor: "#334155" },
 
   meta: { color: "#cbd5e1", marginTop: 8 },
 

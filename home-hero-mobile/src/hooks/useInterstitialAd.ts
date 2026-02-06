@@ -26,6 +26,7 @@ function ensureGoogleMobileAdsLoaded(): boolean {
   if (!hasGoogleMobileAdsNativeModule()) return false;
 
   try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
     const gma = require("react-native-google-mobile-ads");
     InterstitialAd = gma.InterstitialAd;
     AdEventType = gma.AdEventType;
@@ -102,7 +103,7 @@ export function useInterstitialAd(enabled: boolean = true) {
       });
 
       // Subscribe to ad events
-      const unsubscribe = ad.addAdEventListener(AdEventType.LOADED, () => {
+      ad.addAdEventListener(AdEventType.LOADED, () => {
         console.log("Interstitial ad loaded");
         adRef.current = ad;
         isLoadingRef.current = false;

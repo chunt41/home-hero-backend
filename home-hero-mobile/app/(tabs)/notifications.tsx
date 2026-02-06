@@ -165,7 +165,7 @@ export default function NotificationsScreen() {
               />
               <Text style={styles.emptyText}>No notifications yet</Text>
               <Text style={styles.emptySubText}>
-                We'll notify you when something happens
+                We’ll notify you when something happens
               </Text>
             </View>
           }

@@ -4,16 +4,16 @@ import { api } from "../lib/apiClient";
 export type Review = {
   id: number;
   rating: number;
-  comment: string | null;
+  text: string | null;
   createdAt: string;
   job: {
     id: number;
     title: string;
   };
-  consumer: {
+  reviewer: {
     id: number;
     name: string;
-  };
+  } | null;
 };
 
 export type ReviewsSummary = {
@@ -29,7 +29,7 @@ export type ReviewsSummary = {
   reviews: Review[];
 };
 
-export function useProviderReviews(providerId: number) {
+export function useProviderReviews(providerId: number, options?: { limit?: number }) {
   const [summary, setSummary] = useState<ReviewsSummary | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -39,14 +39,16 @@ export function useProviderReviews(providerId: number) {
     setError(null);
 
     try {
-      const data = await api.get<ReviewsSummary>(`/providers/${providerId}/reviews`);
+      const limit = options?.limit;
+      const qs = limit ? `?limit=${encodeURIComponent(String(limit))}` : "";
+      const data = await api.get<ReviewsSummary>(`/providers/${providerId}/reviews${qs}`);
       setSummary(data);
     } catch (err: any) {
       setError(err?.message || "Failed to load reviews");
     } finally {
       setLoading(false);
     }
-  }, [providerId]);
+  }, [providerId, options?.limit]);
 
   useEffect(() => {
     if (providerId) {

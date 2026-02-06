@@ -36,6 +36,7 @@ export default function AdminDashboardScreen() {
 
   const quickLinks = [
     { label: "Review Flagged Jobs", icon: "alert", screen: "/admin/FlaggedJobs" },
+    { label: "Provider Verifications", icon: "account-alert", screen: "/admin/AdminProviderVerifications" },
     { label: "Reports / Moderation", icon: "flag", screen: "/admin/AdminReports" },
     { label: "User Management", icon: "account-search", screen: "/admin/UserManagement" },
     { label: "Platform Analytics", icon: "chart-bar", screen: "/admin/AdminAnalytics" },

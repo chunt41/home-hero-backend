@@ -27,6 +27,8 @@ type JobBrowseItem = {
   budgetMax: number | null;
   status: "OPEN" | string;
   location: string | null;
+  category?: string | null;
+  urgency?: string | null;
   createdAt: string;
   bidCount: number;
   isFavorited: boolean;
@@ -57,16 +59,30 @@ function buildQuery(params: Record<string, string | number | null | undefined>) 
   return out ? `?${out}` : "";
 }
 
+function urgencyLabel(u?: string | null) {
+  const v = (u ?? "").toUpperCase().trim();
+  if (v === "URGENT") return "Urgent";
+  if (v === "SOON") return "Soon";
+  if (v === "NORMAL") return "Normal";
+  return u ?? null;
+}
+
+function urgencyPillStyle(u?: string | null) {
+  const v = (u ?? "").toUpperCase().trim();
+  if (v === "URGENT") return styles.pillUrgent;
+  if (v === "SOON") return styles.pillSoon;
+  if (v === "NORMAL") return styles.pillNormal;
+  return styles.pillNormal;
+}
+
 export default function JobsScreen() {
   const { user } = useAuth();
   const { showBannerAds, showInterstitialAds, inlineBannerEvery, showFooterBanner } =
     useAdConfig();
   const { showAd } = useInterstitialAd(showInterstitialAds);
 
-  // Only providers should access this screen
-  if (user?.role !== "PROVIDER") {
-    return <Redirect href="/" />;
-  }
+  const isProvider = user?.role === "PROVIDER";
+
   const [q, setQ] = useState("");
   const [location, setLocation] = useState("");
   const [minBudget, setMinBudget] = useState("");
@@ -87,11 +103,6 @@ export default function JobsScreen() {
   const [loadingInitial, setLoadingInitial] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
-  
-  // Fetch categories on mount
-  useEffect(() => {
-    fetchCategories();
-  }, []);
 
   const fetchCategories = useCallback(async () => {
     try {
@@ -101,6 +112,11 @@ export default function JobsScreen() {
       console.error("Failed to fetch categories:", err);
     }
   }, []);
+
+  // Fetch categories on mount
+  useEffect(() => {
+    fetchCategories();
+  }, [fetchCategories]);
 
   const toggleFavorite = useCallback(async (jobId: number) => {
     // optimistic update
@@ -118,7 +134,7 @@ export default function JobsScreen() {
         } else {
         await api.delete(`/jobs/${jobId}/favorite`);
         }
-    } catch (e) {
+    } catch {
         // revert if request fails
         setItems((prev) =>
         prev.map((j) => (j.id === jobId ? { ...j, isFavorited: !j.isFavorited } : j))
@@ -261,6 +277,25 @@ export default function JobsScreen() {
             </Text>
           ) : null}
 
+          {item.category || item.urgency ? (
+            <View style={styles.pillsRow}>
+              {item.category ? (
+                <View style={[styles.pill, styles.pillCategory]}>
+                  <Text style={styles.pillText} numberOfLines={1}>
+                    {item.category}
+                  </Text>
+                </View>
+              ) : null}
+              {item.urgency ? (
+                <View style={[styles.pill, urgencyPillStyle(item.urgency)]}>
+                  <Text style={styles.pillText} numberOfLines={1}>
+                    {urgencyLabel(item.urgency)}
+                  </Text>
+                </View>
+              ) : null}
+            </View>
+          ) : null}
+
           <Text style={styles.desc} numberOfLines={2}>
             {item.description ?? "No description provided."}
           </Text>
@@ -291,6 +326,11 @@ export default function JobsScreen() {
       </View>
     );
   };
+
+  // Only providers should access this screen.
+  if (!isProvider) {
+    return <Redirect href="/" />;
+  }
 
   return (
     <SafeAreaView style={styles.container} edges={["top"]}>
@@ -520,6 +560,36 @@ const styles = StyleSheet.create({
     borderRadius: 10,
     justifyContent: "center",
     alignItems: "center",
+  },
+
+  pillsRow: {
+    flexDirection: "row",
+    gap: 8,
+    marginTop: 6,
+    marginBottom: 4,
+    flexWrap: "wrap",
+  },
+  pill: {
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 999,
+  },
+  pillText: {
+    color: "#fff",
+    fontSize: 12,
+    fontWeight: "700",
+  },
+  pillCategory: {
+    backgroundColor: "#1d4ed8",
+  },
+  pillUrgent: {
+    backgroundColor: "#dc2626",
+  },
+  pillSoon: {
+    backgroundColor: "#f59e0b",
+  },
+  pillNormal: {
+    backgroundColor: "#334155",
   },
   filterBadgeText: {
     color: "#fff",
