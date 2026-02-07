@@ -1,4 +1,5 @@
 import * as SecureStore from "expo-secure-store";
+import { Platform } from "react-native";
 import { API_BASE_URL } from "../config";
 import { getAppAttestationToken } from "./attestation";
 
@@ -89,6 +90,12 @@ function buildUrl(path: string, query?: Record<string, unknown>): string {
   return url.toString();
 }
 
+function appPlatformHeader(): "android" | "ios" | "unknown" {
+  if (Platform.OS === "android") return "android";
+  if (Platform.OS === "ios") return "ios";
+  return "unknown";
+}
+
 async function request<T>(
   method: HttpMethod,
   path: string,
@@ -108,8 +115,9 @@ async function request<T>(
 
   const headers: Record<string, string> = {
     Accept: "application/json",
-    "X-App-Attestation": attestationToken,
+    "X-App-Platform": appPlatformHeader(),
   };
+  if (attestationToken) headers["X-App-Attestation"] = attestationToken;
   if (body !== undefined) headers["Content-Type"] = "application/json";
   if (token) headers.Authorization = `Bearer ${token}`;
 
@@ -173,9 +181,10 @@ async function requestForm<T>(
 
   const headers: Record<string, string> = {
     Accept: "application/json",
-    "X-App-Attestation": attestationToken,
-    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    "X-App-Platform": appPlatformHeader(),
   };
+  if (attestationToken) headers["X-App-Attestation"] = attestationToken;
+  if (token) headers.Authorization = `Bearer ${token}`;
 
   const url = buildUrl(path, query);
 

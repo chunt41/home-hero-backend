@@ -45,7 +45,7 @@ type BidItem = {
 type ConsumerJobDetail = {
   id: number;
   title: string;
-  status: "OPEN" | "IN_PROGRESS" | "COMPLETED" | "CANCELLED" | string;
+  status: "OPEN" | "AWARDED" | "IN_PROGRESS" | "COMPLETED" | "CANCELLED" | string;
   bidCount: number;
 };
 
@@ -137,6 +137,7 @@ export default function ConsumerJobBidsScreen() {
 
   const lockBannerText = useMemo(() => {
     if (!job) return "";
+    if (job.status === "AWARDED") return "Job is AWARDED — awarding & counter edits are locked.";
     if (job.status === "IN_PROGRESS") return "Job is IN_PROGRESS — awarding & counter edits are locked.";
     if (job.status === "COMPLETED") return "Job is COMPLETED — bids are read-only.";
     if (job.status === "CANCELLED") return "Job is CANCELLED — bids are read-only.";
@@ -160,7 +161,7 @@ export default function ConsumerJobBidsScreen() {
         setActingBidId(bidId);
         setError(null);
 
-        // awards + moves job status (your backend does: job -> IN_PROGRESS)
+        // awards + moves job status (job -> AWARDED)
         await api.post(`/jobs/${jobId}/bids/${bidId}/accept`, {});
 
         // refresh first so UI is correct
@@ -185,7 +186,7 @@ export default function ConsumerJobBidsScreen() {
 
       Alert.alert(
         "Accept this bid?",
-        "This will award the job to this provider and move the job to IN_PROGRESS.",
+        "This will award the job to this provider (job becomes AWARDED).",
         [
           { text: "Cancel", style: "cancel" },
           {
@@ -362,7 +363,7 @@ export default function ConsumerJobBidsScreen() {
       {showLockBanner ? (
         <View style={styles.lockBanner}>
           <Text style={styles.lockBannerText}>{lockBannerText}</Text>
-          {job?.status === "IN_PROGRESS" && acceptedBid ? (
+          {(job?.status === "AWARDED" || job?.status === "IN_PROGRESS") && acceptedBid ? (
             <Pressable style={styles.lockBannerBtn} onPress={onOpenMessages}>
               <Text style={styles.lockBannerBtnText}>Open Messages</Text>
             </Pressable>

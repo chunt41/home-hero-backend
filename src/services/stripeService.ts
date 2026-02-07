@@ -12,6 +12,27 @@ export const stripe = new Stripe(env.STRIPE_SECRET_KEY, {
   // Leaving this unset uses the SDK/account default and avoids runtime failures.
 });
 
+type StripeClientLike = {
+  paymentIntents: {
+    retrieve: (id: string) => Promise<any>;
+  };
+};
+
+type StripeServiceDeps = {
+  prisma?: any;
+  stripeClient?: StripeClientLike;
+  now?: Date;
+};
+
+function mapStripePaymentIntentStatus(status: string | null | undefined): "PENDING" | "SUCCEEDED" | "FAILED" {
+  const s = String(status ?? "");
+  if (s === "succeeded") return "SUCCEEDED";
+  if (s === "canceled" || s === "requires_payment_method" || s === "requires_action") return "PENDING";
+  if (s === "processing" || s === "requires_confirmation" || s === "requires_capture") return "PENDING";
+  if (s === "payment_failed") return "FAILED";
+  return "PENDING";
+}
+
 export async function createPaymentIntent(userId: number, tier: "BASIC" | "PRO") {
   const prices = {
     BASIC: 600, // $6.00 in cents
@@ -155,27 +176,77 @@ export async function createAddonPaymentIntent(userId: number, addon: ProviderAd
   };
 }
 
-export async function handlePaymentIntentSucceeded(
-  paymentIntentId: string
+/**
+ * Read-only-ish client confirmation hook.
+ *
+ * This may refresh the local StripePayment status, but MUST NOT grant entitlements or
+ * modify subscription tiers. Webhooks are the canonical source of truth for entitlements.
+ */
+export async function refreshPaymentIntentStatusReadOnly(args: {
+  paymentIntentId: string;
+  userId: number;
+  deps?: StripeServiceDeps;
+}): Promise<{ ok: true; status: string; paymentStatus: "PENDING" | "SUCCEEDED" | "FAILED" } | { ok: false; status: string; paymentStatus: "PENDING" | "SUCCEEDED" | "FAILED" }> {
+  const { paymentIntentId, userId } = args;
+  const prismaClient = args.deps?.prisma ?? prisma;
+  const stripeClient = args.deps?.stripeClient ?? (stripe as any as StripeClientLike);
+
+  const paymentIntent = await stripeClient.paymentIntents.retrieve(paymentIntentId);
+  const status = String(paymentIntent?.status ?? "unknown");
+  const paymentStatus = mapStripePaymentIntentStatus(status);
+
+  if (paymentIntent?.metadata?.userId && paymentIntent.metadata.userId !== String(userId)) {
+    throw new Error("Payment mismatch");
+  }
+
+  // Best-effort: update local payment status for UI. Do not modify subscription/entitlements.
+  try {
+    await prismaClient.stripePayment.updateMany({
+      where: { stripePaymentIntentId: paymentIntentId, userId },
+      data: { status: paymentStatus },
+    });
+  } catch {
+    // ignore (read-only-ish)
+  }
+
+  if (status !== "succeeded") {
+    return { ok: false, status, paymentStatus };
+  }
+
+  return { ok: true, status, paymentStatus };
+}
+
+/**
+ * Entitlement/subscription application path.
+ *
+ * Only Stripe webhooks should call this.
+ */
+export async function applyPaymentIntentSucceededFromWebhook(
+  paymentIntentId: string,
+  deps?: StripeServiceDeps
 ) {
-  const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
+  const prismaClient = deps?.prisma ?? prisma;
+  const stripeClient = deps?.stripeClient ?? (stripe as any as StripeClientLike);
+  const now = deps?.now ?? new Date();
+
+  const paymentIntent = await stripeClient.paymentIntents.retrieve(paymentIntentId);
 
   // ADDON_V2: new provider entitlement flow (AddonPurchase + ProviderEntitlement)
   if (paymentIntent.metadata?.kind === "ADDON_V2") {
     const result = await handleAddonV2PaymentIntentSucceeded({
       paymentIntent: paymentIntent as any,
-      deps: { prisma },
+      deps: { prisma: prismaClient },
     });
 
     // Keep return shape compatible with /payments/confirm (mobile expects subscription key).
-    const subscription = await prisma.subscription.findUnique({
+    const subscription = await prismaClient.subscription.findUnique({
       where: { userId: Number(paymentIntent.metadata?.providerId) },
     });
 
     return { subscription, addonResult: result };
   }
 
-  const stripePayment = await prisma.stripePayment.findUnique({
+  const stripePayment = await prismaClient.stripePayment.findUnique({
     where: { stripePaymentIntentId: paymentIntentId },
     include: { user: true, subscription: true },
   });
@@ -184,14 +255,21 @@ export async function handlePaymentIntentSucceeded(
     throw new Error("Payment record not found");
   }
 
-  const now = new Date();
   const monthKey = getUsageMonthKey(now);
 
-  const { subscription } = await prisma.$transaction(async (tx) => {
-    await tx.stripePayment.update({
-      where: { id: stripePayment.id },
+  const { subscription, idempotent } = await prismaClient.$transaction(async (tx: any) => {
+    // Idempotency guard: only the first success transition should apply entitlements.
+    const transitioned = await tx.stripePayment.updateMany({
+      where: { id: stripePayment.id, status: { not: "SUCCEEDED" } },
       data: { status: "SUCCEEDED" },
     });
+
+    if (transitioned.count === 0) {
+      const existing = await tx.subscription.findUnique({
+        where: { userId: stripePayment.userId },
+      });
+      return { subscription: existing, idempotent: true };
+    }
 
     if (stripePayment.kind === "SUBSCRIPTION") {
       const subscription = await tx.subscription.upsert({
@@ -209,7 +287,7 @@ export async function handlePaymentIntentSucceeded(
         },
       });
 
-      return { subscription };
+      return { subscription, idempotent: false };
     }
 
     // ADDON: apply entitlements/add-ons
@@ -253,20 +331,23 @@ export async function handlePaymentIntentSucceeded(
       throw new Error("Subscription not found after addon applied");
     }
 
-    return { subscription };
+    return { subscription, idempotent: false };
   });
 
-  return { subscription, stripePayment };
+  return { subscription, stripePayment, idempotent };
 }
 
-export async function handlePaymentIntentFailed(paymentIntentId: string) {
+export async function applyPaymentIntentFailedFromWebhook(paymentIntentId: string, deps?: StripeServiceDeps) {
+  const prismaClient = deps?.prisma ?? prisma;
+  const stripeClient = deps?.stripeClient ?? (stripe as any as StripeClientLike);
+
   // Best-effort: if this is an ADDON_V2 payment intent, mark it failed.
   try {
-    const pi = await stripe.paymentIntents.retrieve(paymentIntentId);
+    const pi = await stripeClient.paymentIntents.retrieve(paymentIntentId);
     if (pi.metadata?.kind === "ADDON_V2") {
       await handleAddonV2PaymentIntentFailed({
         paymentIntent: pi as any,
-        deps: { prisma },
+        deps: { prisma: prismaClient },
       });
       return;
     }
@@ -274,7 +355,7 @@ export async function handlePaymentIntentFailed(paymentIntentId: string) {
     // ignore
   }
 
-  const stripePayment = await prisma.stripePayment.findUnique({
+  const stripePayment = await prismaClient.stripePayment.findUnique({
     where: { stripePaymentIntentId: paymentIntentId },
   });
 
@@ -282,7 +363,7 @@ export async function handlePaymentIntentFailed(paymentIntentId: string) {
     throw new Error("Payment record not found");
   }
 
-  await prisma.stripePayment.update({
+  await prismaClient.stripePayment.update({
     where: { id: stripePayment.id },
     data: { status: "FAILED" },
   });

@@ -50,7 +50,7 @@ export function useConsumerJobBids(jobId: number) {
         // Prefer the unified award endpoint (falls back to legacy accept endpoint if needed).
         try {
           await api.post(`/jobs/${jobId}/award`, { bidId });
-        } catch (_e) {
+        } catch {
           await api.post(`/jobs/${jobId}/bids/${bidId}/accept`, {});
         }
         // Update local state

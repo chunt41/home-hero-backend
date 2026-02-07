@@ -98,6 +98,7 @@ export default function ProviderJobDetailScreen() {
   const [error, setError] = useState<string | null>(null);
 
   const [acting, setActing] = useState<"accept" | "decline" | null>(null);
+  const [startActing, setStartActing] = useState(false);
   const [completionActing, setCompletionActing] = useState<"mark" | "confirm" | null>(null);
 
   const fetchJob = useCallback(async () => {
@@ -184,6 +185,12 @@ export default function ProviderJobDetailScreen() {
     return myBid?.status === "ACCEPTED";
   }, [job, myBid?.status]);
 
+  const canStartJob = useMemo(() => {
+    if (!job) return false;
+    if (job.status !== "AWARDED") return false;
+    return myBid?.status === "ACCEPTED";
+  }, [job, myBid?.status]);
+
   const canMarkComplete = useMemo(() => {
     if (!job) return false;
     if (job.status !== "IN_PROGRESS") return false;
@@ -197,6 +204,38 @@ export default function ProviderJobDetailScreen() {
     if (job.completionPendingForUserId !== user.id) return false;
     return myBid?.status === "ACCEPTED";
   }, [job, myBid?.status, user?.id]);
+
+  const goToLeaveReview = useCallback(() => {
+    if (!Number.isFinite(jobId)) return;
+    router.push(`/leave-review?jobId=${jobId}`);
+  }, [jobId]);
+
+  const onStartJob = useCallback(() => {
+    if (!job) return;
+
+    Alert.alert(
+      "Start job?",
+      "This marks the job IN_PROGRESS.",
+      [
+        { text: "Not yet", style: "cancel" },
+        {
+          text: "Start",
+          onPress: async () => {
+            try {
+              setStartActing(true);
+              await api.post(`/jobs/${job.id}/start`, {});
+              await fetchJob();
+              Alert.alert("Started", "Job is now IN_PROGRESS.");
+            } catch (e: any) {
+              Alert.alert("Error", e?.message ?? "Could not start job.");
+            } finally {
+              setStartActing(false);
+            }
+          },
+        },
+      ]
+    );
+  }, [job, fetchJob]);
 
   const onMarkComplete = useCallback(() => {
     if (!job) return;
@@ -517,7 +556,7 @@ export default function ProviderJobDetailScreen() {
             </View>
           ) : null}
 
-          {myBid?.status === "ACCEPTED" && job.status === "IN_PROGRESS" ? (
+          {myBid?.status === "ACCEPTED" && (job.status === "AWARDED" || job.status === "IN_PROGRESS") ? (
             <View style={styles.card}>
               <View style={styles.cardHeaderRow}>
                 <Text style={styles.sectionTitle}>Scheduling</Text>
@@ -588,9 +627,19 @@ export default function ProviderJobDetailScreen() {
             </View>
           ) : null}
 
-          {(canMarkComplete || canConfirmComplete) ? (
+          {(canStartJob || canMarkComplete || canConfirmComplete || (job.status === "COMPLETED" && myBid?.status === "ACCEPTED")) ? (
             <View style={styles.card}>
               <Text style={styles.sectionTitle}>Completion</Text>
+
+              {canStartJob ? (
+                <Pressable
+                  style={[styles.primaryBtn, (startActing || completionActing) && styles.btnDisabled]}
+                  disabled={!!startActing || !!completionActing}
+                  onPress={onStartJob}
+                >
+                  <Text style={styles.primaryText}>{startActing ? "Starting…" : "Start Job"}</Text>
+                </Pressable>
+              ) : null}
 
               {canMarkComplete ? (
                 <Pressable
@@ -609,7 +658,7 @@ export default function ProviderJobDetailScreen() {
                   style={[
                     styles.primaryBtn,
                     completionActing && styles.btnDisabled,
-                    canMarkComplete ? { marginTop: 10 } : null,
+                    canMarkComplete || canStartJob ? { marginTop: 10 } : null,
                   ]}
                   disabled={!!completionActing}
                   onPress={onConfirmComplete}
@@ -618,6 +667,15 @@ export default function ProviderJobDetailScreen() {
                     {completionActing === "confirm" ? "Confirming…" : "Confirm Completion"}
                   </Text>
                 </Pressable>
+              ) : null}
+
+              {job.status === "COMPLETED" && myBid?.status === "ACCEPTED" ? (
+                <View style={{ marginTop: 10 }}>
+                  <Text style={styles.bodySmall}>Job completed — you can leave or update a review.</Text>
+                  <Pressable style={[styles.secondaryBtn, { marginTop: 10 }]} onPress={goToLeaveReview}>
+                    <Text style={styles.secondaryText}>Leave Review</Text>
+                  </Pressable>
+                </View>
               ) : null}
             </View>
           ) : null}

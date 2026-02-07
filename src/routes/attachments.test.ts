@@ -70,6 +70,109 @@ test("GET /attachments/:id returns 403 for unauthorized provider", async (t) => 
   assert.equal(res.status, 403);
 });
 
+test("GET /attachments/:id returns 302 signed URL for authorized user (object storage)", async (t) => {
+  const tmpUploads = await fs.promises.mkdtemp(path.join(os.tmpdir(), "hh-uploads-"));
+
+  let signedCalls = 0;
+  const storageProvider = {
+    putObject: async () => {},
+    deleteObject: async () => {},
+    getSignedReadUrl: async (key: string, ttlSeconds: number) => {
+      signedCalls += 1;
+      assert.equal(key, "attachments/job/abc.jpg");
+      assert.equal(ttlSeconds, 60);
+      return "https://example.invalid/signed-url";
+    },
+  };
+
+  const prisma = makePrismaStub({
+    jobAttachment: {
+      id: 10,
+      jobId: 99,
+      mimeType: "image/jpeg",
+      filename: "img.jpg",
+      sizeBytes: 5,
+      diskPath: null,
+      storageKey: "attachments/job/abc.jpg",
+    },
+    job: { id: 99, consumerId: 100 },
+    bid: null,
+  });
+
+  const app = express();
+  app.use((req, _res, next) => {
+    (req as any).user = { userId: 100, role: "CONSUMER" };
+    next();
+  });
+  app.get(
+    "/attachments/:id",
+    createGetAttachmentHandler({
+      prisma: prisma as any,
+      uploadsDir: tmpUploads,
+      storageProvider: storageProvider as any,
+      signedUrlTtlSeconds: 60,
+    })
+  );
+
+  const { server, baseUrl } = await listen(app);
+  t.after(() => server.close());
+
+  const res = await fetch(`${baseUrl}/attachments/10`, { redirect: "manual" as any });
+  assert.equal(res.status, 302);
+  assert.equal(res.headers.get("location"), "https://example.invalid/signed-url");
+  assert.equal(signedCalls, 1);
+});
+
+test("GET /attachments/:id does not sign URL when unauthorized (object storage)", async (t) => {
+  const tmpUploads = await fs.promises.mkdtemp(path.join(os.tmpdir(), "hh-uploads-"));
+
+  let signedCalls = 0;
+  const storageProvider = {
+    putObject: async () => {},
+    deleteObject: async () => {},
+    getSignedReadUrl: async () => {
+      signedCalls += 1;
+      return "https://example.invalid/signed-url";
+    },
+  };
+
+  const prisma = makePrismaStub({
+    jobAttachment: {
+      id: 11,
+      jobId: 1000,
+      mimeType: "image/jpeg",
+      filename: "img.jpg",
+      sizeBytes: 5,
+      diskPath: null,
+      storageKey: "attachments/job/secret.jpg",
+    },
+    job: { id: 1000, consumerId: 100 },
+    bid: null,
+  });
+
+  const app = express();
+  app.use((req, _res, next) => {
+    (req as any).user = { userId: 200, role: "PROVIDER" };
+    next();
+  });
+  app.get(
+    "/attachments/:id",
+    createGetAttachmentHandler({
+      prisma: prisma as any,
+      uploadsDir: tmpUploads,
+      storageProvider: storageProvider as any,
+      signedUrlTtlSeconds: 60,
+    })
+  );
+
+  const { server, baseUrl } = await listen(app);
+  t.after(() => server.close());
+
+  const res = await fetch(`${baseUrl}/attachments/11`, { redirect: "manual" as any });
+  assert.equal(res.status, 403);
+  assert.equal(signedCalls, 0);
+});
+
 test("GET /attachments/:id streams for job consumer", async (t) => {
   const tmpUploads = await fs.promises.mkdtemp(path.join(os.tmpdir(), "hh-uploads-"));
   const filePath = path.join(tmpUploads, "attachments", "doc.pdf");

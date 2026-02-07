@@ -2,6 +2,7 @@ import { prisma } from "../prisma";
 import { isExpoPushToken, sendExpoPush } from "./expoPush";
 import zipcodes from "zipcodes";
 import { matchSavedSearchToJob } from "./savedSearchMatcher";
+import { computeJobMatchScore, extractZip } from "./jobMatchRanking";
 
 type JobMatchPayload = {
   jobId: number;
@@ -9,71 +10,6 @@ type JobMatchPayload = {
 
 function normalize(s: string) {
   return s.trim().toLowerCase();
-}
-
-function extractZip(location: string | null | undefined): string | null {
-  if (!location) return null;
-  const m = location.match(/\b(\d{5})(?:-\d{4})?\b/);
-  return m ? m[1] : null;
-}
-
-function subscriptionMultiplier(tier: string | null | undefined): number {
-  switch (tier) {
-    case "PRO":
-      return 1.5;
-    case "BASIC":
-      return 1.2;
-    case "FREE":
-    default:
-      return 1.0;
-  }
-}
-
-function clamp01(n: number) {
-  if (!Number.isFinite(n)) return 0;
-  return Math.max(0, Math.min(1, n));
-}
-
-function computeScore(params: {
-  jobZip: string | null;
-  jobLocation: string | null;
-  providerFeaturedZips: string[];
-  providerLocation: string | null;
-  providerRating: number | null;
-  providerReviewCount: number | null;
-  subscriptionTier: string | null;
-  distanceScoreOverride?: number | null;
-}): number {
-  const jobZip = params.jobZip;
-
-  let distanceScore = 0.35;
-  if (typeof params.distanceScoreOverride === "number" && Number.isFinite(params.distanceScoreOverride)) {
-    distanceScore = clamp01(params.distanceScoreOverride);
-  } else {
-    if (jobZip && Array.isArray(params.providerFeaturedZips) && params.providerFeaturedZips.includes(jobZip)) {
-      distanceScore = 1.0;
-    } else if (jobZip && params.providerLocation && normalize(params.providerLocation).includes(jobZip)) {
-      distanceScore = 0.8;
-    } else if (params.jobLocation && params.providerLocation) {
-      const jl = normalize(params.jobLocation);
-      const pl = normalize(params.providerLocation);
-      if (jl && pl && (jl.includes(pl) || pl.includes(jl))) {
-        distanceScore = 0.6;
-      }
-    }
-  }
-
-  const rating = typeof params.providerRating === "number" ? params.providerRating : null;
-  const ratingScore = clamp01((rating ?? 3.5) / 5);
-
-  const rc = typeof params.providerReviewCount === "number" ? params.providerReviewCount : 0;
-  const confidenceBoost = 1 + Math.log10((rc ?? 0) + 1) / 6; // ~1..1.3-ish
-
-  const tierMult = subscriptionMultiplier(params.subscriptionTier ?? "FREE");
-
-  // Weighted blend → then subscription multiplier
-  const blended = 0.55 * ratingScore + 0.45 * distanceScore;
-  return blended * confidenceBoost * tierMult;
 }
 
 function isMissingTableOrRelationError(err: unknown): boolean {
@@ -124,6 +60,17 @@ export async function processJobMatchNotify(payload: JobMatchPayload): Promise<v
       rating: number | null;
       reviewCount: number | null;
       featuredZipCodes: string[];
+      verificationBadge: boolean;
+    } | null;
+    providerEntitlement: {
+      verificationBadge: boolean;
+    } | null;
+    providerStats: {
+      jobsCompleted30d: number | null;
+      cancellationRate30d: number | null;
+      disputeRate30d: number | null;
+      reportRate30d: number | null;
+      medianResponseTimeSeconds30d: number | null;
     } | null;
     subscription: { tier: string | null } | null;
     pushTokens: { token: string; platform: string | null }[];
@@ -169,6 +116,21 @@ export async function processJobMatchNotify(payload: JobMatchPayload): Promise<v
                   rating: true,
                   reviewCount: true,
                   featuredZipCodes: true,
+                  verificationBadge: true,
+                },
+              },
+              providerEntitlement: {
+                select: {
+                  verificationBadge: true,
+                },
+              },
+              providerStats: {
+                select: {
+                  jobsCompleted30d: true,
+                  cancellationRate30d: true,
+                  disputeRate30d: true,
+                  reportRate30d: true,
+                  medianResponseTimeSeconds30d: true,
                 },
               },
               subscription: {
@@ -230,7 +192,9 @@ export async function processJobMatchNotify(payload: JobMatchPayload): Promise<v
             providerLocation: provider.location ?? null,
             providerRating: provider.providerProfile?.rating ?? null,
             providerReviewCount: provider.providerProfile?.reviewCount ?? null,
+            providerVerificationBadge: Boolean(provider.providerEntitlement?.verificationBadge ?? provider.providerProfile?.verificationBadge),
             subscriptionTier: provider.subscription?.tier ?? "FREE",
+            providerStats: provider.providerStats ?? null,
             distanceScoreOverride: m.distanceScore,
           });
 
@@ -299,6 +263,21 @@ export async function processJobMatchNotify(payload: JobMatchPayload): Promise<v
             rating: true,
             reviewCount: true,
             featuredZipCodes: true,
+            verificationBadge: true,
+          },
+        },
+        providerEntitlement: {
+          select: {
+            verificationBadge: true,
+          },
+        },
+        providerStats: {
+          select: {
+            jobsCompleted30d: true,
+            cancellationRate30d: true,
+            disputeRate30d: true,
+            reportRate30d: true,
+            medianResponseTimeSeconds30d: true,
           },
         },
         subscription: {
@@ -327,6 +306,8 @@ export async function processJobMatchNotify(payload: JobMatchPayload): Promise<v
           providerLocation: p.location ?? null,
           providerRating: p.providerProfile?.rating ?? null,
           providerReviewCount: p.providerProfile?.reviewCount ?? null,
+          providerStats: (p as any).providerStats ?? null,
+          providerVerificationBadge: Boolean((p as any).providerEntitlement?.verificationBadge ?? p.providerProfile?.verificationBadge),
           subscriptionTier: p.subscription?.tier ?? "FREE",
         });
         return { provider: p as ProviderRow, score };
@@ -417,4 +398,36 @@ export async function processJobMatchNotify(payload: JobMatchPayload): Promise<v
   if (pushMessages.length) {
     await sendExpoPush(pushMessages);
   }
+}
+
+function computeScore(params: {
+  jobZip: string | null;
+  jobLocation: string | null;
+  providerFeaturedZips: string[];
+  providerLocation: string | null;
+  providerRating: number | null;
+  providerReviewCount: number | null;
+  providerStats?: {
+    jobsCompleted30d: number | null;
+    cancellationRate30d: number | null;
+    disputeRate30d: number | null;
+    reportRate30d: number | null;
+    medianResponseTimeSeconds30d: number | null;
+  } | null;
+  providerVerificationBadge?: boolean;
+  subscriptionTier: string | null;
+  distanceScoreOverride?: number | null;
+}): number {
+  return computeJobMatchScore({
+    jobZip: params.jobZip,
+    jobLocation: params.jobLocation,
+    providerFeaturedZips: params.providerFeaturedZips,
+    providerLocation: params.providerLocation,
+    providerAvgRating: params.providerRating,
+    providerRatingCount: params.providerReviewCount,
+    providerStats: params.providerStats ?? null,
+    providerVerificationBadge: params.providerVerificationBadge ?? false,
+    subscriptionTier: (params.subscriptionTier as any) ?? null,
+    distanceScoreOverride: params.distanceScoreOverride,
+  });
 }

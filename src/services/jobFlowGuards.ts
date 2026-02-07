@@ -3,7 +3,11 @@ export function canReviewJob(status: string): boolean {
 }
 
 export function canOpenDispute(status: string): boolean {
-  return status === "COMPLETED" || status === "COMPLETED_PENDING_CONFIRMATION";
+  return (
+    status === "IN_PROGRESS" ||
+    status === "COMPLETED" ||
+    status === "COMPLETED_PENDING_CONFIRMATION"
+  );
 }
 
 export function canMarkComplete(status: string): boolean {

@@ -42,14 +42,14 @@ export default function NotificationsScreen() {
         return "briefcase-search-outline";
       case "NEW_BID":
         return "gavel";
+      case "NEW_MESSAGE":
+        return "message";
       case "COUNTER_OFFER":
         return "handshake";
       case "BID_ACCEPTED":
         return "check-circle";
       case "BID_REJECTED":
         return "close-circle";
-      case "MESSAGE":
-        return "message";
       case "JOB_COMPLETED":
         return "star";
       case "JOB_COMPLETION_CONFIRM_REQUIRED":
@@ -67,14 +67,14 @@ export default function NotificationsScreen() {
         return "#38bdf8";
       case "NEW_BID":
         return "#3b82f6";
+      case "NEW_MESSAGE":
+        return "#8b5cf6";
       case "COUNTER_OFFER":
         return "#f59e0b";
       case "BID_ACCEPTED":
         return "#10b981";
       case "BID_REJECTED":
         return "#ef4444";
-      case "MESSAGE":
-        return "#8b5cf6";
       case "JOB_COMPLETED":
         return "#ec4899";
       case "JOB_COMPLETION_CONFIRM_REQUIRED":
@@ -101,8 +101,10 @@ export default function NotificationsScreen() {
             markRead(item.id);
           }
 
-          if (item.type === "job.match" && typeof item.jobId === "number") {
-            router.push(`/job/${item.jobId}`);
+          if (typeof item.jobId === "number") {
+            if (item.type === "job.match" || item.type === "NEW_BID" || item.type === "NEW_MESSAGE") {
+              router.push(`/job/${item.jobId}`);
+            }
           }
         }}
       >

@@ -7,6 +7,7 @@ import {
   sanitizeFilenameForHeader,
   shouldInlineContentType,
 } from "../utils/attachmentsGuard";
+import type { StorageProvider } from "../storage/storageProvider";
 
 export type AuthUserLike = {
   userId: number;
@@ -26,6 +27,7 @@ type PrismaLike = {
       filename: string | null;
       sizeBytes: number | null;
       diskPath: string | null;
+      storageKey: string | null;
     } | null>;
   };
   messageAttachment: {
@@ -35,6 +37,7 @@ type PrismaLike = {
       filename: string | null;
       sizeBytes: number | null;
       diskPath: string | null;
+      storageKey: string | null;
       message: { jobId: number };
     } | null>;
   };
@@ -50,8 +53,18 @@ function isAdmin(req: AuthRequestLike): boolean {
   return req.user?.role === "ADMIN";
 }
 
-export function createGetAttachmentHandler(args: { prisma: PrismaLike; uploadsDir: string }) {
-  const { prisma, uploadsDir } = args;
+export function createGetAttachmentHandler(args: {
+  prisma: PrismaLike;
+  uploadsDir: string;
+  storageProvider?: StorageProvider;
+  signedUrlTtlSeconds?: number;
+}) {
+  const {
+    prisma,
+    uploadsDir,
+    storageProvider,
+    signedUrlTtlSeconds = 300,
+  } = args;
 
   return async (req: AuthRequestLike, res: Response, next: NextFunction) => {
     try {
@@ -70,11 +83,13 @@ export function createGetAttachmentHandler(args: { prisma: PrismaLike; uploadsDi
           filename: true,
           sizeBytes: true,
           diskPath: true,
+          storageKey: true,
         },
       });
 
       let jobId: number | null = jobAttach?.jobId ?? null;
       let diskPath: string | null | undefined = jobAttach?.diskPath;
+      let storageKey: string | null | undefined = jobAttach?.storageKey;
       let mimeType: string | null | undefined = jobAttach?.mimeType;
       let filename: string | null | undefined = jobAttach?.filename;
       let sizeBytes: number | null | undefined = jobAttach?.sizeBytes;
@@ -88,6 +103,7 @@ export function createGetAttachmentHandler(args: { prisma: PrismaLike; uploadsDi
             filename: true,
             sizeBytes: true,
             diskPath: true,
+            storageKey: true,
             message: { select: { jobId: true } },
           },
         });
@@ -98,6 +114,7 @@ export function createGetAttachmentHandler(args: { prisma: PrismaLike; uploadsDi
 
         jobId = msgAttach.message.jobId;
         diskPath = msgAttach.diskPath;
+        storageKey = msgAttach.storageKey;
         mimeType = msgAttach.mimeType;
         filename = msgAttach.filename;
         sizeBytes = msgAttach.sizeBytes;
@@ -128,6 +145,21 @@ export function createGetAttachmentHandler(args: { prisma: PrismaLike; uploadsDi
 
       if (!authorized) {
         return res.status(403).json({ error: "Not allowed to access this attachment." });
+      }
+
+      // New path: object storage -> signed URL
+      if (storageKey) {
+        if (!storageProvider) {
+          return res.status(500).json({ error: "Attachment storage is not configured." });
+        }
+
+        const ttl = Number.isFinite(signedUrlTtlSeconds) && signedUrlTtlSeconds > 0
+          ? Math.floor(signedUrlTtlSeconds)
+          : 300;
+
+        const url = await storageProvider.getSignedReadUrl(storageKey, ttl);
+        res.setHeader("Cache-Control", "private, max-age=0, no-store");
+        return res.redirect(302, url);
       }
 
       if (!diskPath) {

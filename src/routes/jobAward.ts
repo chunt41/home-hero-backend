@@ -38,8 +38,9 @@ export function createPostJobAwardHandler(deps: {
   prisma: any;
   createNotification: (args: { userId: number; type: string; content: any }) => Promise<void>;
   enqueueWebhookEvent: (args: { eventType: string; payload: Record<string, any> }) => Promise<void>;
+  auditSecurityEvent?: (req: Request, actionType: string, metadata?: Record<string, any>) => Promise<void>;
 }) {
-  const { prisma, createNotification, enqueueWebhookEvent } = deps;
+  const { prisma, createNotification, enqueueWebhookEvent, auditSecurityEvent } = deps;
 
   return async (req: AuthRequest, res: Response) => {
     try {
@@ -129,7 +130,7 @@ export function createPostJobAwardHandler(deps: {
         const updatedJob = await tx.job.update({
           where: { id: job.id },
           data: {
-            status: "IN_PROGRESS",
+            status: "AWARDED",
             awardedProviderId: bid.providerId,
             awardedAt: now,
           },
@@ -138,10 +139,26 @@ export function createPostJobAwardHandler(deps: {
         return { accepted, updatedJob };
       });
 
+      // Notify both parties
       await createNotification({
         userId: bid.providerId,
-        type: "BID_ACCEPTED",
-        content: `Your bid was accepted for "${job.title}".`,
+        type: "JOB_AWARDED",
+        content: `You were awarded for "${job.title}".`,
+      });
+      await createNotification({
+        userId: job.consumerId,
+        type: "JOB_AWARDED",
+        content: `You awarded a provider for "${job.title}".`,
+      });
+
+      await auditSecurityEvent?.(req, "job.awarded", {
+        targetType: "JOB",
+        targetId: String(job.id),
+        jobId: job.id,
+        previousStatus: previousJobStatus,
+        newStatus: result.updatedJob.status,
+        awardedProviderId: bid.providerId,
+        bidId: bid.id,
       });
 
       await enqueueWebhookEvent({
@@ -170,7 +187,7 @@ export function createPostJobAwardHandler(deps: {
       });
 
       return res.json({
-        message: "Provider awarded. Job is now IN_PROGRESS.",
+        message: "Provider awarded. Job is now AWARDED.",
         job: result.updatedJob,
         acceptedBid: result.accepted,
       });

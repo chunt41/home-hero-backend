@@ -119,11 +119,24 @@ export default function ConsumerJobsScreen() {
 
     switch (filter) {
       case "ACTIVE":
-        return norm.filter((j) => j.status === "OPEN" || j.status === "IN_PROGRESS");
+        return norm.filter(
+          (j) =>
+            j.status === "OPEN" ||
+            j.status === "AWARDED" ||
+            j.status === "IN_PROGRESS" ||
+            j.status === "COMPLETED_PENDING_CONFIRMATION" ||
+            j.status === "DISPUTED"
+        );
       case "OPEN":
         return norm.filter((j) => j.status === "OPEN");
       case "IN_PROGRESS":
-        return norm.filter((j) => j.status === "IN_PROGRESS");
+        return norm.filter(
+          (j) =>
+            j.status === "AWARDED" ||
+            j.status === "IN_PROGRESS" ||
+            j.status === "COMPLETED_PENDING_CONFIRMATION" ||
+            j.status === "DISPUTED"
+        );
       case "COMPLETED":
         return norm.filter((j) => j.status === "COMPLETED");
       case "CANCELLED":
@@ -147,7 +160,14 @@ export default function ConsumerJobsScreen() {
     for (const j of items) {
       const s = normalizeStatus(j.status);
       if (s === "OPEN") c.OPEN++;
-      else if (s === "IN_PROGRESS") c.IN_PROGRESS++;
+      else if (
+        s === "AWARDED" ||
+        s === "IN_PROGRESS" ||
+        s === "COMPLETED_PENDING_CONFIRMATION" ||
+        s === "DISPUTED"
+      ) {
+        c.IN_PROGRESS++;
+      }
       else if (s === "COMPLETED") c.COMPLETED++;
       else if (s === "CANCELLED") c.CANCELLED++;
     }
@@ -158,7 +178,7 @@ export default function ConsumerJobsScreen() {
   const emptyText = useMemo(() => {
     if (filter === "ACTIVE") return "No active jobs right now.";
     if (filter === "OPEN") return "No OPEN jobs.";
-    if (filter === "IN_PROGRESS") return "No jobs IN_PROGRESS.";
+    if (filter === "IN_PROGRESS") return "No in-progress jobs.";
     if (filter === "COMPLETED") return "No COMPLETED jobs yet.";
     if (filter === "CANCELLED") return "No CANCELLED jobs.";
     return "No jobs yet.";

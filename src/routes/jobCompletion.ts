@@ -57,8 +57,9 @@ export function createPostJobMarkCompleteHandler(deps: {
   prisma: any;
   createNotification: (args: { userId: number; type: string; content: any }) => Promise<void>;
   enqueueWebhookEvent: (args: { eventType: string; payload: Record<string, any> }) => Promise<void>;
+  auditSecurityEvent?: (req: Request, actionType: string, metadata?: Record<string, any>) => Promise<void>;
 }) {
-  const { prisma, createNotification, enqueueWebhookEvent } = deps;
+  const { prisma, createNotification, enqueueWebhookEvent, auditSecurityEvent } = deps;
 
   return async (req: AuthRequest, res: Response) => {
     try {
@@ -116,6 +117,15 @@ export function createPostJobMarkCompleteHandler(deps: {
         },
       });
 
+      await auditSecurityEvent?.(req, "job.completion_marked", {
+        targetType: "JOB",
+        targetId: String(jobId),
+        jobId,
+        previousStatus,
+        newStatus: updatedJob.status,
+        completionPendingForUserId: pendingForUserId,
+      });
+
       // Notify both parties
       await createNotification({
         userId: pendingForUserId,
@@ -156,8 +166,9 @@ export function createPostJobConfirmCompleteHandler(deps: {
   prisma: any;
   createNotification: (args: { userId: number; type: string; content: any }) => Promise<void>;
   enqueueWebhookEvent: (args: { eventType: string; payload: Record<string, any> }) => Promise<void>;
+  auditSecurityEvent?: (req: Request, actionType: string, metadata?: Record<string, any>) => Promise<void>;
 }) {
-  const { prisma, createNotification, enqueueWebhookEvent } = deps;
+  const { prisma, createNotification, enqueueWebhookEvent, auditSecurityEvent } = deps;
 
   return async (req: AuthRequest, res: Response) => {
     try {
@@ -216,6 +227,15 @@ export function createPostJobConfirmCompleteHandler(deps: {
           completionPendingForUserId: null,
           completedAt: now,
         },
+      });
+
+      await auditSecurityEvent?.(req, "job.completed", {
+        targetType: "JOB",
+        targetId: String(jobId),
+        jobId,
+        previousStatus,
+        newStatus: updatedJob.status,
+        completedAt: now.toISOString(),
       });
 
       // Notify both parties

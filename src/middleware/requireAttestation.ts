@@ -1,6 +1,13 @@
 import type { NextFunction, Request, Response } from "express";
 import * as jwt from "jsonwebtoken";
 
+import { logSecurityEvent } from "../services/securityEventLogger";
+import {
+  verifyAndroidPlayIntegrityAttestation,
+} from "../attestation/androidPlayIntegrity";
+import { verifyIosAppAttestAttestation } from "../attestation/iosAppAttest";
+import { AttestationError } from "../attestation/attestationError";
+
 export type AttestationInfo = {
   platform: "android" | "ios" | "unknown";
   deviceId: string;
@@ -16,18 +23,6 @@ export type AttestationResult = {
 export type AttestationVerifier = {
   verify(token: string): Promise<AttestationResult>;
 };
-
-class AttestationError extends Error {
-  status: number;
-  code: string;
-
-  constructor(message: string, status = 401, code = "ATTESTATION_INVALID") {
-    super(message);
-    this.name = "AttestationError";
-    this.status = status;
-    this.code = code;
-  }
-}
 
 function allowUnattestedDev(): boolean {
   const flag = String(process.env.ALLOW_UNATTESTED_DEV ?? "").toLowerCase() === "true";
@@ -51,6 +46,11 @@ function normalizeToken(raw: unknown): string | null {
   }
 
   return trimmed;
+}
+
+function headerPlatform(req: Request): AttestationInfo["platform"] {
+  // Clients should send X-App-Platform: android|ios
+  return asPlatform(req.header("X-App-Platform"));
 }
 
 function isLikelyJwt(token: string): boolean {
@@ -212,73 +212,134 @@ function failureKey(req: Request): string {
   return `${ip}|${ua}`;
 }
 
-export async function requireAttestation(req: Request, res: Response, next: NextFunction) {
-  if (!enforceAttestation()) {
-    (req as any).attested = false;
-    return next();
-  }
+export type AttestationVerifierDeps = {
+  verifyAndroid?: typeof verifyAndroidPlayIntegrityAttestation;
+  verifyIos?: typeof verifyIosAppAttestAttestation;
+  verifyJwt?: (token: string) => Promise<AttestationResult>;
+};
 
-  const raw = req.header("X-App-Attestation");
-  const token = normalizeToken(raw);
+export function createRequireAttestation(deps: AttestationVerifierDeps = {}) {
+  const verifyAndroid = deps.verifyAndroid ?? verifyAndroidPlayIntegrityAttestation;
+  const verifyIos = deps.verifyIos ?? verifyIosAppAttestAttestation;
+  const verifyJwt =
+    deps.verifyJwt ??
+    (async (token: string) => {
+      const verifier = createAttestationVerifier();
+      return verifier.verify(token);
+    });
 
-  if (!token) {
-    if (allowUnattestedDev()) {
+  return async function requireAttestationMiddleware(req: Request, res: Response, next: NextFunction) {
+    if (!enforceAttestation()) {
       (req as any).attested = false;
       return next();
     }
 
-    const { limited, remainingMs } = bumpFailure(failureKey(req));
-    if (limited) {
-      res.setHeader("Retry-After", String(Math.ceil(remainingMs / 1000)));
-      return res.status(429).json({ error: "Too many invalid attestation attempts. Please slow down." });
+    const platform = headerPlatform(req);
+    const raw = req.header("X-App-Attestation");
+    const token = normalizeToken(raw);
+
+    if (!token) {
+      if (allowUnattestedDev()) {
+        (req as any).attested = false;
+        return next();
+      }
+
+      const { limited, remainingMs } = bumpFailure(failureKey(req));
+      if (limited) {
+        res.setHeader("Retry-After", String(Math.ceil(remainingMs / 1000)));
+        return res.status(429).json({ error: "Too many invalid attestation attempts. Please slow down." });
+      }
+
+      console.warn("[attestation] missing token", {
+        path: req.path,
+        method: req.method,
+        ip: (req as any).ip,
+        platform,
+      });
+
+      void logSecurityEvent(req, "attestation.missing", {
+        targetType: "route",
+        targetId: req.path,
+        platform,
+        code: "ATTESTATION_MISSING",
+        method: req.method,
+      });
+
+      return res.status(401).json({ error: "App attestation required" });
     }
 
-    console.warn("[attestation] missing token", {
-      path: req.path,
-      method: req.method,
-      ip: (req as any).ip,
-    });
-
-    return res.status(401).json({ error: "App attestation required" });
-  }
-
-  if (allowUnattestedDev()) {
-    // In dev bypass mode, still mark we received something for observability.
-    (req as any).attested = false;
-    (req as any).attestation = {
-      platform: "unknown",
-      deviceId: "dev-bypass",
-      issuedAt: new Date().toISOString(),
-      riskLevel: "unknown",
-    } satisfies AttestationInfo;
-    return next();
-  }
-
-  try {
-    const verifier = createAttestationVerifier();
-    const result = await verifier.verify(token);
-
-    (req as any).attested = true;
-    (req as any).attestation = result.attestation;
-    return next();
-  } catch (e: any) {
-    const { limited, remainingMs } = bumpFailure(failureKey(req));
-    if (limited) {
-      res.setHeader("Retry-After", String(Math.ceil(remainingMs / 1000)));
-      return res.status(429).json({ error: "Too many invalid attestation attempts. Please slow down." });
+    if (allowUnattestedDev()) {
+      // In dev bypass mode, still mark we received something for observability.
+      (req as any).attested = false;
+      (req as any).attestation = {
+        platform: "unknown",
+        deviceId: "dev-bypass",
+        issuedAt: new Date().toISOString(),
+        riskLevel: "unknown",
+      } satisfies AttestationInfo;
+      return next();
     }
 
-    const status = typeof e?.status === "number" ? e.status : 401;
-    const message = typeof e?.message === "string" ? e.message : "Invalid attestation";
+    try {
+      let result: AttestationResult;
 
-    console.warn("[attestation] failed", {
-      path: req.path,
-      method: req.method,
-      ip: (req as any).ip,
-      code: e?.code,
-      message,
-    });
+      // Route verification based on platform header (preferred) and token format (fallback).
+      if (platform === "android") {
+        const expectedNonce = normalizeToken(req.header("X-App-Attestation-Nonce"));
+        result = await verifyAndroid(token, {
+          expectedNonce: expectedNonce ?? undefined,
+        });
+      } else if (platform === "ios") {
+        const expectedNonce = normalizeToken(req.header("X-App-Attestation-Nonce"));
+        result = await verifyIos(token, {
+          expectedNonce: expectedNonce ?? undefined,
+        });
+      } else {
+        // Back-compat: older clients may only send a JWT.
+        if (isLikelyJwt(token)) {
+          result = await verifyJwt(token);
+        } else {
+          throw new AttestationError(
+            "Unsupported attestation token/platform; send X-App-Platform",
+            401,
+            "ATTESTATION_UNSUPPORTED"
+          );
+        }
+      }
 
-    return res.status(status).json({ error: `App attestation failed: ${message}` });
-  }
+      (req as any).attested = true;
+      (req as any).attestation = result.attestation;
+      return next();
+    } catch (e: any) {
+      const { limited, remainingMs } = bumpFailure(failureKey(req));
+      if (limited) {
+        res.setHeader("Retry-After", String(Math.ceil(remainingMs / 1000)));
+        return res.status(429).json({ error: "Too many invalid attestation attempts. Please slow down." });
+      }
+
+      const status = typeof e?.status === "number" ? e.status : 401;
+      const message = typeof e?.message === "string" ? e.message : "Invalid attestation";
+
+      console.warn("[attestation] failed", {
+        path: req.path,
+        method: req.method,
+        ip: (req as any).ip,
+        platform,
+        code: e?.code,
+        message,
+      });
+
+      void logSecurityEvent(req, "attestation.failed", {
+        targetType: "route",
+        targetId: req.path,
+        platform,
+        code: String(e?.code ?? "ATTESTATION_FAILED"),
+        method: req.method,
+      });
+
+      return res.status(status).json({ error: `App attestation failed: ${message}` });
+    }
+  };
 }
+
+export const requireAttestation = createRequireAttestation();

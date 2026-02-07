@@ -9,9 +9,9 @@ test("canReviewJob allows only COMPLETED", () => {
   assert.equal(canReviewJob("COMPLETED"), true);
 });
 
-test("canOpenDispute allows completion pending or completed", () => {
+test("canOpenDispute allows in-progress or completed", () => {
   assert.equal(canOpenDispute("OPEN"), false);
-  assert.equal(canOpenDispute("IN_PROGRESS"), false);
+  assert.equal(canOpenDispute("IN_PROGRESS"), true);
   assert.equal(canOpenDispute("COMPLETED_PENDING_CONFIRMATION"), true);
   assert.equal(canOpenDispute("COMPLETED"), true);
   assert.equal(canOpenDispute("CANCELLED"), false);

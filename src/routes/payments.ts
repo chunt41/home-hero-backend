@@ -6,8 +6,8 @@ import { requireVerifiedEmail } from "../middleware/requireVerifiedEmail";
 import { requireAdmin } from "../middleware/requireAdmin";
 import {
   createPaymentIntent,
-  handlePaymentIntentSucceeded,
-  handlePaymentIntentFailed,
+  applyPaymentIntentSucceededFromWebhook,
+  applyPaymentIntentFailedFromWebhook,
   stripe,
 } from "../services/stripeService";
 import { env } from "../config/env";
@@ -17,6 +17,71 @@ import { logSecurityEvent } from "../services/securityEventLogger";
 import { createAsyncRouter } from "../middleware/asyncWrap";
 
 const router = createAsyncRouter(express);
+
+export function createConfirmPaymentHandler(deps?: {
+  stripeClient?: { paymentIntents: { retrieve: (id: string) => Promise<any> } };
+  prismaClient?: typeof prisma;
+  logSecurityEventImpl?: typeof logSecurityEvent;
+}) {
+  const stripeClient = deps?.stripeClient ?? stripe;
+  const prismaClient = deps?.prismaClient ?? prisma;
+  const logSecurityEventImpl = deps?.logSecurityEventImpl ?? logSecurityEvent;
+
+  return async (req: any, res: any) => {
+    try {
+      const { paymentIntentId } = (req as any).validated.body as { paymentIntentId: string };
+      const userId = req.user!.userId;
+
+      // Verify the payment intent
+      const paymentIntent = await stripeClient.paymentIntents.retrieve(paymentIntentId);
+
+      if (paymentIntent.status !== "succeeded") {
+        await logSecurityEventImpl(req, "payment.confirm_failed", {
+          targetType: "USER",
+          targetId: userId,
+          paymentIntentId,
+          reason: "not_succeeded",
+          status: paymentIntent.status,
+        });
+        return res.status(400).json({
+          error: "Payment not completed",
+          status: paymentIntent.status,
+        });
+      }
+
+      // Check that the payment belongs to this user
+      if (paymentIntent.metadata?.userId !== String(userId)) {
+        await logSecurityEventImpl(req, "payment.confirm_failed", {
+          targetType: "USER",
+          targetId: userId,
+          paymentIntentId,
+          reason: "payment_mismatch",
+        });
+        return res.status(403).json({ error: "Payment mismatch" });
+      }
+
+      // Read-only: do NOT grant entitlements or update subscription tier.
+      const subscription = await prismaClient.subscription.findUnique({ where: { userId } });
+
+      await logSecurityEventImpl(req, "payment.confirm_succeeded", {
+        targetType: "USER",
+        targetId: userId,
+        paymentIntentId,
+        note: "confirm_is_read_only; entitlements_applied_by_webhook",
+        subscriptionTier: (subscription as any)?.tier ?? null,
+      });
+
+      return res.json({
+        success: true,
+        subscription,
+        note: "Entitlements are applied via Stripe webhooks.",
+      });
+    } catch (error: any) {
+      console.error("Payment confirmation error:", error);
+      return res.status(500).json({ error: error.message });
+    }
+  };
+}
 
 const createIntentSchema = {
   body: z.object({
@@ -103,7 +168,10 @@ router.post(
 
 /**
  * POST /payments/confirm
- * Confirm payment and update subscription
+ * Confirm payment (read-only)
+ *
+ * IMPORTANT: This endpoint must never grant entitlements or update subscription tiers.
+ * Stripe webhooks are the canonical source of truth for applying entitlements.
  */
 router.post(
   "/confirm",
@@ -111,58 +179,8 @@ router.post(
   requireVerifiedEmail,
   requireAttestation,
   validate(confirmPaymentSchema),
-  async (req, res) => {
-  try {
-    const { paymentIntentId } = (req as any).validated.body as { paymentIntentId: string };
-    const userId = req.user!.userId;
-
-    // Verify the payment intent
-    const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
-
-    if (paymentIntent.status !== "succeeded") {
-      await logSecurityEvent(req, "payment.confirm_failed", {
-        targetType: "USER",
-        targetId: userId,
-        paymentIntentId,
-        reason: "not_succeeded",
-        status: paymentIntent.status,
-      });
-      return res.status(400).json({
-        error: "Payment not completed",
-        status: paymentIntent.status,
-      });
-    }
-
-    // Check that the payment belongs to this user
-    if (paymentIntent.metadata?.userId !== String(userId)) {
-      await logSecurityEvent(req, "payment.confirm_failed", {
-        targetType: "USER",
-        targetId: userId,
-        paymentIntentId,
-        reason: "payment_mismatch",
-      });
-      return res.status(403).json({ error: "Payment mismatch" });
-    }
-
-    // Update subscription
-    const result = await handlePaymentIntentSucceeded(paymentIntentId);
-
-    await logSecurityEvent(req, "payment.confirm_succeeded", {
-      targetType: "USER",
-      targetId: userId,
-      paymentIntentId,
-      subscriptionTier: (result as any)?.subscription?.tier ?? null,
-    });
-
-    res.json({
-      success: true,
-      subscription: result.subscription,
-    });
-  } catch (error: any) {
-    console.error("Payment confirmation error:", error);
-    res.status(500).json({ error: error.message });
-  }
-});
+  createConfirmPaymentHandler()
+);
 
 /**
  * POST /payments/webhook
@@ -206,10 +224,23 @@ router.post(
 
       if (event.type === "payment_intent.succeeded") {
         const paymentIntent = event.data.object as any;
-        await handlePaymentIntentSucceeded(paymentIntent.id);
+        const r = await applyPaymentIntentSucceededFromWebhook(paymentIntent.id);
+        await logSecurityEvent(req, "payment.webhook_processed", {
+          stripeEventType: event.type,
+          stripeEventId: (event as any)?.id ?? null,
+          paymentIntentId: paymentIntent.id,
+          idempotent: Boolean((r as any)?.idempotent),
+          kind: String(paymentIntent?.metadata?.kind ?? "unknown"),
+        });
       } else if (event.type === "payment_intent.payment_failed") {
         const paymentIntent = event.data.object as any;
-        await handlePaymentIntentFailed(paymentIntent.id);
+        await applyPaymentIntentFailedFromWebhook(paymentIntent.id);
+        await logSecurityEvent(req, "payment.webhook_processed", {
+          stripeEventType: event.type,
+          stripeEventId: (event as any)?.id ?? null,
+          paymentIntentId: paymentIntent.id,
+          kind: String(paymentIntent?.metadata?.kind ?? "unknown"),
+        });
       }
 
       res.json({ received: true });

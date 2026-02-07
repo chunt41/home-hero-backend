@@ -56,6 +56,7 @@ model User {
   reviewsGiven                Review[]              @relation("ReviewsGiven")
   reviewsReceived             Review[]              @relation("ReviewsReceived")
   disputesOpened              Dispute[]
+  disputesResolved            Dispute[]             @relation("DisputeResolvedBy")
   subscription                Subscription?
   subscriptionPayments        SubscriptionPayment[]
   stripePayments              StripePayment[]
@@ -337,6 +338,7 @@ model ProviderVerificationAttachment {
   mimeType         String?
   sizeBytes        Int?
   diskPath         String?
+  storageKey       String?
   createdAt        DateTime @default(now())
 
   verification     ProviderVerification @relation(fields: [providerId], references: [providerId], onDelete: Cascade)
@@ -460,14 +462,18 @@ model Dispute {
   status          DisputeStatus @default(OPEN)
   createdAt       DateTime      @default(now())
   resolvedAt      DateTime?
+  resolvedByAdminId Int?
   resolutionNotes String?
+  resolutionJobStatus JobStatus?
 
   job             Job           @relation(fields: [jobId], references: [id], onDelete: Cascade)
   openedBy        User          @relation(fields: [openedByUserId], references: [id], onDelete: Cascade)
+  resolvedByAdmin User?         @relation("DisputeResolvedBy", fields: [resolvedByAdminId], references: [id])
 
   @@index([jobId])
   @@index([openedByUserId])
   @@index([status])
+  @@index([resolvedByAdminId])
   @@index([createdAt])
 }
 
@@ -625,6 +631,7 @@ model JobAttachment {
   jobId     Int
   url       String
   diskPath  String?
+  storageKey String?
   uploaderUserId Int?
   type      String?
   mimeType  String?
@@ -641,6 +648,7 @@ model MessageAttachment {
   messageId Int
   url       String
   diskPath  String?
+  storageKey String?
   uploaderUserId Int?
   mimeType  String?
   filename  String?
@@ -791,9 +799,11 @@ enum UserRole {
 
 enum JobStatus {
   OPEN
+  AWARDED
   IN_PROGRESS
   COMPLETED_PENDING_CONFIRMATION
   COMPLETED
+  DISPUTED
   CANCELLED
 }
 

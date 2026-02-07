@@ -146,14 +146,17 @@ test("POST /jobs/:jobId/award awards by bidId", async (t) => {
 
   assert.equal(res.status, 200);
   const body = await res.json();
-  assert.equal(body.job.status, "IN_PROGRESS");
+  assert.equal(body.job.status, "AWARDED");
   assert.equal(body.job.awardedProviderId, 200);
   assert.ok(body.job.awardedAt);
   assert.equal(body.acceptedBid.status, "ACCEPTED");
 
-  assert.equal(notified.length, 1);
-  assert.equal(notified[0].userId, 200);
-  assert.equal(notified[0].type, "BID_ACCEPTED");
+  assert.equal(notified.length, 2);
+  assert.deepEqual(
+    new Set(notified.map((n) => n.userId)),
+    new Set([100, 200])
+  );
+  assert.ok(notified.every((n) => n.type === "JOB_AWARDED"));
 
   assert.equal(webhooks.length, 2);
   assert.equal(webhooks[0].eventType, "bid.accepted");

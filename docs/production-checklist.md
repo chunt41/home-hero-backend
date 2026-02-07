@@ -7,9 +7,37 @@ Set these on the Railway service (do **not** commit to git):
 
 - `DATABASE_URL`
 - `JWT_SECRET`
+- `RATE_LIMIT_REDIS_URL` (required in production; Redis-backed rate limiting)
+- `RATE_LIMIT_REDIS_PREFIX` (optional; default `rl`)
 - `STRIPE_SECRET_KEY` (must be `sk_live_...`)
 - `STRIPE_WEBHOOK_SECRET` (must be `whsec_...`)
 - `CORS_ORIGINS` (your real origins, comma-separated)
+
+Optional but recommended production guardrails:
+
+- Object storage for attachments (required in `NODE_ENV=production` unless escape hatch is set):
+  - `OBJECT_STORAGE_PROVIDER=s3`
+  - `OBJECT_STORAGE_S3_BUCKET`
+  - `OBJECT_STORAGE_S3_REGION`
+  - `OBJECT_STORAGE_S3_ACCESS_KEY_ID`
+  - `OBJECT_STORAGE_S3_SECRET_ACCESS_KEY`
+  - `OBJECT_STORAGE_S3_ENDPOINT` (optional; required for Cloudflare R2)
+  - `OBJECT_STORAGE_S3_FORCE_PATH_STYLE` (optional)
+  - `ATTACHMENTS_SIGNED_URL_TTL_SECONDS` (optional; default `300`)
+  - Emergency escape hatch (not recommended): `OBJECT_STORAGE_ALLOW_DISK_IN_PROD=true`
+
+- App attestation enforcement (only required if you turn it on):
+  - `APP_ATTESTATION_ENFORCE=true`
+  - Optional: `APP_ATTESTATION_PLATFORMS=android,ios` (defaults to both)
+  - Android Play Integrity:
+    - `ANDROID_PLAY_INTEGRITY_PACKAGE_NAME`
+    - `ANDROID_PLAY_INTEGRITY_CERT_SHA256_DIGESTS`
+    - One of: `GOOGLE_SERVICE_ACCOUNT_JSON` | `GOOGLE_SERVICE_ACCOUNT_JSON_B64` | `GOOGLE_APPLICATION_CREDENTIALS`
+  - iOS App Attest:
+    - `IOS_APP_ATTEST_BUNDLE_ID`
+    - `IOS_APP_ATTEST_ALLOWED_KEY_IDS` (or `*`)
+    - `IOS_APP_ATTEST_VERIFY_URL`
+    - `IOS_APP_ATTEST_VERIFY_AUTH_HEADER` (optional)
 
 ### 2) Stripe webhook endpoint
 In Stripe Dashboard (Live mode):

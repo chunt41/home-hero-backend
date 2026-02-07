@@ -6,7 +6,7 @@ import { prisma } from "./prisma";
 import express = require("express");
 import type { Request, Response, NextFunction } from "express";
 import { AdminActionType } from "@prisma/client";
-import { roleRateLimit } from "./middleware/rateLimit";
+import { createRoleRateLimitRedis, validateRateLimitRedisStartupOrThrow } from "./middleware/rateLimitRedis";
 import {
   canAccessJobAttachment,
   resolveDiskPathInsideUploadsDir,
@@ -19,6 +19,9 @@ import {
   createPostJobConfirmCompleteHandler,
   createPostJobMarkCompleteHandler,
 } from "./routes/jobCompletion";
+import { createPostJobStartHandler } from "./routes/jobStart";
+import { createGetProviderEntitlementsHandler } from "./routes/providerEntitlements";
+import { createPostJobReviewsHandler } from "./routes/jobReviews";
 import helmet from "helmet";
 import * as crypto from "crypto";
 import multer from "multer";
@@ -46,6 +49,10 @@ import {
   consumeLeadIfAvailable,
 } from "./services/providerEntitlements";
 import { canOpenDispute, canReviewJob } from "./services/jobFlowGuards";
+import {
+  createPostAdminResolveDisputeHandler,
+  createPostJobDisputesHandler,
+} from "./routes/jobDisputes";
 import { requestIdMiddleware, httpAccessLogMiddleware } from "./middleware/observability";
 import { initSentry, captureException, flushSentry } from "./observability/sentry";
 import { classifyJob } from "./services/jobClassifier";
@@ -65,9 +72,20 @@ import { enqueueBackgroundJob } from "./jobs/enqueue";
 import { patchAppForAsyncErrors } from "./middleware/asyncWrap";
 import { createGlobalErrorHandler } from "./middleware/globalErrorHandler";
 import { createBasicAuthForAdminUi, createRequireAdminUiEnabled } from "./routes/adminWebhooksUiGuard";
-import { computeProviderDiscoveryRanking, normalizeZipForBoost } from "./services/providerDiscoveryRanking";
+import { normalizeZipForBoost } from "./services/providerDiscoveryRanking";
+import { extractZip5, rankProvider } from "./matching/rankProviders";
+import zipcodes from "zipcodes";
 import { recomputeProviderStatsForProvider } from "./services/providerStats";
 import { getCurrentMonthKeyUtc } from "./ai/aiGateway";
+import { validateAttestationStartupOrThrow } from "./attestation/startupValidation";
+import { createLoginBruteForceProtector } from "./services/loginBruteForceProtector";
+import { createAuthLoginHandler } from "./routes/authLogin";
+import {
+  getAttachmentSignedUrlTtlSeconds,
+  getObjectStorageProviderName,
+  getStorageProviderOrThrow,
+  validateObjectStorageStartupOrThrow,
+} from "./storage/storageFactory";
 
 let webhookWorkerStartedAt: Date | null = null;
 
@@ -152,6 +170,15 @@ if (process.env.NODE_ENV !== "production") {
   dotenv.config();
 }
 
+// Fail fast in production if app attestation is enforced but verifier config is missing.
+validateAttestationStartupOrThrow();
+
+// Fail fast in production if Redis-backed rate limiting is not configured.
+validateRateLimitRedisStartupOrThrow();
+
+// Fail fast in production if attachment object storage is required but not configured.
+validateObjectStorageStartupOrThrow();
+
 const app = express();
 // Ensure async route errors bubble into the single global error handler.
 patchAppForAsyncErrors(app);
@@ -159,6 +186,10 @@ app.set("etag", false);
 app.set("trust proxy", true);
 const PORT = env.PORT;
 const JWT_SECRET = env.JWT_SECRET;
+
+const objectStorageProviderName = getObjectStorageProviderName();
+const attachmentStorageProvider = objectStorageProviderName === "s3" ? getStorageProviderOrThrow() : undefined;
+const attachmentsSignedUrlTtlSeconds = getAttachmentSignedUrlTtlSeconds();
 
 // Optional error reporting (Sentry)
 initSentry().catch(() => null);
@@ -288,10 +319,6 @@ function patchExpressForAsyncErrors(appInstance: any) {
 
 patchExpressForAsyncErrors(app);
 
-app.get("/health", (_req, res) => {
-  res.json({ ok: true });
-});
-
 // --- Middlewares ---
 const allowedOrigins =
   (process.env.CORS_ORIGINS ?? "")
@@ -367,16 +394,18 @@ function isAllowedVerificationMime(mime: string | undefined): boolean {
   return false;
 }
 
+function safeUploadExt(originalName: string | undefined): string {
+  const original = (originalName || "file").trim() || "file";
+  const ext = path.extname(original).slice(0, 12);
+  return ext && ext.startsWith(".") ? ext : "";
+}
+
+function makeUploadBasename(originalName: string | undefined): string {
+  return `${crypto.randomUUID()}${safeUploadExt(originalName)}`;
+}
+
 const uploadAttachment = multer({
-  storage: multer.diskStorage({
-    destination: (_req, _file, cb) => cb(null, ATTACHMENTS_DIR),
-    filename: (_req, file, cb) => {
-      const original = file.originalname || "file";
-      const ext = path.extname(original).slice(0, 12);
-      const safeExt = ext && ext.startsWith(".") ? ext : "";
-      cb(null, `${crypto.randomUUID()}${safeExt}`);
-    },
-  }),
+  storage: multer.memoryStorage(),
   limits: {
     fileSize: Number.isFinite(MAX_ATTACHMENT_BYTES)
       ? MAX_ATTACHMENT_BYTES
@@ -415,15 +444,7 @@ function uploadSingleAttachment(req: any, res: any, next: any) {
 }
 
 const uploadVerificationAttachment = multer({
-  storage: multer.diskStorage({
-    destination: (_req, _file, cb) => cb(null, ATTACHMENTS_DIR),
-    filename: (_req, file, cb) => {
-      const original = file.originalname || "file";
-      const ext = path.extname(original).slice(0, 12);
-      const safeExt = ext && ext.startsWith(".") ? ext : "";
-      cb(null, `${crypto.randomUUID()}${safeExt}`);
-    },
-  }),
+  storage: multer.memoryStorage(),
   limits: {
     fileSize: Number.isFinite(MAX_ATTACHMENT_BYTES)
       ? MAX_ATTACHMENT_BYTES
@@ -465,7 +486,8 @@ function uploadSingleVerificationAttachment(req: any, res: any, next: any) {
   });
 }
 
-const attachmentDownloadLimiter = roleRateLimit({
+const attachmentDownloadLimiter = createRoleRateLimitRedis({
+  bucket: "attachment_download",
   windowMs: 60_000,
   limits: { UNKNOWN: 0, CONSUMER: 120, PROVIDER: 180, ADMIN: 600 },
   message: "Too many attachment downloads. Please slow down.",
@@ -484,7 +506,12 @@ app.get(
   "/attachments/:id",
   authMiddleware,
   attachmentDownloadLimiter,
-  createGetAttachmentHandler({ prisma: prisma as any, uploadsDir: UPLOADS_DIR })
+  createGetAttachmentHandler({
+    prisma: prisma as any,
+    uploadsDir: UPLOADS_DIR,
+    storageProvider: attachmentStorageProvider,
+    signedUrlTtlSeconds: attachmentsSignedUrlTtlSeconds,
+  })
 );
 
 
@@ -544,55 +571,80 @@ export function verifyGoGetterWebhook(secret: string, toleranceSeconds = 300) {
   };
 }
 
-const loginLimiter = roleRateLimit({
+const loginLimiter = createRoleRateLimitRedis({
+  bucket: "auth_login",
   windowMs: 60_000,
   limits: { UNKNOWN: 5, CONSUMER: 10, PROVIDER: 10, ADMIN: 30 },
   message: "Too many login attempts. Try again in a minute.",
 });
 
-const signupLimiter = roleRateLimit({
+const signupLimiter = createRoleRateLimitRedis({
+  bucket: "auth_signup",
   windowMs: 60_000,
   limits: { UNKNOWN: 5, CONSUMER: 5, PROVIDER: 5, ADMIN: 10 },
   message: "Too many signup attempts. Try again in a minute.",
 });
 
-const verifyEmailLimiter = roleRateLimit({
+const verifyEmailLimiter = createRoleRateLimitRedis({
+  bucket: "auth_verify_email",
   windowMs: 60_000,
   limits: { UNKNOWN: 10, CONSUMER: 15, PROVIDER: 15, ADMIN: 30 },
   message: "Too many verification attempts. Try again in a minute.",
 });
 
-const forgotPasswordLimiter = roleRateLimit({
+const forgotPasswordLimiter = createRoleRateLimitRedis({
+  bucket: "auth_forgot_password",
   windowMs: 60_000,
   limits: { UNKNOWN: 5, CONSUMER: 10, PROVIDER: 10, ADMIN: 30 },
   message: "Too many password reset requests. Try again in a minute.",
 });
 
-const resetPasswordLimiter = roleRateLimit({
+const resetPasswordLimiter = createRoleRateLimitRedis({
+  bucket: "auth_reset_password",
   windowMs: 60_000,
   limits: { UNKNOWN: 5, CONSUMER: 10, PROVIDER: 10, ADMIN: 30 },
   message: "Too many password reset attempts. Try again in a minute.",
 });
 
-const messageLimiter = roleRateLimit({
+const loginBruteForce = createLoginBruteForceProtector();
+
+const messageLimiter = createRoleRateLimitRedis({
+  bucket: "message_read",
   windowMs: 60_000,
   limits: { UNKNOWN: 0, CONSUMER: 30, PROVIDER: 45, ADMIN: 200 },
   message: "Too many messages in a short time. Please slow down.",
 });
 
-const bidLimiter = roleRateLimit({
+const bidLimiter = createRoleRateLimitRedis({
+  bucket: "bid_place",
   windowMs: 60_000,
   limits: { UNKNOWN: 0, CONSUMER: 0, PROVIDER: 15, ADMIN: 100 },
   message: "Too many bids in a short time. Please slow down.",
 });
 
-const reportLimiter = roleRateLimit({
+const jobCreateLimiter = createRoleRateLimitRedis({
+  bucket: "job_create",
+  windowMs: 60_000,
+  limits: { UNKNOWN: 0, CONSUMER: 10, PROVIDER: 0, ADMIN: 60 },
+  message: "Too many job posts in a short time. Please slow down.",
+});
+
+const messageSendLimiter = createRoleRateLimitRedis({
+  bucket: "message_send",
+  windowMs: 60_000,
+  limits: { UNKNOWN: 0, CONSUMER: 20, PROVIDER: 30, ADMIN: 200 },
+  message: "Too many messages in a short time. Please slow down.",
+});
+
+const reportLimiter = createRoleRateLimitRedis({
+  bucket: "report_create",
   windowMs: 60_000,
   limits: { UNKNOWN: 0, CONSUMER: 5, PROVIDER: 5, ADMIN: 200 },
   message: "Too many reports in a short time. Please slow down.",
 });
 
-const notificationsLimiter = roleRateLimit({
+const notificationsLimiter = createRoleRateLimitRedis({
+  bucket: "notifications_read",
   windowMs: 60_000,
   limits: { UNKNOWN: 0, CONSUMER: 60, PROVIDER: 60, ADMIN: 300 },
   message: "Too many notification refreshes. Please slow down.",
@@ -1187,11 +1239,6 @@ app.post("/dev/seed-categories", validate({}), async (req: Request, res: Respons
 
 
 
-// --- Health check ---
-app.get("/health", (req, res) => {
-  res.json({ status: "ok", message: "GoGetter API is running 🚀" });
-});
-
 // GET /me  → current user's info (should work even if suspended)
 app.get("/me", authAllowSuspended, async (req: AuthRequest, res: Response) => {
   try {
@@ -1404,7 +1451,8 @@ const purchaseAddonSchema = {
 
 // POST /provider/addons/purchase
 // Creates a Stripe payment intent for an add-on purchase.
-// The client should call POST /payments/confirm after Stripe succeeds.
+// The client may call POST /payments/confirm after Stripe succeeds to refresh UI state,
+// but entitlements are granted only via Stripe webhooks.
 app.post(
   "/provider/addons/purchase",
   authMiddleware,
@@ -1448,30 +1496,11 @@ app.post(
 
 // GET /provider/entitlements
 // Returns current provider entitlements/perks granted by add-on purchases.
-app.get("/provider/entitlements", authMiddleware, async (req: AuthRequest, res: Response) => {
-  try {
-    if (!req.user) return res.status(401).json({ error: "Not authenticated" });
-    if (req.user.role !== "PROVIDER") {
-      return res.status(403).json({ error: "Only providers can view entitlements." });
-    }
-
-    const ent = await prisma.providerEntitlement.upsert({
-      where: { providerId: req.user.userId },
-      update: {},
-      create: {
-        providerId: req.user.userId,
-        verificationBadge: false,
-        featuredZipCodes: [],
-        leadCredits: 0,
-      },
-    });
-
-    return res.json({ entitlements: ent });
-  } catch (err) {
-    console.error("GET /provider/entitlements error:", err);
-    return res.status(500).json({ error: "Internal server error while fetching entitlements." });
-  }
-});
+app.get(
+  "/provider/entitlements",
+  authMiddleware,
+  createGetProviderEntitlementsHandler({ prisma })
+);
 
 
 // POST /subscription/upgrade
@@ -1480,6 +1509,7 @@ app.post(
   "/subscription/upgrade",
   authMiddleware,
   requireVerifiedEmail,
+  requireAttestation,
   validate({ body: z.object({ tier: subscriptionUpgradeTierSchema }) }),
   async (req: AuthRequest, res: Response) => {
   try {
@@ -1490,6 +1520,13 @@ app.post(
     // NOTE: Upgrades should normally be handled via Stripe payment confirmation
     // (see /payments/create-intent + /payments/confirm). This manual endpoint is
     // disabled by default to prevent bypassing payments.
+    if (process.env.NODE_ENV === "production") {
+      return res.status(403).json({
+        error:
+          "Manual subscription upgrades are disabled in production. Stripe webhooks are the source of truth.",
+      });
+    }
+
     const allowManualUpgrade =
       String(process.env.ALLOW_MANUAL_SUBSCRIPTION_UPGRADE ?? "false") === "true";
     if (!allowManualUpgrade) {
@@ -1594,6 +1631,7 @@ app.post(
   "/subscription/downgrade",
   authMiddleware,
   requireVerifiedEmail,
+  requireAttestation,
   validate({ body: z.object({ tier: subscriptionDowngradeTierSchema.optional() }) }),
   async (req: AuthRequest, res: Response) => {
   try {
@@ -1918,69 +1956,15 @@ app.post(
   loginLimiter,
   requireAttestation,
   validate(loginSchema),
-  async (req: ValidatedRequest<typeof loginSchema>, res) => {
-  try {
-    const { email, password } = req.validated.body;
-
-    const user = await prisma.user.findUnique({
-      where: { email },
-      include: { subscription: true },
-    });
-
-    if (!user) {
-      await logSecurityEvent(req, "auth.login_failed", {
-        actorEmail: email,
-        reason: "user_not_found",
-      });
-      return res.status(401).json({ error: "Invalid email or password." });
-    }
-
-    const isValid = await bcrypt.compare(String(password), user.passwordHash);
-
-    if (!isValid) {
-      await logSecurityEvent(req, "auth.login_failed", {
-        actorUserId: user.id,
-        actorRole: user.role,
-        actorEmail: user.email,
-        reason: "bad_password",
-      });
-      return res.status(401).json({ error: "Invalid email or password." });
-    }
-
-    await logSecurityEvent(req, "auth.login", {
-      actorUserId: user.id,
-      actorRole: user.role,
-      actorEmail: user.email,
-      targetType: "USER",
-      targetId: user.id,
-      emailVerified: Boolean(user.emailVerifiedAt),
-    });
-
-    const token = jwt.sign(
-      {
-        userId: user.id,
-        role: user.role,
-      },
-      JWT_SECRET,
-      { expiresIn: "7d" }
-    );
-
-    return res.json({
-      token,
-      user: {
-        id: user.id,
-        role: user.role,
-        name: user.name,
-        email: user.email,
-        subscriptionTier: user.subscription?.tier ?? "FREE",
-        emailVerified: Boolean(user.emailVerifiedAt),
-      },
-    });
-  } catch (err) {
-    console.error("Login error:", err);
-    return res.status(500).json({ error: "Internal server error during login." });
-  }
-});
+  createAuthLoginHandler({
+    prisma,
+    bcryptCompare: bcrypt.compare,
+    jwtSign: jwt.sign,
+    jwtSecret: JWT_SECRET,
+    logSecurityEvent,
+    loginBruteForce,
+  })
+);
 
 // --- AUTH: FORGOT PASSWORD ---
 // POST /auth/forgot-password
@@ -2187,6 +2171,7 @@ app.post(
   authMiddleware,
   requireVerifiedEmail,
   requireAttestation,
+  jobCreateLimiter,
   validate(createJobSchema),
   async (req: (AuthRequest & ValidatedRequest<typeof createJobSchema>), res: Response) => {
   try {
@@ -2643,29 +2628,57 @@ app.post(
         (process.env.PUBLIC_BASE_URL ?? "").trim() ||
         `${req.protocol}://${req.get("host")}`;
 
-      const diskPath = path.posix.join("attachments", file.filename);
       const kind = file.mimetype.startsWith("video/") ? "video" : "image";
+      const basename = makeUploadBasename(file.originalname);
+      const storageKey = attachmentStorageProvider
+        ? path.posix.join("attachments", "job", String(jobId), basename)
+        : null;
+      const diskPath = !attachmentStorageProvider
+        ? path.posix.join("attachments", basename)
+        : null;
 
-      const attach = await prisma.$transaction(async (tx) => {
-        const created = await tx.jobAttachment.create({
-          data: {
-            jobId,
-            url: "",
-            diskPath,
-            uploaderUserId: req.user!.userId,
-            type: kind,
-            mimeType: file.mimetype,
-            filename: file.originalname || null,
-            sizeBytes: file.size || null,
-          },
-        });
+      let cleanupOnDbFailure: null | (() => Promise<void>) = null;
+      if (attachmentStorageProvider && storageKey) {
+        await attachmentStorageProvider.putObject(storageKey, file.buffer, file.mimetype);
+        cleanupOnDbFailure = async () => {
+          await attachmentStorageProvider.deleteObject(storageKey).catch(() => null);
+        };
+      } else if (diskPath) {
+        const abs = path.join(UPLOADS_DIR, diskPath);
+        await fs.promises.mkdir(path.dirname(abs), { recursive: true });
+        await fs.promises.writeFile(abs, file.buffer);
+        cleanupOnDbFailure = async () => {
+          await fs.promises.unlink(abs).catch(() => null);
+        };
+      }
 
-        const url = `${publicBase}/attachments/${created.id}`;
-        return tx.jobAttachment.update({
-          where: { id: created.id },
-          data: { url },
+      let attach: any;
+      try {
+        attach = await prisma.$transaction(async (tx) => {
+          const created = await tx.jobAttachment.create({
+            data: {
+              jobId,
+              url: "",
+              diskPath,
+              storageKey,
+              uploaderUserId: req.user!.userId,
+              type: kind,
+              mimeType: file.mimetype,
+              filename: file.originalname || null,
+              sizeBytes: file.size || null,
+            },
+          });
+
+          const url = `${publicBase}/attachments/${created.id}`;
+          return tx.jobAttachment.update({
+            where: { id: created.id },
+            data: { url },
+          });
         });
-      });
+      } catch (e) {
+        await cleanupOnDbFailure?.();
+        throw e;
+      }
 
       await enqueueWebhookEvent({
         eventType: "job.attachment_added",
@@ -3705,7 +3718,7 @@ app.post(
       if (job.consumerId !== req.user.userId) {
         return res.status(403).json({ error: "Not authorized for this job." });
       }
-      if (job.status !== "IN_PROGRESS") {
+      if (job.status !== "AWARDED" && job.status !== "IN_PROGRESS") {
         return res.status(400).json({ error: "Appointments can be proposed once a provider is awarded." });
       }
 
@@ -3782,8 +3795,8 @@ app.post(
         select: { id: true, status: true },
       });
       if (!job) return res.status(404).json({ error: "Job not found." });
-      if (job.status !== "IN_PROGRESS") {
-        return res.status(400).json({ error: "Job is not in progress." });
+      if (job.status !== "AWARDED" && job.status !== "IN_PROGRESS") {
+        return res.status(400).json({ error: "Job is not awarded or in progress." });
       }
 
       try {
@@ -4129,7 +4142,12 @@ app.post(
       await createNotification({
         userId: job.consumerId,
         type: "NEW_BID",
-        content: `New bid (#${bid.id}) on your job "${job.title}".`,
+        content: {
+          title: "New bid",
+          body: `New bid (#${bid.id}) on your job "${job.title}".`,
+          jobId: job.id,
+          bidId: bid.id,
+        },
       });
 
       // ✅ Webhook: bid placed (you can later split into bid.updated vs bid.placed)
@@ -5097,144 +5115,13 @@ app.post(
       comment: z.string().max(2000).optional(),
     }),
   }),
-  async (req, res) => {
-  try {
-    if (!req.user) return res.status(401).json({ error: "Unauthorized" });
-    if (req.user.role !== "CONSUMER" && req.user.role !== "PROVIDER") {
-      return res.status(403).json({ error: "Only consumers or providers can leave reviews." });
-    }
-
-    const { jobId } = (req as any).validated.params as { jobId: number };
-    const { rating: ratingNum, text, comment } = (req as any).validated.body as {
-      rating: number;
-      text?: string;
-      comment?: string;
-    };
-
-    const moderation = moderateReviewText(text ?? comment ?? null);
-    if (!moderation.ok) {
-      const { error } = moderation as { ok: false; error: string };
-      return res.status(400).json({ error });
-    }
-
-    // Fetch job (to verify ownership & status)
-    const job = await prisma.job.findUnique({
-      where: { id: jobId },
-      select: { id: true, consumerId: true, status: true, title: true },
-    });
-
-    if (!job) {
-      return res.status(404).json({ error: "Job not found." });
-    }
-
-    // Only allow review if job has been COMPLETED
-    if (!canReviewJob(job.status)) {
-      return res.status(400).json({
-        error: `Only COMPLETED jobs can be reviewed. Current status: ${job.status}.`,
-      });
-    }
-
-    // Find the accepted bid on this job to get the providerId
-    const acceptedBid = await prisma.bid.findFirst({
-      where: { jobId, status: "ACCEPTED" },
-      select: { id: true, providerId: true },
-    });
-
-    if (!acceptedBid) {
-      return res.status(400).json({
-        error: "No accepted bid found for this job. Cannot determine which provider to review.",
-      });
-    }
-
-    const providerId = acceptedBid.providerId;
-
-    const reviewerUserId = req.user.userId;
-    let revieweeUserId: number;
-
-    if (req.user.role === "CONSUMER") {
-      if (job.consumerId !== reviewerUserId) {
-        return res.status(403).json({ error: "You can only review jobs that you created." });
-      }
-      revieweeUserId = providerId;
-    } else {
-      // PROVIDER: only the accepted provider can review the consumer for this job
-      if (providerId !== reviewerUserId) {
-        return res.status(403).json({ error: "Only the accepted provider can review this job." });
-      }
-      revieweeUserId = job.consumerId;
-    }
-
-    // Check if this consumer already reviewed this job+provider → update instead of create
-    const existing = await prisma.review.findUnique({
-      where: {
-        jobId_reviewerUserId: {
-          jobId,
-          reviewerUserId,
-        },
-      },
-    });
-
-    const textValue = moderation.text;
-
-    let review;
-    let eventType: "review.created" | "review.updated" = "review.created";
-
-    if (existing) {
-      eventType = "review.updated";
-      review = await prisma.review.update({
-        where: { id: existing.id },
-        data: {
-          rating: ratingNum,
-          text: textValue,
-          revieweeUserId,
-        },
-      });
-    } else {
-      review = await prisma.review.create({
-        data: {
-          jobId,
-          reviewerUserId,
-          revieweeUserId,
-          rating: ratingNum,
-          text: textValue,
-        },
-      });
-    }
-
-    // Recompute provider's average rating & reviewCount (only when the provider is being reviewed)
-    const ratingSummary =
-      revieweeUserId === providerId ? await recomputeProviderRating(providerId) : null;
-
-    // ✅ Webhook: review created/updated (after review + provider profile update)
-    await enqueueWebhookEvent({
-      eventType,
-      payload: {
-        reviewId: review.id,
-        jobId,
-        jobTitle: job.title,
-        reviewerUserId,
-        revieweeUserId,
-        acceptedBidId: acceptedBid.id,
-        rating: review.rating,
-        text: review.text,
-        createdAt: review.createdAt,
-        updatedAt: review.updatedAt,
-        ratingSummary,
-      },
-    });
-
-    return res.status(existing ? 200 : 201).json({
-      message: existing ? "Review updated." : "Review created.",
-      review,
-      ratingSummary,
-    });
-  } catch (err) {
-    console.error("Create/update review error:", err);
-    return res.status(500).json({
-      error: "Internal server error while creating/updating review.",
-    });
-  }
-});
+  createPostJobReviewsHandler({
+    prisma,
+    moderateReviewText,
+    recomputeProviderRating,
+    enqueueWebhookEvent,
+  })
+);
 
 // GET /jobs/:jobId/reviews → list reviews for a job (both sides)
 app.get(
@@ -5391,95 +5278,16 @@ app.get(
   }
 );
 
-// POST /jobs/:jobId/disputes → open a dispute (consumer or accepted provider)
+// POST /jobs/:jobId/disputes → open a dispute (consumer or accepted/awarded provider)
 app.post(
   "/jobs/:jobId/disputes",
   authMiddleware,
-  validate({
-    params: jobIdParamsSchema,
-    body: z.object({
-      reasonCode: z.string().min(1).max(100),
-      description: z.string().max(5000).optional(),
-    }),
-  }),
-  async (req: AuthRequest, res: Response) => {
-    try {
-      if (!req.user) return res.status(401).json({ error: "Not authenticated" });
-      if (req.user.role !== "CONSUMER" && req.user.role !== "PROVIDER") {
-        return res.status(403).json({ error: "Only consumers or providers can open disputes." });
-      }
-
-      const { jobId } = (req as any).validated.params as { jobId: number };
-      const { reasonCode, description } = (req as any).validated.body as {
-        reasonCode: string;
-        description?: string;
-      };
-
-      const job = await prisma.job.findUnique({
-        where: { id: jobId },
-        select: { id: true, consumerId: true, status: true, title: true },
-      });
-
-      if (!job) return res.status(404).json({ error: "Job not found." });
-
-      if (!canOpenDispute(job.status)) {
-        return res.status(400).json({
-          error: `Disputes can only be opened after completion is requested or confirmed. Current status: ${job.status}.`,
-        });
-      }
-
-      const acceptedBid = await prisma.bid.findFirst({
-        where: { jobId, status: "ACCEPTED" },
-        select: { providerId: true },
-      });
-
-      const me = req.user.userId;
-      const isConsumerParticipant = job.consumerId === me;
-      const isProviderParticipant = acceptedBid?.providerId === me;
-      if (!isConsumerParticipant && !isProviderParticipant && !isAdmin(req)) {
-        return res.status(403).json({ error: "Not allowed." });
-      }
-
-      const existingOpen = await prisma.dispute.findFirst({
-        where: {
-          jobId,
-          status: { in: ["OPEN", "INVESTIGATING"] },
-        },
-        select: { id: true },
-      });
-
-      if (existingOpen) {
-        return res.status(409).json({ error: "A dispute is already open for this job." });
-      }
-
-      const dispute = await prisma.dispute.create({
-        data: {
-          jobId,
-          openedByUserId: me,
-          reasonCode: reasonCode.trim(),
-          description: description?.trim() || null,
-        },
-      });
-
-      await enqueueWebhookEvent({
-        eventType: "dispute.created",
-        payload: {
-          disputeId: dispute.id,
-          jobId: job.id,
-          jobTitle: job.title,
-          openedByUserId: me,
-          reasonCode: dispute.reasonCode,
-          status: dispute.status,
-          createdAt: dispute.createdAt,
-        },
-      });
-
-      return res.status(201).json({ dispute });
-    } catch (err) {
-      console.error("POST /jobs/:jobId/disputes error:", err);
-      return res.status(500).json({ error: "Internal server error while opening dispute." });
-    }
-  }
+  createPostJobDisputesHandler({
+    prisma,
+    createNotification,
+    enqueueWebhookEvent,
+    auditSecurityEvent: logSecurityEvent,
+  })
 );
 
 // --- Job completion confirmation flow ---
@@ -5488,7 +5296,25 @@ app.post(
   "/jobs/:id/mark-complete",
   authMiddleware,
   requireVerifiedEmail,
-  createPostJobMarkCompleteHandler({ prisma, createNotification, enqueueWebhookEvent })
+  createPostJobMarkCompleteHandler({
+    prisma,
+    createNotification,
+    enqueueWebhookEvent,
+    auditSecurityEvent: logSecurityEvent,
+  })
+);
+
+// POST /jobs/:id/start (awarded provider only)
+app.post(
+  "/jobs/:id/start",
+  authMiddleware,
+  requireVerifiedEmail,
+  createPostJobStartHandler({
+    prisma,
+    createNotification,
+    enqueueWebhookEvent,
+    auditSecurityEvent: logSecurityEvent,
+  })
 );
 
 // POST /jobs/:id/confirm-complete (the other participant)
@@ -5496,7 +5322,12 @@ app.post(
   "/jobs/:id/confirm-complete",
   authMiddleware,
   requireVerifiedEmail,
-  createPostJobConfirmCompleteHandler({ prisma, createNotification, enqueueWebhookEvent })
+  createPostJobConfirmCompleteHandler({
+    prisma,
+    createNotification,
+    enqueueWebhookEvent,
+    auditSecurityEvent: logSecurityEvent,
+  })
 );
 
 // GET /admin/disputes → list disputes (admin only)
@@ -5547,7 +5378,7 @@ app.patch(
   validate({
     params: z.object({ id: z.coerce.number().int().positive() }),
     body: z.object({
-      status: z.enum(["OPEN", "INVESTIGATING", "RESOLVED"]).optional(),
+      status: z.enum(["OPEN", "INVESTIGATING"]).optional(),
       resolutionNotes: z.string().max(5000).optional(),
     }),
   }),
@@ -5557,7 +5388,7 @@ app.patch(
 
       const { id } = (req as any).validated.params as { id: number };
       const { status, resolutionNotes } = (req as any).validated.body as {
-        status?: "OPEN" | "INVESTIGATING" | "RESOLVED";
+        status?: "OPEN" | "INVESTIGATING";
         resolutionNotes?: string;
       };
 
@@ -5565,14 +5396,14 @@ app.patch(
       if (!existing) return res.status(404).json({ error: "Dispute not found." });
 
       const nextStatus = status ?? existing.status;
-      const isResolved = nextStatus === "RESOLVED";
 
       const dispute = await prisma.dispute.update({
         where: { id },
         data: {
           status: nextStatus,
           resolutionNotes: resolutionNotes?.trim() || existing.resolutionNotes,
-          resolvedAt: isResolved ? new Date() : null,
+          // Resolution that affects job lifecycle must be done via POST /admin/disputes/:id/resolve
+          resolvedAt: existing.resolvedAt,
         },
       });
 
@@ -5592,6 +5423,18 @@ app.patch(
       return res.status(500).json({ error: "Internal server error while updating dispute." });
     }
   }
+);
+
+// POST /admin/disputes/:id/resolve → resolve dispute + set job status (admin only)
+app.post(
+  "/admin/disputes/:id/resolve",
+  authMiddleware,
+  createPostAdminResolveDisputeHandler({
+    prisma,
+    createNotification,
+    enqueueWebhookEvent,
+    auditSecurityEvent: logSecurityEvent,
+  })
 );
 
 // GET /me/inbox → list "threads" across all jobs for current user
@@ -6170,15 +6013,24 @@ app.get(
           const stats = p.provider.providerStats;
           const avgRating = stats?.avgRating ?? p.rating ?? null;
           const ratingCount = stats?.ratingCount ?? p.reviewCount ?? 0;
-          const ranking = computeProviderDiscoveryRanking({
+
+          const viewerZip = boostedZip;
+          const providerZip = extractZip5(p.provider.location ?? null);
+          const distanceMiles =
+            viewerZip && providerZip
+              ? viewerZip === providerZip
+                ? 0
+                : (zipcodes.distance(viewerZip, providerZip) as number | null)
+              : null;
+
+          const ranking = rankProvider({
+            distanceMiles,
             avgRating,
             ratingCount,
-            jobsCompleted30d: stats?.jobsCompleted30d ?? 0,
-            cancellationRate30d: stats?.cancellationRate30d ?? 0,
-            disputeRate30d: stats?.disputeRate30d ?? 0,
-            reportRate30d: stats?.reportRate30d ?? 0,
+            medianResponseTimeSeconds30d: stats?.medianResponseTimeSeconds30d ?? null,
             subscriptionTier,
             isFeaturedForZip,
+            verificationBadge,
           });
 
           return { profile: p, verificationBadge, isFeaturedForZip, ranking, stats };
@@ -6233,8 +6085,12 @@ app.get(
           isFeaturedForZip,
           ranking: {
             baseScore: ranking.baseScore,
+            distanceScore: ranking.distanceScore,
+            ratingScore: ranking.ratingScore,
+            responseScore: ranking.responseScore,
             tierBoost: ranking.tierBoost,
             featuredBoost: ranking.featuredBoost,
+            verifiedBoost: ranking.verifiedBoost,
             finalScore: ranking.finalScore,
           },
           stats: stats
@@ -6409,15 +6265,23 @@ app.get(
           const avgRating = stats?.avgRating ?? p.rating ?? null;
           const ratingCount = stats?.ratingCount ?? p.reviewCount ?? 0;
 
-          const ranking = computeProviderDiscoveryRanking({
+          const viewerZip = boostedZip;
+          const providerZip = extractZip5(p.provider.location ?? null);
+          const distanceMiles =
+            viewerZip && providerZip
+              ? viewerZip === providerZip
+                ? 0
+                : (zipcodes.distance(viewerZip, providerZip) as number | null)
+              : null;
+
+          const ranking = rankProvider({
+            distanceMiles,
             avgRating,
             ratingCount,
-            jobsCompleted30d: stats?.jobsCompleted30d ?? 0,
-            cancellationRate30d: stats?.cancellationRate30d ?? 0,
-            disputeRate30d: stats?.disputeRate30d ?? 0,
-            reportRate30d: stats?.reportRate30d ?? 0,
+            medianResponseTimeSeconds30d: stats?.medianResponseTimeSeconds30d ?? null,
             subscriptionTier,
             isFeaturedForZip,
+            verificationBadge,
           });
 
           return {
@@ -6488,8 +6352,12 @@ app.get(
           isFeaturedForZip,
           ranking: {
             baseScore: ranking.baseScore,
+            distanceScore: ranking.distanceScore,
+            ratingScore: ranking.ratingScore,
+            responseScore: ranking.responseScore,
             tierBoost: ranking.tierBoost,
             featuredBoost: ranking.featuredBoost,
+            verifiedBoost: ranking.verifiedBoost,
             finalScore: ranking.finalScore,
           },
 
@@ -6633,15 +6501,26 @@ app.get("/providers/search/feed", authMiddleware, async (req: AuthRequest, res: 
           const stats = p.provider.providerStats;
           const avgRating = stats?.avgRating ?? p.rating ?? null;
           const ratingCount = stats?.ratingCount ?? p.reviewCount ?? 0;
-          return computeProviderDiscoveryRanking({
+
+          const verificationBadge = Boolean(p.provider.providerEntitlement?.verificationBadge ?? p.verificationBadge);
+
+          const viewerZip = boostedZip;
+          const providerZip = extractZip5(p.provider.location ?? null);
+          const distanceMiles =
+            viewerZip && providerZip
+              ? viewerZip === providerZip
+                ? 0
+                : (zipcodes.distance(viewerZip, providerZip) as number | null)
+              : null;
+
+          return rankProvider({
+            distanceMiles,
             avgRating,
             ratingCount,
-            jobsCompleted30d: stats?.jobsCompleted30d ?? 0,
-            cancellationRate30d: stats?.cancellationRate30d ?? 0,
-            disputeRate30d: stats?.disputeRate30d ?? 0,
-            reportRate30d: stats?.reportRate30d ?? 0,
+            medianResponseTimeSeconds30d: stats?.medianResponseTimeSeconds30d ?? null,
             subscriptionTier,
             isFeaturedForZip,
+            verificationBadge,
           });
         })(),
         stats: p.provider.providerStats
@@ -6858,26 +6737,54 @@ app.post(
         update: {},
       });
 
-      const diskPath = path.posix.join("attachments", file.filename);
+      const basename = makeUploadBasename(file.originalname);
+      const storageKey = attachmentStorageProvider
+        ? path.posix.join("attachments", "verification", String(req.user.userId), basename)
+        : null;
+      const diskPath = !attachmentStorageProvider
+        ? path.posix.join("attachments", basename)
+        : null;
 
-      const attach = await prisma.providerVerificationAttachment.create({
-        data: {
-          providerId: req.user.userId,
-          uploaderUserId: req.user.userId,
-          diskPath,
-          mimeType: file.mimetype,
-          filename: file.originalname || null,
-          sizeBytes: file.size || null,
-        },
-        select: {
-          id: true,
-          providerId: true,
-          mimeType: true,
-          filename: true,
-          sizeBytes: true,
-          createdAt: true,
-        },
-      });
+      let cleanupOnDbFailure: null | (() => Promise<void>) = null;
+      if (attachmentStorageProvider && storageKey) {
+        await attachmentStorageProvider.putObject(storageKey, file.buffer, file.mimetype);
+        cleanupOnDbFailure = async () => {
+          await attachmentStorageProvider.deleteObject(storageKey).catch(() => null);
+        };
+      } else if (diskPath) {
+        const abs = path.join(UPLOADS_DIR, diskPath);
+        await fs.promises.mkdir(path.dirname(abs), { recursive: true });
+        await fs.promises.writeFile(abs, file.buffer);
+        cleanupOnDbFailure = async () => {
+          await fs.promises.unlink(abs).catch(() => null);
+        };
+      }
+
+      let attach: any;
+      try {
+        attach = await prisma.providerVerificationAttachment.create({
+          data: {
+            providerId: req.user.userId,
+            uploaderUserId: req.user.userId,
+            diskPath,
+            storageKey,
+            mimeType: file.mimetype,
+            filename: file.originalname || null,
+            sizeBytes: file.size || null,
+          },
+          select: {
+            id: true,
+            providerId: true,
+            mimeType: true,
+            filename: true,
+            sizeBytes: true,
+            createdAt: true,
+          },
+        });
+      } catch (e) {
+        await cleanupOnDbFailure?.();
+        throw e;
+      }
 
       const publicBase =
         (process.env.PUBLIC_BASE_URL ?? "").trim() ||
@@ -6918,6 +6825,7 @@ app.get(
           filename: true,
           sizeBytes: true,
           diskPath: true,
+          storageKey: true,
         },
       });
 
@@ -6928,6 +6836,16 @@ app.get(
 
       if (!authorized) {
         return res.status(403).json({ error: "Not allowed to access this attachment." });
+      }
+
+      // New path: object storage -> signed URL
+      if (attach.storageKey && attachmentStorageProvider) {
+        const url = await attachmentStorageProvider.getSignedReadUrl(
+          attach.storageKey,
+          attachmentsSignedUrlTtlSeconds
+        );
+        res.setHeader("Cache-Control", "private, max-age=0, no-store");
+        return res.redirect(302, url);
       }
 
       if (!attach.diskPath) {
@@ -8225,6 +8143,7 @@ app.post(
   authMiddleware,
   requireVerifiedEmail,
   requireAttestation,
+  messageSendLimiter,
   validate(sendMessageSchema),
   uploadSingleAttachment,
   async (req: AuthRequest & { validated: Validated<typeof sendMessageSchema> }, res: Response) => {
@@ -8459,41 +8378,79 @@ app.post(
       // ignore scoring failures
     }
 
-    const created = await prisma.$transaction(async (tx) => {
-      const message = await tx.message.create({
-        data: {
-          jobId,
-          senderId,
-          text: messageText,
-        },
-      });
+    let pendingAttachment: null | {
+      diskPath: string | null;
+      storageKey: string | null;
+      rollback: () => Promise<void>;
+    } = null;
 
-      let attachments: any[] = [];
-      if (file) {
-        const diskPath = path.posix.join("attachments", file.filename);
+    if (file) {
+      const basename = makeUploadBasename(file.originalname);
+      if (attachmentStorageProvider) {
+        const storageKey = path.posix.join("attachments", "message", String(jobId), basename);
+        await attachmentStorageProvider.putObject(storageKey, file.buffer, file.mimetype);
+        pendingAttachment = {
+          diskPath: null,
+          storageKey,
+          rollback: async () => {
+            await attachmentStorageProvider.deleteObject(storageKey).catch(() => null);
+          },
+        };
+      } else {
+        const diskPath = path.posix.join("attachments", basename);
+        const abs = path.join(UPLOADS_DIR, diskPath);
+        await fs.promises.mkdir(path.dirname(abs), { recursive: true });
+        await fs.promises.writeFile(abs, file.buffer);
+        pendingAttachment = {
+          diskPath,
+          storageKey: null,
+          rollback: async () => {
+            await fs.promises.unlink(abs).catch(() => null);
+          },
+        };
+      }
+    }
 
-        const a = await tx.messageAttachment.create({
+    let created: any;
+    try {
+      created = await prisma.$transaction(async (tx) => {
+        const message = await tx.message.create({
           data: {
-            messageId: message.id,
-            url: "",
-            diskPath,
-            uploaderUserId: senderId,
-            mimeType: file.mimetype,
-            filename: file.originalname || null,
-            sizeBytes: file.size || null,
+            jobId,
+            senderId,
+            text: messageText,
           },
         });
 
-        const updated = await tx.messageAttachment.update({
-          where: { id: a.id },
-          data: { url: `${publicBase}/attachments/${a.id}` },
-        });
+        let attachments: any[] = [];
+        if (file && pendingAttachment) {
+          const a = await tx.messageAttachment.create({
+            data: {
+              messageId: message.id,
+              url: "",
+              diskPath: pendingAttachment.diskPath,
+              storageKey: pendingAttachment.storageKey,
+              uploaderUserId: senderId,
+              mimeType: file.mimetype,
+              filename: file.originalname || null,
+              sizeBytes: file.size || null,
+            },
+          });
 
-        attachments = [updated];
-      }
+          const updated = await tx.messageAttachment.update({
+            where: { id: a.id },
+            data: { url: `${publicBase}/attachments/${a.id}` },
+          });
 
-      return { message, attachments };
-    });
+          attachments = [updated];
+        }
+
+        return { message, attachments };
+      });
+    } catch (e) {
+      await pendingAttachment?.rollback();
+      throw e;
+    }
 
     // 🔔 Determine who to notify
     let notifiedUserIds: number[] = [];
@@ -8512,7 +8469,11 @@ app.post(
           await createNotification({
             userId: b.providerId,
             type: "NEW_MESSAGE",
-            content: `New message on job "${job.title}".`,
+            content: {
+              title: "New message",
+              body: `New message on job "${job.title}".`,
+              jobId: job.id,
+            },
           });
         }
       }
@@ -8522,7 +8483,11 @@ app.post(
       await createNotification({
         userId: job.consumerId,
         type: "NEW_MESSAGE",
-        content: `New message on your job "${job.title}".`,
+        content: {
+          title: "New message",
+          body: `New message on your job "${job.title}".`,
+          jobId: job.id,
+        },
       });
     }
 
@@ -8824,7 +8789,7 @@ app.post(
     const previousJobStatus = job.status;
     const now = new Date();
 
-    // Accept in a transaction: accept chosen, decline others, job -> IN_PROGRESS
+    // Accept in a transaction: accept chosen, decline others, job -> AWARDED
     // Also set award fields if the DB has those columns.
     let result: { accepted: any; updatedJob: any };
     try {
@@ -8842,7 +8807,7 @@ app.post(
         const updatedJob = await tx.job.update({
           where: { id: job.id },
           data: {
-            status: "IN_PROGRESS",
+            status: "AWARDED",
             awardedProviderId: bid.providerId,
             awardedAt: now,
           },
@@ -8866,18 +8831,33 @@ app.post(
 
         const updatedJob = await tx.job.update({
           where: { id: job.id },
-          data: { status: "IN_PROGRESS" },
+          data: { status: "AWARDED" },
         });
 
         return { accepted, updatedJob };
       });
     }
 
-    // 🔔 Notify the winning provider
+    // Notify both parties
     await createNotification({
       userId: bid.providerId,
-      type: "BID_ACCEPTED",
-      content: `Your bid was accepted for "${job.title}".`,
+      type: "JOB_AWARDED",
+      content: `You were awarded for "${job.title}".`,
+    });
+    await createNotification({
+      userId: job.consumerId,
+      type: "JOB_AWARDED",
+      content: `You awarded a provider for "${job.title}".`,
+    });
+
+    await logSecurityEvent(req as any, "job.awarded", {
+      targetType: "JOB",
+      targetId: String(job.id),
+      jobId: job.id,
+      previousStatus: previousJobStatus,
+      newStatus: result.updatedJob.status,
+      awardedProviderId: bid.providerId,
+      bidId: bid.id,
     });
 
     // ✅ Webhook 1: bid accepted
@@ -8908,7 +8888,7 @@ app.post(
     });
 
     return res.json({
-      message: "Bid accepted. Job is now IN_PROGRESS.",
+      message: "Bid accepted. Job is now AWARDED.",
       job: result.updatedJob,
       acceptedBid: result.accepted,
     });
@@ -8929,6 +8909,7 @@ app.post(
     prisma,
     createNotification,
     enqueueWebhookEvent,
+    auditSecurityEvent: logSecurityEvent,
   })
 );
 
@@ -8953,6 +8934,7 @@ app.post("/jobs/:jobId/cancel", validate({ params: jobIdParamsSchema }), async (
       select: {
         id: true,
         consumerId: true,
+        awardedProviderId: true,
         status: true,
         title: true,
         location: true,
@@ -8969,10 +8951,10 @@ app.post("/jobs/:jobId/cancel", validate({ params: jobIdParamsSchema }), async (
       return res.status(403).json({ error: "You can only cancel jobs that you created." });
     }
 
-    // Only allow cancel if job is OPEN or IN_PROGRESS
-    if (job.status !== "OPEN" && job.status !== "IN_PROGRESS") {
+    // Only allow cancel if job is OPEN, AWARDED, or IN_PROGRESS
+    if (job.status !== "OPEN" && job.status !== "AWARDED" && job.status !== "IN_PROGRESS") {
       return res.status(400).json({
-        error: `Only jobs that are OPEN or IN_PROGRESS can be cancelled. Current status: ${job.status}.`,
+        error: `Only jobs that are OPEN, AWARDED, or IN_PROGRESS can be cancelled. Current status: ${job.status}.`,
       });
     }
 
@@ -8996,6 +8978,29 @@ app.post("/jobs/:jobId/cancel", validate({ params: jobIdParamsSchema }), async (
         },
       }),
     ]);
+
+    // Notify both parties (if a provider has been awarded)
+    await createNotification({
+      userId: job.consumerId,
+      type: "JOB_CANCELLED",
+      content: `Job "${job.title}" was cancelled.`,
+    });
+    if (typeof job.awardedProviderId === "number") {
+      await createNotification({
+        userId: job.awardedProviderId,
+        type: "JOB_CANCELLED",
+        content: `Job "${job.title}" was cancelled.`,
+      });
+    }
+
+    await logSecurityEvent(req as any, "job.cancelled", {
+      targetType: "JOB",
+      targetId: String(jobId),
+      jobId,
+      previousStatus,
+      newStatus: updatedJob.status,
+      awardedProviderId: typeof job.awardedProviderId === "number" ? job.awardedProviderId : null,
+    });
 
     // ✅ Webhook 1: job cancelled
     await enqueueWebhookEvent({

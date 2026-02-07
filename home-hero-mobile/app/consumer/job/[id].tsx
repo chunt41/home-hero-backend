@@ -47,9 +47,11 @@ type ConsumerJobDetail = {
   location: string | null;
   status:
     | "OPEN"
+    | "AWARDED"
     | "IN_PROGRESS"
     | "COMPLETED_PENDING_CONFIRMATION"
     | "COMPLETED"
+    | "DISPUTED"
     | "CANCELLED"
     | string;
   createdAt: string;
@@ -170,7 +172,7 @@ export default function ConsumerJobDetailScreen() {
       ? `$${job?.budgetMin ?? "?"} - $${job?.budgetMax ?? "?"}`
       : "Budget not listed";
 
-  const canCancel = job?.status === "OPEN" || job?.status === "IN_PROGRESS";
+  const canCancel = job?.status === "OPEN" || job?.status === "AWARDED" || job?.status === "IN_PROGRESS";
   const canComplete = job?.status === "IN_PROGRESS";
   const canConfirmComplete =
     job?.status === "COMPLETED_PENDING_CONFIRMATION" &&
@@ -278,7 +280,7 @@ export default function ConsumerJobDetailScreen() {
                   { text: "Later", style: "cancel" },
                   {
                     text: "Leave review",
-                    onPress: () => router.push(`/consumer/leave-review?jobId=${job.id}`),
+                    onPress: () => router.push(`/leave-review?jobId=${job.id}`),
                   },
                 ]
               );
@@ -310,7 +312,7 @@ export default function ConsumerJobDetailScreen() {
   }, [jobId]);
 
   const goToLeaveReview = useCallback(() => {
-    router.push(`/consumer/leave-review?jobId=${jobId}`);
+    router.push(`/leave-review?jobId=${jobId}`);
   }, [jobId]);
 
   const goToReportJob = useCallback(() => {
@@ -334,8 +336,8 @@ export default function ConsumerJobDetailScreen() {
       Alert.alert("Not awarded", "Award a provider before scheduling.");
       return;
     }
-    if (job.status !== "IN_PROGRESS") {
-      Alert.alert("Not ready", "Scheduling opens once the job is IN_PROGRESS.");
+    if (job.status !== "AWARDED" && job.status !== "IN_PROGRESS") {
+      Alert.alert("Not ready", `Scheduling is not available in status ${job.status}.`);
       return;
     }
 
@@ -505,8 +507,8 @@ export default function ConsumerJobDetailScreen() {
                 </Pressable>
               </View>
 
-              {job.status !== "IN_PROGRESS" ? (
-                <Text style={styles.bodyMuted}>Available once the job is in progress.</Text>
+              {job.status !== "AWARDED" && job.status !== "IN_PROGRESS" ? (
+                <Text style={styles.bodyMuted}>Available once the job is awarded.</Text>
               ) : (
                 <>
                   <Text style={styles.bodyMuted}>Propose a time (scaffold: uses your device timezone).</Text>
