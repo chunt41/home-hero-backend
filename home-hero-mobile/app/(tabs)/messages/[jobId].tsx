@@ -59,6 +59,32 @@ type Msg = {
 
 type PageInfo = { limit: number; nextCursor: number | null };
 type MessagesResponse = { items: Msg[]; pageInfo: PageInfo };
+type ContactExchangeRequestStatus = "PENDING" | "APPROVED" | "REJECTED";
+type ContactExchangeRequest = {
+  id: number;
+  requestedByUserId: number;
+  status: ContactExchangeRequestStatus;
+  createdAt: string;
+  decidedAt: string | null;
+} | null;
+
+type ContactExchangeResponse =
+  | {
+      approved: false;
+      jobId: number;
+      jobStatus: string;
+      request: ContactExchangeRequest;
+    }
+  | {
+      approved: true;
+      jobId: number;
+      jobStatus: string;
+      request: ContactExchangeRequest;
+      contact: {
+        consumer: { id: number; name: string | null; email: string | null; phone: string | null } | null;
+        provider: { id: number; name: string | null; email: string | null; phone: string | null } | null;
+      };
+    };
 
 function formatTime(iso: string) {
   const d = new Date(iso);
@@ -161,6 +187,13 @@ export default function JobMessagesThreadScreen() {
   );
 
   const [error, setError] = useState<string | null>(null);
+  const [blockedBanner, setBlockedBanner] = useState<null | {
+    message: string;
+    appealUrl: string | null;
+  }>(null);
+
+  const [contactExchange, setContactExchange] = useState<ContactExchangeResponse | null>(null);
+  const [contactExchangeLoading, setContactExchangeLoading] = useState(false);
 
   const maxAttachmentBytes = useMemo(() => getMaxAttachmentBytes(), []);
 
@@ -273,6 +306,74 @@ export default function JobMessagesThreadScreen() {
       setQuickRepliesLoading(false);
     }
   }, []);
+
+  // -------------------------
+  // 1c) CONTACT EXCHANGE STATE
+  // -------------------------
+  const fetchContactExchange = useCallback(async () => {
+    if (!Number.isFinite(numericJobId)) return;
+    setContactExchangeLoading(true);
+    try {
+      const data = await api.get<ContactExchangeResponse>(`/jobs/${numericJobId}/contact-exchange`);
+      setContactExchange(data);
+    } catch {
+      // don't fail the whole screen
+      setContactExchange(null);
+    } finally {
+      setContactExchangeLoading(false);
+    }
+  }, [numericJobId]);
+
+  const requestContactExchange = useCallback(async () => {
+    if (!Number.isFinite(numericJobId)) return;
+
+    try {
+      setContactExchangeLoading(true);
+      await api.post(`/jobs/${numericJobId}/contact-exchange/request`, {});
+      await fetchContactExchange();
+      Alert.alert("Request sent", "The other person can approve or reject your request.");
+    } catch (e: any) {
+      const detailCode = e?.details && typeof e.details === "object" ? (e.details as any)?.code : null;
+      const retryAfterSeconds =
+        e?.details && typeof e.details === "object" ? (e.details as any)?.retryAfterSeconds : null;
+
+      if (detailCode === "CONTACT_EXCHANGE_COOLDOWN" && typeof retryAfterSeconds === "number") {
+        Alert.alert(
+          "Please wait",
+          `You can request contact exchange again in about ${Math.max(1, Math.ceil(retryAfterSeconds / 60))} minute(s).`
+        );
+        return;
+      }
+
+      if (detailCode === "CONTACT_EXCHANGE_NOT_AVAILABLE") {
+        Alert.alert(
+          "Not available yet",
+          "Contact exchange is available after a provider is awarded on this job."
+        );
+        return;
+      }
+
+      Alert.alert("Error", e?.message ?? "Failed to request contact exchange.");
+    } finally {
+      setContactExchangeLoading(false);
+    }
+  }, [numericJobId, fetchContactExchange]);
+
+  const decideContactExchange = useCallback(
+    async (decision: "APPROVE" | "REJECT") => {
+      if (!Number.isFinite(numericJobId)) return;
+      try {
+        setContactExchangeLoading(true);
+        await api.post(`/jobs/${numericJobId}/contact-exchange/decide`, { decision });
+        await fetchContactExchange();
+      } catch (e: any) {
+        Alert.alert("Error", e?.message ?? "Failed to update contact exchange.");
+      } finally {
+        setContactExchangeLoading(false);
+      }
+    },
+    [numericJobId, fetchContactExchange]
+  );
 
   // -------------------------
   // 2) KEYBOARD HEIGHT (Android spacer)
@@ -515,6 +616,7 @@ export default function JobMessagesThreadScreen() {
         } else {
           setQuickReplies([]);
         }
+        await fetchContactExchange();
         await fetchPage("initial");
         await markRead();
         startPolling();
@@ -523,7 +625,7 @@ export default function JobMessagesThreadScreen() {
       return () => {
         stopPolling();
       };
-    }, [loadMe, fetchReadStates, fetchQuickReplies, fetchPage, markRead, startPolling, stopPolling])
+    }, [loadMe, fetchReadStates, fetchQuickReplies, fetchContactExchange, fetchPage, markRead, startPolling, stopPolling])
   );
 
   // -------------------------
@@ -651,16 +753,49 @@ export default function JobMessagesThreadScreen() {
         await fetchPage("refresh");
         await markRead();
         await fetchReadStates();
+
+        return { outcome: "sent" as const };
       } catch (e: any) {
+        const details = e?.details;
+        const detailCode = details && typeof details === "object" ? (details as any)?.code : null;
+        const appealUrl = details && typeof details === "object" ? (details as any)?.appealUrl : null;
+
+        const isModerationBlock =
+          e?.status === 400 &&
+          (detailCode === "MESSAGE_BLOCKED" || detailCode === "CONTACT_INFO_NOT_ALLOWED");
+
+        if (isModerationBlock) {
+          // If this was a fresh send (not a retry), don't leave a failed bubble.
+          if (!tempId) {
+            setItems((prev) => prev.filter((m) => m.id !== optimisticId));
+          } else {
+            setItems((prev) =>
+              prev.map((m) =>
+                m.id === optimisticId ? { ...m, _status: "FAILED" as const } : m
+              )
+            );
+          }
+
+          const msg =
+            e?.message ??
+            "Your message was blocked for your safety. Please keep communication in-app.";
+
+          setBlockedBanner({
+            message: msg,
+            appealUrl:
+              typeof appealUrl === "string" && appealUrl.trim()
+                ? appealUrl.trim()
+                : null,
+          });
+
+          return { outcome: "blocked" as const };
+        }
+
         setItems((prev) =>
           prev.map((m) =>
             m.id === optimisticId ? { ...m, _status: "FAILED" as const } : m
           )
         );
-
-        const details = e?.details;
-        const detailCode = details && typeof details === "object" ? (details as any)?.code : null;
-        const appealUrl = details && typeof details === "object" ? (details as any)?.appealUrl : null;
 
         if (e?.status === 403 && e?.details?.code === "RESTRICTED") {
           const msg =
@@ -668,30 +803,11 @@ export default function JobMessagesThreadScreen() {
             "Your account is temporarily restricted from sending messages. Please try again later.";
           Alert.alert("Temporarily restricted", msg);
           setError(msg);
-        } else if (e?.status === 400 && (detailCode === "MESSAGE_BLOCKED" || detailCode === "CONTACT_INFO_NOT_ALLOWED")) {
-          const msg =
-            e?.message ??
-            "Your message was blocked for your safety. Please keep communication in-app.";
-
-          const buttons: any[] = [{ text: "OK" }];
-          if (typeof appealUrl === "string" && appealUrl.trim()) {
-            buttons.unshift({
-              text: "Appeal",
-              onPress: () => {
-                try {
-                  Linking.openURL(appealUrl);
-                } catch {
-                  // ignore
-                }
-              },
-            });
-          }
-
-          Alert.alert("Message blocked", msg, buttons);
-          setError(msg);
         } else {
           setError(e?.message ?? "Failed to send.");
         }
+
+        return { outcome: "failed" as const };
       }
     },
     [
@@ -712,12 +828,16 @@ export default function JobMessagesThreadScreen() {
 
     setSending(true);
     setError(null);
+    setBlockedBanner(null);
 
     try {
       const attachmentToSend = pendingAttachment;
-      setText("");
-      setPendingAttachment(null);
-      await sendMessage(trimmed, undefined, attachmentToSend);
+      const result = await sendMessage(trimmed, undefined, attachmentToSend);
+
+      if (result?.outcome === "sent") {
+        setText("");
+        setPendingAttachment(null);
+      }
     } finally {
       setSending(false);
     }
@@ -974,6 +1094,142 @@ export default function JobMessagesThreadScreen() {
               />
 
               <View style={styles.composer}>
+                {blockedBanner ? (
+                  <View style={styles.blockedBanner}>
+                    <View style={styles.blockedBannerHeader}>
+                      <Text style={styles.blockedBannerTitle}>Message blocked</Text>
+                      <Pressable
+                        onPress={() => setBlockedBanner(null)}
+                        hitSlop={8}
+                      >
+                        <Text style={styles.blockedBannerDismiss}>×</Text>
+                      </Pressable>
+                    </View>
+                    <Text style={styles.blockedBannerText}>{blockedBanner.message}</Text>
+                    {blockedBanner.appealUrl ? (
+                      <Pressable
+                        onPress={() => {
+                          try {
+                            Linking.openURL(blockedBanner.appealUrl!);
+                          } catch {
+                            // ignore
+                          }
+                        }}
+                      >
+                        <Text style={styles.blockedBannerLink}>Appeal</Text>
+                      </Pressable>
+                    ) : null}
+                  </View>
+                ) : null}
+
+                <View style={styles.contactExchangeBox}>
+                  <View style={styles.contactExchangeHeader}>
+                    <Text style={styles.contactExchangeTitle}>Contact exchange</Text>
+                    <Pressable
+                      onPress={fetchContactExchange}
+                      disabled={contactExchangeLoading}
+                      hitSlop={8}
+                    >
+                      <Text style={styles.contactExchangeRefresh}>
+                        {contactExchangeLoading ? "Refreshing…" : "Refresh"}
+                      </Text>
+                    </Pressable>
+                  </View>
+
+                  <View style={styles.contactExchangeBody}>
+                    {contactExchangeLoading && !contactExchange ? (
+                      <Text style={styles.contactExchangeHint}>Loading…</Text>
+                    ) : contactExchange?.approved && contactExchange.contact.consumer && contactExchange.contact.provider ? (
+                      <>
+                        <Text style={styles.contactExchangeApproved}>Approved</Text>
+                        <View style={styles.contactExchangeContacts}>
+                          <View style={styles.contactExchangeContactCol}>
+                            <Text style={styles.contactExchangeContactLabel}>Consumer</Text>
+                            <Text style={styles.contactExchangeContactValue}>
+                              {contactExchange.contact.consumer.name ?? ""}
+                            </Text>
+                            <Text style={styles.contactExchangeContactValue}>
+                              {contactExchange.contact.consumer.email ?? ""}
+                            </Text>
+                            <Text style={styles.contactExchangeContactValue}>
+                              {contactExchange.contact.consumer.phone ?? ""}
+                            </Text>
+                          </View>
+                          <View style={styles.contactExchangeContactCol}>
+                            <Text style={styles.contactExchangeContactLabel}>Provider</Text>
+                            <Text style={styles.contactExchangeContactValue}>
+                              {contactExchange.contact.provider.name ?? ""}
+                            </Text>
+                            <Text style={styles.contactExchangeContactValue}>
+                              {contactExchange.contact.provider.email ?? ""}
+                            </Text>
+                            <Text style={styles.contactExchangeContactValue}>
+                              {contactExchange.contact.provider.phone ?? ""}
+                            </Text>
+                          </View>
+                        </View>
+                      </>
+                    ) : contactExchange?.request ? (
+                      contactExchange.request.status === "PENDING" ? (
+                        contactExchange.request.requestedByUserId === myUserId ? (
+                          <Text style={styles.contactExchangePending}>
+                            Request pending approval.
+                          </Text>
+                        ) : (
+                          <View style={styles.contactExchangeDecisionRow}>
+                            <Pressable
+                              style={[
+                                styles.contactExchangeApprove,
+                                contactExchangeLoading && styles.btnDisabled,
+                              ]}
+                              disabled={contactExchangeLoading}
+                              onPress={() => decideContactExchange("APPROVE")}
+                            >
+                              <Text style={styles.contactExchangeDecisionText}>Approve</Text>
+                            </Pressable>
+                            <Pressable
+                              style={[
+                                styles.contactExchangeReject,
+                                contactExchangeLoading && styles.btnDisabled,
+                              ]}
+                              disabled={contactExchangeLoading}
+                              onPress={() => decideContactExchange("REJECT")}
+                            >
+                              <Text style={styles.contactExchangeDecisionText}>Reject</Text>
+                            </Pressable>
+                          </View>
+                        )
+                      ) : contactExchange.request.status === "REJECTED" ? (
+                        <Text style={styles.contactExchangeHint}>
+                          Request rejected. You can request again later.
+                        </Text>
+                      ) : (
+                        <Text style={styles.contactExchangeHint}>
+                          Approved. Tap Refresh to load contact details.
+                        </Text>
+                      )
+                    ) : (
+                      <>
+                        <Text style={styles.contactExchangeHint}>
+                          Want to share contact details? Send a request to the other person.
+                        </Text>
+                        <Pressable
+                          style={[
+                            styles.contactExchangeRequestBtn,
+                            contactExchangeLoading && styles.btnDisabled,
+                          ]}
+                          onPress={requestContactExchange}
+                          disabled={contactExchangeLoading}
+                        >
+                          <Text style={styles.contactExchangeRequestText}>
+                            Request contact exchange
+                          </Text>
+                        </Pressable>
+                      </>
+                    )}
+                  </View>
+                </View>
+
                 {pendingAttachment ? (
                   <View style={styles.pendingRow}>
                     <Text style={styles.pendingText} numberOfLines={1}>
@@ -1178,21 +1434,168 @@ const styles = StyleSheet.create({
     padding: 12,
     borderTopWidth: 1,
     borderTopColor: "#0f172a",
-    backgroundColor: "#020617",
   },
-  quickRepliesWrap: {
+
+  blockedBanner: {
+    marginTop: 10,
+    padding: 12,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "#7c2d12",
+    backgroundColor: "#1f130a",
     marginBottom: 10,
-    backgroundColor: "#020617",
   },
-  quickRepliesHeader: {
+  blockedBannerHeader: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
+    marginBottom: 6,
+  },
+  blockedBannerTitle: {
+    color: "#fdba74",
+    fontWeight: "900",
+  },
+  blockedBannerDismiss: {
+    color: "#94a3b8",
+    fontWeight: "900",
+    fontSize: 18,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    marginRight: -6,
+  },
+  blockedBannerText: {
+    color: "#fed7aa",
+  },
+  blockedBannerLink: {
+    color: "#38bdf8",
+    fontWeight: "900",
+    marginTop: 8,
+  },
+  blockedBannerActions: {
+    gap: 8,
+  },
+  blockedBannerBtn: {
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    borderRadius: 10,
+    backgroundColor: "#0f172a",
+    borderWidth: 1,
+    borderColor: "#1e293b",
+  },
+  blockedBannerBtnText: {
+    color: "#e2e8f0",
+    fontWeight: "800",
+    fontSize: 12,
+  },
+
+  contactExchangeBox: {
+    borderWidth: 1,
+    borderColor: "#1e293b",
+    backgroundColor: "#0b1220",
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 10,
+  },
+  contactExchangeHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 8,
+  },
+  contactExchangeTitle: {
+    color: "#fff",
+    fontWeight: "900",
+  },
+  contactExchangeRefresh: {
+    color: "#38bdf8",
+    fontWeight: "800",
+  },
+  contactExchangeBody: {
+    gap: 10,
+  },
+  contactExchangeHint: {
+    color: "#94a3b8",
+  },
+  contactExchangePending: {
+    color: "#e2e8f0",
+    fontWeight: "800",
+  },
+  contactExchangeApproved: {
+    color: "#34d399",
+    fontWeight: "900",
+  },
+  contactExchangeContacts: {
+    flexDirection: "row",
+    gap: 12,
+  },
+  contactExchangeContactCol: {
+    flex: 1,
+    gap: 6,
+  },
+  contactExchangeContactLabel: {
+    color: "#94a3b8",
+    fontWeight: "800",
+    fontSize: 12,
+  },
+  contactExchangeContactValue: {
+    color: "#38bdf8",
+    fontWeight: "800",
+  },
+  contactExchangeDecisionRow: {
+    flexDirection: "row",
+    gap: 10,
+  },
+  contactExchangeApprove: {
+    flex: 1,
+    paddingVertical: 10,
+    borderRadius: 12,
+    backgroundColor: "#064e3b",
+    borderWidth: 1,
+    borderColor: "#065f46",
+    alignItems: "center",
+  },
+  contactExchangeReject: {
+    flex: 1,
+    paddingVertical: 10,
+    borderRadius: 12,
+    backgroundColor: "#3f1d1d",
+    borderWidth: 1,
+    borderColor: "#7f1d1d",
+    alignItems: "center",
+  },
+  contactExchangeDecisionText: {
+    color: "#fff",
+    fontWeight: "900",
+  },
+  contactExchangeRequestBtn: {
+    paddingVertical: 10,
+    borderRadius: 12,
+    backgroundColor: "#0f172a",
+    borderWidth: 1,
+    borderColor: "#1e293b",
+    alignItems: "center",
+  },
+  contactExchangeRequestText: {
+    color: "#e2e8f0",
+    fontWeight: "900",
+  },
+
+  quickRepliesWrap: {
+    borderWidth: 1,
+    borderColor: "#1e293b",
+    backgroundColor: "#0b1220",
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 10,
+  },
+  quickRepliesHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
     marginBottom: 8,
   },
   quickRepliesTitle: {
-    color: "#94a3b8",
-    fontSize: 12,
+    color: "#fff",
     fontWeight: "900",
   },
   quickRepliesManage: {
@@ -1220,6 +1623,7 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: "900",
   },
+
   composerRow: {
     flexDirection: "row",
     gap: 10,

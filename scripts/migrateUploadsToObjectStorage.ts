@@ -3,37 +3,26 @@ import * as path from "node:path";
 
 import { prisma } from "../src/prisma";
 import { resolveDiskPathInsideUploadsDir } from "../src/utils/attachmentsGuard";
-import {
-  getObjectStorageProviderName,
-  getStorageProviderOrThrow,
-} from "../src/storage/storageFactory";
+import { getStorageProviderOrThrow } from "../src/storage/storageFactory";
 
 type Flags = {
   dryRun: boolean;
-  clearDiskPath: boolean;
-  deleteLocal: boolean;
   limit: number | null;
 };
 
 function parseFlags(argv: string[]): Flags {
   const flags: Flags = {
     dryRun: false,
-    clearDiskPath: false,
-    deleteLocal: false,
     limit: null,
   };
 
   for (const arg of argv) {
     if (arg === "--dry-run") flags.dryRun = true;
-    else if (arg === "--clear-disk-path") flags.clearDiskPath = true;
-    else if (arg === "--delete-local") flags.deleteLocal = true;
     else if (arg.startsWith("--limit=")) {
       const n = Number(arg.slice("--limit=".length));
       flags.limit = Number.isFinite(n) && n > 0 ? Math.floor(n) : null;
     }
   }
-
-  if (flags.deleteLocal) flags.clearDiskPath = true;
   return flags;
 }
 
@@ -46,15 +35,32 @@ async function fileExists(p: string): Promise<boolean> {
   }
 }
 
+function sanitizeFilenameForStorageKey(filename: string): string {
+  const base = path.posix.basename(String(filename || "file")).trim() || "file";
+  // Keep a conservative set of characters.
+  const cleaned = base
+    .replace(/\\/g, "_")
+    .replace(/\//g, "_")
+    .replace(/\s+/g, "_")
+    .replace(/[^a-zA-Z0-9._-]/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_+|_+$/g, "");
+
+  // Avoid empty result.
+  return cleaned || "file";
+}
+
+function makeDeterministicStorageKey(args: {
+  namespace: "job" | "message" | "verification";
+  id: number;
+  filename: string;
+}): string {
+  const safeName = sanitizeFilenameForStorageKey(args.filename);
+  return path.posix.join("attachments", args.namespace, String(args.id), safeName);
+}
+
 async function main() {
   const flags = parseFlags(process.argv.slice(2));
-
-  const providerName = getObjectStorageProviderName();
-  if (providerName !== "s3") {
-    throw new Error(
-      "This migration requires OBJECT_STORAGE_PROVIDER=s3 (S3/R2 compatible)."
-    );
-  }
 
   const storage = getStorageProviderOrThrow();
 
@@ -62,20 +68,35 @@ async function main() {
 
   console.log("[migrate] starting", {
     dryRun: flags.dryRun,
-    clearDiskPath: flags.clearDiskPath,
-    deleteLocal: flags.deleteLocal,
     limit: flags.limit,
     uploadsDir,
   });
 
   let migrated = 0;
+  let failed = 0;
+  let processed = 0;
   let skippedMissingFile = 0;
   let skippedInvalidPath = 0;
+  let skippedNoDiskPath = 0;
 
   async function maybeStop() {
     if (flags.limit !== null && migrated >= flags.limit) {
       console.log("[migrate] reached limit, stopping", { migrated });
       process.exit(0);
+    }
+  }
+
+  function logProgress() {
+    // best-effort periodic progress logging
+    if (processed > 0 && processed % 25 === 0) {
+      console.log("[migrate] progress", {
+        processed,
+        migrated,
+        failed,
+        skippedMissingFile,
+        skippedInvalidPath,
+        skippedNoDiskPath,
+      });
     }
   }
 
@@ -99,6 +120,7 @@ async function main() {
           jobId: true,
           diskPath: true,
           mimeType: true,
+          filename: true,
         },
       });
 
@@ -106,50 +128,61 @@ async function main() {
       lastId = rows[rows.length - 1].id;
 
       for (const row of rows) {
-        if (!row.diskPath) continue;
+        processed += 1;
+        logProgress();
 
-        let abs: string;
+        if (!row.diskPath) {
+          skippedNoDiskPath += 1;
+          continue;
+        }
+
         try {
-          abs = resolveDiskPathInsideUploadsDir(uploadsDir, row.diskPath);
-        } catch {
-          skippedInvalidPath += 1;
-          continue;
-        }
+          let abs: string;
+          try {
+            abs = resolveDiskPathInsideUploadsDir(uploadsDir, row.diskPath);
+          } catch {
+            skippedInvalidPath += 1;
+            continue;
+          }
 
-        if (!(await fileExists(abs))) {
-          skippedMissingFile += 1;
-          continue;
-        }
+          if (!(await fileExists(abs))) {
+            skippedMissingFile += 1;
+            console.warn("[migrate] missing_file", { kind: "job", id: row.id, diskPath: row.diskPath });
+            continue;
+          }
 
-        const basename = path.posix.basename(row.diskPath);
-        const storageKey = path.posix.join(
-          "attachments",
-          "job",
-          String(row.jobId),
-          basename
-        );
-
-        if (!flags.dryRun) {
-          const buf = await fs.promises.readFile(abs);
-          const ct = row.mimeType || "application/octet-stream";
-
-          await storage.putObject(storageKey, buf, ct);
-
-          await prisma.jobAttachment.update({
-            where: { id: row.id },
-            data: {
-              storageKey,
-              ...(flags.clearDiskPath ? { diskPath: null } : {}),
-            },
+          const filename = row.filename || path.posix.basename(row.diskPath);
+          const storageKey = makeDeterministicStorageKey({
+            namespace: "job",
+            id: row.id,
+            filename,
           });
 
-          if (flags.deleteLocal) {
-            await fs.promises.unlink(abs).catch(() => null);
-          }
-        }
+          if (!flags.dryRun) {
+            const buf = await fs.promises.readFile(abs);
+            const ct = row.mimeType || "application/octet-stream";
+            await storage.putObject(storageKey, buf, ct);
 
-        migrated += 1;
-        await maybeStop();
+            await prisma.jobAttachment.update({
+              where: { id: row.id },
+              data: {
+                storageKey,
+                // Keep diskPath for rollback.
+              },
+            });
+          }
+
+          migrated += 1;
+          await maybeStop();
+        } catch (e: any) {
+          failed += 1;
+          console.error("[migrate] job_attachment_failed", {
+            id: row.id,
+            diskPath: row.diskPath,
+            message: String(e?.message ?? e),
+          });
+          continue;
+        }
       }
     }
   }
@@ -173,6 +206,7 @@ async function main() {
           id: true,
           diskPath: true,
           mimeType: true,
+          filename: true,
           message: { select: { jobId: true } },
         },
       });
@@ -181,50 +215,61 @@ async function main() {
       lastId = rows[rows.length - 1].id;
 
       for (const row of rows) {
-        if (!row.diskPath) continue;
+        processed += 1;
+        logProgress();
 
-        let abs: string;
+        if (!row.diskPath) {
+          skippedNoDiskPath += 1;
+          continue;
+        }
+
         try {
-          abs = resolveDiskPathInsideUploadsDir(uploadsDir, row.diskPath);
-        } catch {
-          skippedInvalidPath += 1;
-          continue;
-        }
+          let abs: string;
+          try {
+            abs = resolveDiskPathInsideUploadsDir(uploadsDir, row.diskPath);
+          } catch {
+            skippedInvalidPath += 1;
+            continue;
+          }
 
-        if (!(await fileExists(abs))) {
-          skippedMissingFile += 1;
-          continue;
-        }
+          if (!(await fileExists(abs))) {
+            skippedMissingFile += 1;
+            console.warn("[migrate] missing_file", { kind: "message", id: row.id, diskPath: row.diskPath });
+            continue;
+          }
 
-        const basename = path.posix.basename(row.diskPath);
-        const storageKey = path.posix.join(
-          "attachments",
-          "message",
-          String(row.message.jobId),
-          basename
-        );
-
-        if (!flags.dryRun) {
-          const buf = await fs.promises.readFile(abs);
-          const ct = row.mimeType || "application/octet-stream";
-
-          await storage.putObject(storageKey, buf, ct);
-
-          await prisma.messageAttachment.update({
-            where: { id: row.id },
-            data: {
-              storageKey,
-              ...(flags.clearDiskPath ? { diskPath: null } : {}),
-            },
+          const filename = row.filename || path.posix.basename(row.diskPath);
+          const storageKey = makeDeterministicStorageKey({
+            namespace: "message",
+            id: row.id,
+            filename,
           });
 
-          if (flags.deleteLocal) {
-            await fs.promises.unlink(abs).catch(() => null);
-          }
-        }
+          if (!flags.dryRun) {
+            const buf = await fs.promises.readFile(abs);
+            const ct = row.mimeType || "application/octet-stream";
+            await storage.putObject(storageKey, buf, ct);
 
-        migrated += 1;
-        await maybeStop();
+            await prisma.messageAttachment.update({
+              where: { id: row.id },
+              data: {
+                storageKey,
+                // Keep diskPath for rollback.
+              },
+            });
+          }
+
+          migrated += 1;
+          await maybeStop();
+        } catch (e: any) {
+          failed += 1;
+          console.error("[migrate] message_attachment_failed", {
+            id: row.id,
+            diskPath: row.diskPath,
+            message: String(e?.message ?? e),
+          });
+          continue;
+        }
       }
     }
   }
@@ -249,6 +294,7 @@ async function main() {
           providerId: true,
           diskPath: true,
           mimeType: true,
+          filename: true,
         },
       });
 
@@ -256,50 +302,65 @@ async function main() {
       lastId = rows[rows.length - 1].id;
 
       for (const row of rows) {
-        if (!row.diskPath) continue;
+        processed += 1;
+        logProgress();
 
-        let abs: string;
+        if (!row.diskPath) {
+          skippedNoDiskPath += 1;
+          continue;
+        }
+
         try {
-          abs = resolveDiskPathInsideUploadsDir(uploadsDir, row.diskPath);
-        } catch {
-          skippedInvalidPath += 1;
-          continue;
-        }
+          let abs: string;
+          try {
+            abs = resolveDiskPathInsideUploadsDir(uploadsDir, row.diskPath);
+          } catch {
+            skippedInvalidPath += 1;
+            continue;
+          }
 
-        if (!(await fileExists(abs))) {
-          skippedMissingFile += 1;
-          continue;
-        }
+          if (!(await fileExists(abs))) {
+            skippedMissingFile += 1;
+            console.warn("[migrate] missing_file", {
+              kind: "verification",
+              id: row.id,
+              diskPath: row.diskPath,
+            });
+            continue;
+          }
 
-        const basename = path.posix.basename(row.diskPath);
-        const storageKey = path.posix.join(
-          "attachments",
-          "verification",
-          String(row.providerId),
-          basename
-        );
-
-        if (!flags.dryRun) {
-          const buf = await fs.promises.readFile(abs);
-          const ct = row.mimeType || "application/octet-stream";
-
-          await storage.putObject(storageKey, buf, ct);
-
-          await prisma.providerVerificationAttachment.update({
-            where: { id: row.id },
-            data: {
-              storageKey,
-              ...(flags.clearDiskPath ? { diskPath: null } : {}),
-            },
+          const filename = row.filename || path.posix.basename(row.diskPath);
+          const storageKey = makeDeterministicStorageKey({
+            namespace: "verification",
+            id: row.id,
+            filename,
           });
 
-          if (flags.deleteLocal) {
-            await fs.promises.unlink(abs).catch(() => null);
-          }
-        }
+          if (!flags.dryRun) {
+            const buf = await fs.promises.readFile(abs);
+            const ct = row.mimeType || "application/octet-stream";
+            await storage.putObject(storageKey, buf, ct);
 
-        migrated += 1;
-        await maybeStop();
+            await prisma.providerVerificationAttachment.update({
+              where: { id: row.id },
+              data: {
+                storageKey,
+                // Keep diskPath for rollback.
+              },
+            });
+          }
+
+          migrated += 1;
+          await maybeStop();
+        } catch (e: any) {
+          failed += 1;
+          console.error("[migrate] verification_attachment_failed", {
+            id: row.id,
+            diskPath: row.diskPath,
+            message: String(e?.message ?? e),
+          });
+          continue;
+        }
       }
     }
   }
@@ -309,10 +370,18 @@ async function main() {
   await migrateVerificationAttachments();
 
   console.log("[migrate] done", {
+    processed,
     migrated,
+    failed,
     skippedMissingFile,
     skippedInvalidPath,
+    skippedNoDiskPath,
   });
+
+  if (failed > 0) {
+    // Non-zero exit code for visibility in CI/ops, but we still processed everything.
+    process.exitCode = 1;
+  }
 }
 
 main()

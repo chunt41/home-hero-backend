@@ -26,7 +26,6 @@ test("production readiness: .env.example includes required production keys", () 
 
     // Object storage
     "OBJECT_STORAGE_PROVIDER",
-    "OBJECT_STORAGE_ALLOW_DISK_IN_PROD",
     "OBJECT_STORAGE_S3_BUCKET",
     "OBJECT_STORAGE_S3_REGION",
     "OBJECT_STORAGE_S3_ACCESS_KEY_ID",

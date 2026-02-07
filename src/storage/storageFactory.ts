@@ -17,18 +17,14 @@ export function getObjectStorageProviderName(): ObjectStorageProviderName {
 }
 
 export function validateObjectStorageStartupOrThrow() {
-  // We want object storage in prod, but allow an explicit escape hatch.
   if ((process.env.NODE_ENV ?? "development") !== "production") return;
 
-  const allowDisk = envBool("OBJECT_STORAGE_ALLOW_DISK_IN_PROD", false);
   const provider = getObjectStorageProviderName();
-  if (provider === "disk" && !allowDisk) {
-    throw new Error(
-      "FATAL: OBJECT_STORAGE_PROVIDER must be 's3' in production (or set OBJECT_STORAGE_ALLOW_DISK_IN_PROD=true as an emergency escape hatch)."
-    );
+  if (provider !== "s3") {
+    throw new Error("FATAL: OBJECT_STORAGE_PROVIDER must be 's3' in production.");
   }
 
-  if (provider === "s3") {
+  {
     // createS3StorageProvider will validate required env vars.
     createS3StorageProvider({
       bucket: String(process.env.OBJECT_STORAGE_S3_BUCKET ?? ""),
@@ -55,7 +51,7 @@ export function getStorageProviderOrThrow(): StorageProvider {
   }
 
   throw new Error(
-    "Object storage provider is not configured. Set OBJECT_STORAGE_PROVIDER=s3 (recommended), or OBJECT_STORAGE_ALLOW_DISK_IN_PROD=true for temporary disk fallback."
+    "Object storage provider is not configured. Set OBJECT_STORAGE_PROVIDER=s3."
   );
 }
 

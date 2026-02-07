@@ -1,5 +1,6 @@
 import { prisma } from "../prisma";
 import { isExpoPushToken, sendExpoPush } from "./expoPush";
+import { getNotificationPreferencesMap, shouldSendNotification } from "./notificationPreferences";
 import zipcodes from "zipcodes";
 import { matchSavedSearchToJob } from "./savedSearchMatcher";
 import { computeJobMatchScore, extractZip } from "./jobMatchRanking";
@@ -345,6 +346,14 @@ export async function processJobMatchNotify(payload: JobMatchPayload): Promise<v
     toNotify = toNotify.filter((s) => (counts.get(s.provider.id) ?? 0) < providerWindowMax);
   }
 
+  // Respect per-user preferences / quiet hours (fail-open if table isn't migrated yet)
+  const notifyNow = new Date();
+  const prefMap = await getNotificationPreferencesMap({
+    prisma: prisma as any,
+    userIds: toNotify.map((s) => s.provider.id),
+  });
+  toNotify = toNotify.filter((s) => shouldSendNotification(prefMap.get(s.provider.id), "JOB_MATCH", notifyNow));
+
   if (!toNotify.length) return;
 
   const title = "New job near you";
@@ -382,21 +391,23 @@ export async function processJobMatchNotify(payload: JobMatchPayload): Promise<v
   });
 
   // Send push notifications (best-effort)
-  const pushMessages = toNotify
-    .flatMap(({ provider }) => provider.pushTokens ?? [])
-    .map((t) => t.token)
-    .filter((token) => isExpoPushToken(token))
-    .map((token) => ({
-      to: token,
-      title,
-      body,
-      sound: "default" as const,
-      priority: "high" as const,
-      data: { type: "job.match", jobId: job.id },
-    }));
+  const pushMessages = toNotify.flatMap(({ provider }) =>
+    (provider.pushTokens ?? [])
+      .map((t) => t.token)
+      .filter((token) => isExpoPushToken(token))
+      .map((token) => ({
+        to: token,
+        userId: provider.id,
+        title,
+        body,
+        sound: "default" as const,
+        priority: "high" as const,
+        data: { type: "job.match", jobId: job.id },
+      }))
+  );
 
   if (pushMessages.length) {
-    await sendExpoPush(pushMessages);
+    await sendExpoPush(pushMessages, { prisma, deadLetter: { enabled: true } });
   }
 }
 

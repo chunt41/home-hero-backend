@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import { validateAttestationStartupOrThrow } from "../attestation/startupValidation";
 import { validateRateLimitRedisStartupOrThrow } from "../middleware/rateLimitRedis";
 import { validateObjectStorageStartupOrThrow } from "../storage/storageFactory";
+import { validateStripeStartupOrThrow } from "../services/stripeService";
 
 function withEnv(overrides: Record<string, string | undefined>, fn: () => void) {
   const prev: Record<string, string | undefined> = {};
@@ -36,26 +37,14 @@ test("production readiness: Redis rate limit env required in production", () => 
   });
 });
 
-test("production readiness: object storage must be S3 in prod unless escape hatch", () => {
+test("production readiness: object storage must be S3 in prod", () => {
   withEnv(
     {
       NODE_ENV: "production",
       OBJECT_STORAGE_PROVIDER: "disk",
-      OBJECT_STORAGE_ALLOW_DISK_IN_PROD: "false",
     },
     () => {
       assert.throws(() => validateObjectStorageStartupOrThrow(), /OBJECT_STORAGE_PROVIDER/);
-    }
-  );
-
-  withEnv(
-    {
-      NODE_ENV: "production",
-      OBJECT_STORAGE_PROVIDER: "disk",
-      OBJECT_STORAGE_ALLOW_DISK_IN_PROD: "true",
-    },
-    () => {
-      assert.doesNotThrow(() => validateObjectStorageStartupOrThrow());
     }
   );
 
@@ -64,7 +53,6 @@ test("production readiness: object storage must be S3 in prod unless escape hatc
     {
       NODE_ENV: "production",
       OBJECT_STORAGE_PROVIDER: "s3",
-      OBJECT_STORAGE_ALLOW_DISK_IN_PROD: "false",
       OBJECT_STORAGE_S3_BUCKET: "",
       OBJECT_STORAGE_S3_REGION: "",
       OBJECT_STORAGE_S3_ACCESS_KEY_ID: "",
@@ -79,7 +67,6 @@ test("production readiness: object storage must be S3 in prod unless escape hatc
     {
       NODE_ENV: "production",
       OBJECT_STORAGE_PROVIDER: "s3",
-      OBJECT_STORAGE_ALLOW_DISK_IN_PROD: "false",
       OBJECT_STORAGE_S3_BUCKET: "bucket",
       OBJECT_STORAGE_S3_REGION: "us-east-1",
       OBJECT_STORAGE_S3_ACCESS_KEY_ID: "akid",
@@ -107,4 +94,14 @@ test("production readiness: attestation enforcement fails fast when missing conf
       assert.throws(() => validateAttestationStartupOrThrow(), /App attestation is enforced/);
     }
   );
+});
+
+test("production readiness: Stripe webhook secret required in production", () => {
+  withEnv({ NODE_ENV: "production", STRIPE_WEBHOOK_SECRET: undefined }, () => {
+    assert.throws(() => validateStripeStartupOrThrow(), /STRIPE_WEBHOOK_SECRET/);
+  });
+
+  withEnv({ NODE_ENV: "production", STRIPE_WEBHOOK_SECRET: "whsec_dummy" }, () => {
+    assert.doesNotThrow(() => validateStripeStartupOrThrow());
+  });
 });

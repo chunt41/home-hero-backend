@@ -46,7 +46,7 @@ These are fail-fast / enforced behaviors that matter at deploy time:
 - Redis rate limiting: `RATE_LIMIT_REDIS_URL` is required when `NODE_ENV=production`.
 - Attachments storage: object storage is required in production.
   - Set `OBJECT_STORAGE_PROVIDER=s3` and configure `OBJECT_STORAGE_S3_*`.
-  - Emergency escape hatch only: `OBJECT_STORAGE_ALLOW_DISK_IN_PROD=true`.
+  - Object storage is required in production.
 - App attestation (optional, but if enabled it must be configured):
   - Set `APP_ATTESTATION_ENFORCE=true`.
   - Configure Android Play Integrity vars if serving Android.

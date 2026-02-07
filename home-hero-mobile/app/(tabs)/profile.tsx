@@ -96,6 +96,21 @@ export default function ProfileScreen() {
       </Pressable>
 
       <Pressable
+        onPress={() => router.push("/notification-preferences")}
+        style={{
+          backgroundColor: "#1e293b",
+          padding: 16,
+          borderRadius: 10,
+          minWidth: 220,
+          alignItems: "center",
+        }}
+      >
+        <Text style={{ color: "#e2e8f0", fontWeight: "900", fontSize: 16 }}>
+          Notification Settings
+        </Text>
+      </Pressable>
+
+      <Pressable
         onPress={() => logout()}
         style={{
           backgroundColor: "#ef4444",

@@ -1,7 +1,7 @@
 import type { Request, Response, NextFunction } from "express";
 import crypto from "crypto";
-import { createClient } from "redis";
 import { env } from "../config/env";
+import { ensureSharedRedisConnected, ensureSharedRedisClientOrThrow } from "../services/sharedRedisClient";
 
 type Role = "CONSUMER" | "PROVIDER" | "ADMIN" | "UNKNOWN";
 
@@ -18,40 +18,19 @@ export type RedisLike = {
   pTTL: (key: string) => Promise<number>;
 };
 
-type RedisClient = ReturnType<typeof createClient>;
-
-let _client: RedisClient | null = null;
-let _connectPromise: Promise<unknown> | null = null;
-
 function getRedisUrlOrNull(): string | null {
   const url = (env.RATE_LIMIT_REDIS_URL ?? "").trim();
   return url ? url : null;
 }
 
-function ensureClient(): RedisClient {
-  if (_client) return _client;
+function ensureClientOrThrow() {
   const url = getRedisUrlOrNull();
   if (!url) {
     throw new Error(
       "RATE_LIMIT_REDIS_URL is not configured (required for Redis-backed rate limiting)."
     );
   }
-
-  const client = createClient({ url });
-  client.on("error", () => {
-    // Intentionally no console.error spam here; the middleware will handle errors.
-  });
-
-  _client = client;
-  return client;
-}
-
-async function ensureConnected(client: RedisClient): Promise<void> {
-  if (client.isReady) return;
-  if (!_connectPromise) {
-    _connectPromise = client.connect();
-  }
-  await _connectPromise;
+  return ensureSharedRedisClientOrThrow();
 }
 
 function roleFor(req: Request): Role {
@@ -129,19 +108,19 @@ export function createRoleRateLimitRedis(opts: {
       const redis: RedisLike =
         injectedRedis ??
         (() => {
-          const client = ensureClient();
+          const client = ensureClientOrThrow();
           // node-redis methods are camelCase; adapt to RedisLike
           return {
             incr: async (k: string) => {
-              await ensureConnected(client);
+              await ensureSharedRedisConnected();
               return client.incr(k);
             },
             pExpire: async (k: string, ttlMs: number) => {
-              await ensureConnected(client);
+              await ensureSharedRedisConnected();
               return client.pExpire(k, ttlMs);
             },
             pTTL: async (k: string) => {
-              await ensureConnected(client);
+              await ensureSharedRedisConnected();
               return client.pTTL(k);
             },
           };

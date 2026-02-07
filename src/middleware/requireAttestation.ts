@@ -1,12 +1,20 @@
 import type { NextFunction, Request, Response } from "express";
 import * as jwt from "jsonwebtoken";
+import crypto from "crypto";
 
 import { logSecurityEvent } from "../services/securityEventLogger";
+import { ensureSharedRedisConnected } from "../services/sharedRedisClient";
+import { recordAttestationCacheHit, recordAttestationCacheMiss } from "../metrics/prometheus";
 import {
   verifyAndroidPlayIntegrityAttestation,
 } from "../attestation/androidPlayIntegrity";
 import { verifyIosAppAttestAttestation } from "../attestation/iosAppAttest";
 import { AttestationError } from "../attestation/attestationError";
+
+type RedisKV = {
+  get: (key: string) => Promise<string | null>;
+  set: (key: string, value: string, opts?: { PX?: number }) => Promise<unknown>;
+};
 
 export type AttestationInfo = {
   platform: "android" | "ios" | "unknown";
@@ -116,6 +124,83 @@ function asRiskLevel(v: unknown): AttestationInfo["riskLevel"] {
   return "unknown";
 }
 
+function sha256Base64Url(input: string): string {
+  return crypto.createHash("sha256").update(input, "utf8").digest("base64url");
+}
+
+function redisCachePrefix(): string {
+  const prefix = String(process.env.RATE_LIMIT_REDIS_PREFIX ?? "rl").trim() || "rl";
+  return `${prefix}:attestation_cache:v1`;
+}
+
+function tokenCacheKey(tokenHash: string): string {
+  return `${redisCachePrefix()}:token:${tokenHash}`;
+}
+
+function deviceCacheKey(params: {
+  userId: number;
+  deviceId: string;
+  platform: AttestationInfo["platform"];
+}): string {
+  // Avoid storing raw device identifiers in Redis keys.
+  const deviceKey = sha256Base64Url(params.deviceId);
+  return `${redisCachePrefix()}:u:${params.userId}:p:${params.platform}:d:${deviceKey}`;
+}
+
+type CachedAttestationValue = {
+  userId?: number;
+  attestation: AttestationInfo;
+};
+
+async function getRedisForAttestationCacheOrNull(): Promise<RedisKV | null> {
+  try {
+    const client = await ensureSharedRedisConnected();
+    return client as unknown as RedisKV;
+  } catch {
+    // Cache is best-effort; if Redis is down, continue verifying normally.
+    return null;
+  }
+}
+
+function tryExtractDeviceIdUnverified(token: string): { deviceId?: string; platform?: AttestationInfo["platform"] } {
+  if (!isLikelyJwt(token)) return {};
+  try {
+    const decoded = jwt.decode(token) as any;
+    const deviceId = String(decoded?.deviceId ?? decoded?.sub ?? "").trim() || undefined;
+    const plat = asPlatform(decoded?.platform ?? decoded?.plat);
+    const platform = plat !== "unknown" ? plat : undefined;
+    return { deviceId, platform };
+  } catch {
+    return {};
+  }
+}
+
+const cacheTtlMs = 10 * 60_000;
+const cacheStats = {
+  hits: 0,
+  misses: 0,
+  lastLogAt: 0,
+};
+
+function maybeLogCacheHitRatio() {
+  const total = cacheStats.hits + cacheStats.misses;
+  if (total <= 0) return;
+
+  const now = Date.now();
+  const dueByCount = total % 100 === 0;
+  const dueByTime = total >= 25 && now - cacheStats.lastLogAt >= 60_000;
+  if (!dueByCount && !dueByTime) return;
+
+  const ratio = cacheStats.hits / total;
+  cacheStats.lastLogAt = now;
+
+  console.info("[attestation] cache hit ratio", {
+    hits: cacheStats.hits,
+    misses: cacheStats.misses,
+    hitRatio: Number(ratio.toFixed(4)),
+  });
+}
+
 /**
  * Stub verifier (JWT + env public keys).
  *
@@ -216,6 +301,7 @@ export type AttestationVerifierDeps = {
   verifyAndroid?: typeof verifyAndroidPlayIntegrityAttestation;
   verifyIos?: typeof verifyIosAppAttestAttestation;
   verifyJwt?: (token: string) => Promise<AttestationResult>;
+  redis?: RedisKV;
 };
 
 export function createRequireAttestation(deps: AttestationVerifierDeps = {}) {
@@ -280,6 +366,59 @@ export function createRequireAttestation(deps: AttestationVerifierDeps = {}) {
       return next();
     }
 
+    // Best-effort cache: if we recently verified this attestation, skip verifier work.
+    const redis = deps.redis ?? (await getRedisForAttestationCacheOrNull());
+    const tokenHash = sha256Base64Url(token);
+    const reqUserId = Number((req as any)?.user?.userId);
+    const userId = Number.isFinite(reqUserId) && reqUserId > 0 ? reqUserId : null;
+    const extracted = tryExtractDeviceIdUnverified(token);
+    const platformForCache = platform !== "unknown" ? platform : extracted.platform ?? "unknown";
+
+    if (redis) {
+      try {
+        const keysToTry: string[] = [];
+        if (userId && extracted.deviceId) {
+          keysToTry.push(
+            deviceCacheKey({
+              userId,
+              deviceId: extracted.deviceId,
+              platform: platformForCache,
+            })
+          );
+        }
+        keysToTry.push(tokenCacheKey(tokenHash));
+
+        for (const key of keysToTry) {
+          const cached = await redis.get(key);
+          if (!cached) continue;
+
+          let parsed: CachedAttestationValue | null = null;
+          try {
+            parsed = JSON.parse(cached) as CachedAttestationValue;
+          } catch {
+            parsed = null;
+          }
+
+          if (!parsed?.attestation?.deviceId) continue;
+          if (userId && parsed.userId && parsed.userId !== userId) continue;
+
+          (req as any).attested = true;
+          (req as any).attestation = parsed.attestation;
+
+          cacheStats.hits += 1;
+          recordAttestationCacheHit();
+          maybeLogCacheHitRatio();
+          return next();
+        }
+
+        cacheStats.misses += 1;
+        recordAttestationCacheMiss();
+        maybeLogCacheHitRatio();
+      } catch {
+        // If cache lookup fails, fall through to verifier.
+      }
+    }
+
     try {
       let result: AttestationResult;
 
@@ -309,6 +448,38 @@ export function createRequireAttestation(deps: AttestationVerifierDeps = {}) {
 
       (req as any).attested = true;
       (req as any).attestation = result.attestation;
+
+      // Write-through cache (best-effort).
+      if (redis) {
+        const value: CachedAttestationValue = {
+          userId: userId ?? undefined,
+          attestation: result.attestation,
+        };
+
+        const toSet: string[] = [tokenCacheKey(tokenHash)];
+        if (userId) {
+          toSet.push(
+            deviceCacheKey({
+              userId,
+              deviceId: result.attestation.deviceId,
+              platform: result.attestation.platform,
+            })
+          );
+        }
+
+        try {
+          await Promise.all(
+            toSet.map((k) =>
+              redis.set(k, JSON.stringify(value), {
+                PX: cacheTtlMs,
+              })
+            )
+          );
+        } catch {
+          // Ignore cache write failures.
+        }
+      }
+
       return next();
     } catch (e: any) {
       const { limited, remainingMs } = bumpFailure(failureKey(req));

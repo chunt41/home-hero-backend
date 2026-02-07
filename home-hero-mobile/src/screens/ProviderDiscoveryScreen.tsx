@@ -6,6 +6,7 @@ import {
   Pressable,
   ScrollView,
   StyleSheet,
+  Switch,
   Text,
   TextInput,
   View,
@@ -17,9 +18,7 @@ import { MaterialCommunityIcons } from "@expo/vector-icons";
 
 type ProviderItem = {
   id: number;
-  name: string;
-  email: string;
-  phone: string | null;
+  name: string | null;
   location: string | null;
   experience: string | null;
   specialties: string | null;
@@ -28,6 +27,17 @@ type ProviderItem = {
   isFavorited: boolean;
   verificationStatus?: "NONE" | "PENDING" | "VERIFIED" | "REJECTED";
   isVerified?: boolean;
+  distanceMiles?: number | null;
+  scoreBreakdown?: {
+    baseScore: number;
+    distanceScore: number;
+    ratingScore: number;
+    responseScore: number;
+    tierBoost: number;
+    featuredBoost: number;
+    verifiedBoost: number;
+    finalScore: number;
+  };
   stats?: {
     medianResponseTimeSeconds30d?: number | null;
   } | null;
@@ -43,11 +53,10 @@ function formatMedianResponseTime(seconds: number): string {
 }
 
 type ProvidersResponse = {
-  page: number;
-  pageSize: number;
-  total: number;
-  totalPages: number;
-  providers: ProviderItem[];
+  items: ProviderItem[];
+  pageInfo: {
+    nextCursor: string | null;
+  };
 };
 
 type Category = {
@@ -57,16 +66,15 @@ type Category = {
 };
 
 export default function ProviderDiscoveryScreen() {
-  const [q, setQ] = useState("");
-  const [location, setLocation] = useState("");
-  const [minRating, setMinRating] = useState("");
-  const [selectedCategories, setSelectedCategories] = useState<string[]>([]);
+  const [zip, setZip] = useState("");
+  const [radiusMiles, setRadiusMiles] = useState(25);
+  const [verifiedOnly, setVerifiedOnly] = useState(false);
+  const [selectedCategorySlugs, setSelectedCategorySlugs] = useState<string[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
   const [showFiltersModal, setShowFiltersModal] = useState(false);
 
   const [providers, setProviders] = useState<ProviderItem[]>([]);
-  const [page, setPage] = useState(1);
-  const [totalPages, setTotalPages] = useState(1);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [loadingInitial, setLoadingInitial] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
@@ -86,8 +94,8 @@ export default function ProviderDiscoveryScreen() {
     fetchCategories();
   }, [fetchCategories]);
 
-  const fetchPage = useCallback(
-    async (pageNum: number, mode: "initial" | "refresh" | "more") => {
+  const fetchProviders = useCallback(
+    async (mode: "initial" | "refresh" | "more") => {
       const isInitial = mode === "initial";
       const isRefresh = mode === "refresh";
       const isMore = mode === "more";
@@ -103,29 +111,40 @@ export default function ProviderDiscoveryScreen() {
       }
 
       try {
+        const zip5 = (zip.match(/\d{5}/)?.[0] ?? "").trim();
+        if (!zip5) {
+          setProviders([]);
+          setNextCursor(null);
+          setError("Enter a 5-digit ZIP code to search.");
+          return;
+        }
+
         const query = new URLSearchParams();
-        if (q) query.set("q", q);
-        if (location) query.set("location", location);
-        if (minRating) query.set("minRating", minRating);
-        query.set("page", String(pageNum));
-        query.set("pageSize", "15");
+        query.set("zip", zip5);
+        query.set("radiusMiles", String(radiusMiles));
+        if (verifiedOnly) query.set("verifiedOnly", "true");
+        if (selectedCategorySlugs.length > 0) {
+          query.set("categories", selectedCategorySlugs.join(","));
+        }
+        query.set("limit", "15");
+        if (isMore && nextCursor) query.set("cursor", nextCursor);
 
         const url = `/providers/search?${query.toString()}`;
         const res = (await api.get(url)) as ProvidersResponse;
 
-        if (!res || !res.providers) {
+        if (!res || !Array.isArray(res.items) || !res.pageInfo) {
           setError("No response from server");
           setProviders([]);
           return;
         }
 
         if (isMore) {
-          setProviders((prev) => [...prev, ...res.providers]);
+          setProviders((prev) => [...prev, ...res.items]);
         } else {
-          setProviders(res.providers);
+          setProviders(res.items);
         }
 
-        setTotalPages(res.totalPages);
+        setNextCursor(res.pageInfo.nextCursor ?? null);
         setError(null);
       } catch (err) {
         console.error(`Error fetching providers (${mode}):`, err);
@@ -136,7 +155,7 @@ export default function ProviderDiscoveryScreen() {
         else setLoadingMore(false);
       }
     },
-    [q, location, minRating]
+    [zip, radiusMiles, verifiedOnly, selectedCategorySlugs, nextCursor]
   );
 
   const toggleFavorite = useCallback(async (providerId: number) => {
@@ -165,38 +184,35 @@ export default function ProviderDiscoveryScreen() {
   // Debounced search
   useEffect(() => {
     const t = setTimeout(() => {
-      setPage(1);
-      fetchPage(1, "initial");
+      setNextCursor(null);
+      fetchProviders("initial");
     }, 400);
     return () => clearTimeout(t);
-  }, [q, location, minRating, selectedCategories, fetchPage]);
+  }, [zip, radiusMiles, verifiedOnly, selectedCategorySlugs, fetchProviders]);
 
   // First load
   useEffect(() => {
-    fetchPage(1, "initial");
-  }, [fetchPage]);
+    fetchProviders("initial");
+  }, [fetchProviders]);
 
   const onRefresh = useCallback(() => {
-    setPage(1);
-    fetchPage(1, "refresh");
-  }, [fetchPage]);
+    setNextCursor(null);
+    fetchProviders("refresh");
+  }, [fetchProviders]);
 
   const onEndReached = useCallback(() => {
-    if (page < totalPages && !loadingMore && !loadingInitial) {
-      const nextPage = page + 1;
-      setPage(nextPage);
-      fetchPage(nextPage, "more");
+    if (nextCursor && !loadingMore && !loadingInitial) {
+      fetchProviders("more");
     }
-  }, [page, totalPages, loadingMore, loadingInitial, fetchPage]);
+  }, [nextCursor, loadingMore, loadingInitial, fetchProviders]);
 
   const activeFilterCount = useMemo(() => {
     let count = 0;
-    if (q) count++;
-    if (location) count++;
-    if (minRating) count++;
-    if (selectedCategories.length) count++;
+    if (radiusMiles !== 25) count++;
+    if (verifiedOnly) count++;
+    if (selectedCategorySlugs.length) count++;
     return count;
-  }, [q, location, minRating, selectedCategories]);
+  }, [radiusMiles, verifiedOnly, selectedCategorySlugs]);
 
   const renderProviderCard = ({ item }: { item: ProviderItem }) => (
     <Pressable
@@ -213,7 +229,7 @@ export default function ProviderDiscoveryScreen() {
           <View style={styles.details}>
             <View style={styles.nameRow}>
               <Text style={styles.name} numberOfLines={1}>
-                {item.name}
+                {item.name ?? "Provider"}
               </Text>
               {item.isVerified ? (
                 <View style={styles.verifiedBadge}>
@@ -305,18 +321,13 @@ export default function ProviderDiscoveryScreen() {
 
       <View style={styles.searchRow}>
         <TextInput
-          value={q}
-          onChangeText={setQ}
-          placeholder="Search by name…"
+          value={zip}
+          onChangeText={setZip}
+          placeholder="ZIP code…"
           placeholderTextColor="#94a3b8"
           style={styles.input}
-        />
-        <TextInput
-          value={location}
-          onChangeText={setLocation}
-          placeholder="Location…"
-          placeholderTextColor="#94a3b8"
-          style={styles.input}
+          keyboardType="number-pad"
+          maxLength={10}
         />
       </View>
 
@@ -325,7 +336,7 @@ export default function ProviderDiscoveryScreen() {
           <Text style={styles.errorText}>{error}</Text>
           <Pressable
             style={styles.retryBtn}
-            onPress={() => fetchPage(1, "initial")}
+            onPress={() => fetchProviders("initial")}
           >
             <Text style={styles.retryText}>Retry</Text>
           </Pressable>
@@ -384,34 +395,39 @@ export default function ProviderDiscoveryScreen() {
           </View>
 
           <ScrollView style={styles.modalContent}>
-            {/* Min Rating */}
+            {/* Radius */}
             <View style={styles.filterSection}>
-              <Text style={styles.filterSectionTitle}>Minimum Rating</Text>
+              <Text style={styles.filterSectionTitle}>Search Radius</Text>
               <View style={styles.ratingSelector}>
-                {[3, 3.5, 4, 4.5, 5].map((rating) => (
+                {[5, 10, 25, 50].map((miles) => (
                   <Pressable
-                    key={rating}
+                    key={miles}
                     style={[
                       styles.ratingButton,
-                      minRating === String(rating) && styles.ratingButtonActive,
+                      radiusMiles === miles && styles.ratingButtonActive,
                     ]}
-                    onPress={() =>
-                      setMinRating(
-                        minRating === String(rating) ? "" : String(rating)
-                      )
-                    }
+                    onPress={() => setRadiusMiles(miles)}
                   >
                     <Text
                       style={[
                         styles.ratingButtonText,
-                        minRating === String(rating) &&
+                        radiusMiles === miles &&
                           styles.ratingButtonTextActive,
                       ]}
                     >
-                      {rating}★+
+                      {miles} mi
                     </Text>
                   </Pressable>
                 ))}
+              </View>
+            </View>
+
+            {/* Verified */}
+            <View style={styles.filterSection}>
+              <Text style={styles.filterSectionTitle}>Verified Only</Text>
+              <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
+                <Text style={{ color: "#cbd5e1" }}>Show only verified providers</Text>
+                <Switch value={verifiedOnly} onValueChange={setVerifiedOnly} />
               </View>
             </View>
 
@@ -421,7 +437,7 @@ export default function ProviderDiscoveryScreen() {
                 <Text style={styles.filterSectionTitle}>Categories</Text>
                 <View style={styles.categoryGrid}>
                   {categories.map((cat) => {
-                    const isSelected = selectedCategories.includes(cat.id);
+                    const isSelected = selectedCategorySlugs.includes(cat.slug);
                     return (
                       <Pressable
                         key={cat.id}
@@ -430,10 +446,10 @@ export default function ProviderDiscoveryScreen() {
                           isSelected && styles.categoryButtonActive,
                         ]}
                         onPress={() => {
-                          setSelectedCategories((prev) =>
+                          setSelectedCategorySlugs((prev) =>
                             isSelected
-                              ? prev.filter((c) => c !== cat.id)
-                              : [...prev, cat.id]
+                              ? prev.filter((c) => c !== cat.slug)
+                              : [...prev, cat.slug]
                           );
                         }}
                       >
@@ -457,10 +473,9 @@ export default function ProviderDiscoveryScreen() {
               <Pressable
                 style={styles.clearBtn}
                 onPress={() => {
-                  setQ("");
-                  setLocation("");
-                  setMinRating("");
-                  setSelectedCategories([]);
+                  setRadiusMiles(25);
+                  setVerifiedOnly(false);
+                  setSelectedCategorySlugs([]);
                 }}
               >
                 <Text style={styles.clearBtnText}>Clear All Filters</Text>
@@ -472,8 +487,8 @@ export default function ProviderDiscoveryScreen() {
             style={styles.applyBtn}
             onPress={() => {
               setShowFiltersModal(false);
-              setPage(1);
-              fetchPage(1, "initial");
+              setNextCursor(null);
+              fetchProviders("initial");
             }}
           >
             <Text style={styles.applyBtnText}>Apply Filters</Text>

@@ -46,7 +46,7 @@ Production should provide secrets via environment variables. Required env vars a
 This codebase includes a few explicit fail-fast guardrails in production:
 
 - **Redis rate limiting**: requires `RATE_LIMIT_REDIS_URL` when `NODE_ENV=production`.
-- **Attachment object storage**: requires `OBJECT_STORAGE_PROVIDER=s3` when `NODE_ENV=production`, unless `OBJECT_STORAGE_ALLOW_DISK_IN_PROD=true` is set.
+- **Attachment object storage**: requires `OBJECT_STORAGE_PROVIDER=s3` when `NODE_ENV=production`.
 - **App attestation**: if `APP_ATTESTATION_ENFORCE=true` in production, platform verifier configuration must be present (Android Play Integrity and/or iOS App Attest, depending on `APP_ATTESTATION_PLATFORMS`).
 
 ## App attestation (optional, recommended)
@@ -96,7 +96,7 @@ Behavior:
 - Backward compatibility: if an attachment has `diskPath` but no `storageKey`, it is streamed from local disk.
 
 Production enforcement:
-- In `NODE_ENV=production`, object storage is required unless you set `OBJECT_STORAGE_ALLOW_DISK_IN_PROD=true` (emergency escape hatch).
+- In `NODE_ENV=production`, new uploads must go to S3/R2-compatible object storage.
 
 Env vars:
 - `OBJECT_STORAGE_PROVIDER`: `s3` (recommended) or unset/other (disk fallback)
@@ -107,6 +107,10 @@ Env vars:
 - `OBJECT_STORAGE_S3_ENDPOINT` (optional; required for Cloudflare R2)
 - `OBJECT_STORAGE_S3_FORCE_PATH_STYLE` (optional; useful for some S3-compatible providers)
 - `ATTACHMENTS_SIGNED_URL_TTL_SECONDS` (optional; default `300`)
+
+Recommended bucket settings:
+- Bucket should be **private** (Block Public Access ON).
+- Access should be restricted to the backend's credentials; clients should only access attachments via **pre-signed URLs**.
 
 One-off migration:
 - Use [scripts/migrateUploadsToObjectStorage.ts](../scripts/migrateUploadsToObjectStorage.ts) to backfill `storageKey` for existing rows that still reference `diskPath`.

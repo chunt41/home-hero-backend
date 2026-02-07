@@ -7,6 +7,16 @@ import {
   handleAddonV2PaymentIntentSucceeded,
 } from "./addonPurchasesV2";
 
+export function validateStripeStartupOrThrow(): void {
+  if ((process.env.NODE_ENV ?? "development") !== "production") return;
+
+  // Secret key is already required by env.ts; keep this check about webhook safety.
+  const whsec = process.env.STRIPE_WEBHOOK_SECRET;
+  if (!whsec || !whsec.trim()) {
+    throw new Error("Missing required env var: STRIPE_WEBHOOK_SECRET");
+  }
+}
+
 export const stripe = new Stripe(env.STRIPE_SECRET_KEY, {
   // Do not pin to a nonstandard API version string.
   // Leaving this unset uses the SDK/account default and avoids runtime failures.

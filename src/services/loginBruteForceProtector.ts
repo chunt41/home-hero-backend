@@ -1,7 +1,7 @@
 import type { Request } from "express";
 import crypto from "crypto";
-import { createClient } from "redis";
 import { env } from "../config/env";
+import { ensureSharedRedisConnected } from "./sharedRedisClient";
 
 export type RedisKV = {
   get: (key: string) => Promise<string | null>;
@@ -27,32 +27,9 @@ function normalizeEmail(email: string): string {
   return String(email ?? "").trim().toLowerCase();
 }
 
-let _client: ReturnType<typeof createClient> | null = null;
-let _connectPromise: Promise<unknown> | null = null;
-
-async function ensureRedis(): Promise<ReturnType<typeof createClient>> {
-  if (_client) {
-    if (_client.isReady) return _client;
-  }
-
-  const url = String(env.RATE_LIMIT_REDIS_URL ?? "").trim();
-  if (!url) {
-    throw new Error("RATE_LIMIT_REDIS_URL not configured");
-  }
-
-  if (!_client) {
-    _client = createClient({ url });
-    _client.on("error", () => {
-      // Fail-open handled by caller.
-    });
-  }
-
-  if (!_client.isReady) {
-    if (!_connectPromise) _connectPromise = _client.connect();
-    await _connectPromise;
-  }
-
-  return _client;
+async function ensureRedis(): Promise<RedisKV> {
+  const client = await ensureSharedRedisConnected();
+  return client as unknown as RedisKV;
 }
 
 function defaultPolicy(): LoginBruteForcePolicy {
@@ -98,8 +75,7 @@ export function createLoginBruteForceProtector(opts?: {
 
   async function getRedis(): Promise<RedisKV> {
     if (opts?.redis) return opts.redis;
-    const client = await ensureRedis();
-    return client as unknown as RedisKV;
+    return ensureRedis();
   }
 
   function keys(params: { req: Request; email: string }) {

@@ -22,6 +22,11 @@ import {
 import { createPostJobStartHandler } from "./routes/jobStart";
 import { createGetProviderEntitlementsHandler } from "./routes/providerEntitlements";
 import { createPostJobReviewsHandler } from "./routes/jobReviews";
+import {
+  createGetContactExchangeHandler,
+  createPostContactExchangeDecideHandler,
+  createPostContactExchangeRequestHandler,
+} from "./routes/contactExchange";
 import helmet from "helmet";
 import * as crypto from "crypto";
 import multer from "multer";
@@ -31,12 +36,11 @@ import fetch from "node-fetch";
 import { startWebhookWorker } from "./webhooks/worker";
 import { authMiddleware } from "./middleware/authMiddleware";
 import { env } from "./config/env";
-import { requireAttestation } from "./middleware/requireAttestation";
 import { requireVerifiedEmail } from "./middleware/requireVerifiedEmail";
 import { sendMail } from "./services/mailer";
 import { logSecurityEvent } from "./services/securityEventLogger";
 import { logger } from "./services/logger";
-import { stripe } from "./services/stripeService";
+import { stripe, validateStripeStartupOrThrow } from "./services/stripeService";
 import {
   createProviderAddonPaymentIntentV2,
   type LegacyProviderAddonPurchaseRequest,
@@ -60,12 +64,11 @@ import { suggestJobPrice } from "./services/jobPriceSuggester";
 import {
   assessJobPostRisk,
   assessRepeatedBidMessageRisk,
-  assessRepeatedMessageRisk,
-  decideMessageModeration,
   computeRestrictedUntil,
   RISK_RESTRICT_THRESHOLD,
   RISK_REVIEW_THRESHOLD,
 } from "./services/riskScoring";
+import { moderateJobMessageSend } from "./services/jobMessageSendModeration";
 import { z } from "zod";
 import { validate, type Validated, type ValidatedRequest } from "./middleware/validate";
 import { enqueueBackgroundJob } from "./jobs/enqueue";
@@ -75,11 +78,20 @@ import { createBasicAuthForAdminUi, createRequireAdminUiEnabled } from "./routes
 import { normalizeZipForBoost } from "./services/providerDiscoveryRanking";
 import { extractZip5, rankProvider } from "./matching/rankProviders";
 import zipcodes from "zipcodes";
+import {
+  createGetMeNotificationPreferencesHandler,
+  createPutMeNotificationPreferencesHandler,
+} from "./routes/notificationPreferences";
+import { getNotificationPreferencesMap, shouldSendNotification } from "./services/notificationPreferences";
 import { recomputeProviderStatsForProvider } from "./services/providerStats";
+import { createGetProvidersSearchHandler } from "./routes/providersSearch";
 import { getCurrentMonthKeyUtc } from "./ai/aiGateway";
 import { validateAttestationStartupOrThrow } from "./attestation/startupValidation";
+import { enforceAttestationForSensitiveRoutes } from "./attestation/enforceAttestationForSensitiveRoutes";
 import { createLoginBruteForceProtector } from "./services/loginBruteForceProtector";
 import { createAuthLoginHandler } from "./routes/authLogin";
+import { createBasicAuthForMetrics, createRequireMetricsEnabled } from "./routes/metricsGuard";
+import { prometheusContentType, prometheusMetricsText } from "./metrics/prometheus";
 import {
   getAttachmentSignedUrlTtlSeconds,
   getObjectStorageProviderName,
@@ -179,6 +191,9 @@ validateRateLimitRedisStartupOrThrow();
 // Fail fast in production if attachment object storage is required but not configured.
 validateObjectStorageStartupOrThrow();
 
+// Fail fast in production if Stripe webhook processing cannot be verified.
+validateStripeStartupOrThrow();
+
 const app = express();
 // Ensure async route errors bubble into the single global error handler.
 patchAppForAsyncErrors(app);
@@ -215,6 +230,9 @@ app.use(helmet.xContentTypeOptions());
 app.use(requestIdMiddleware);
 app.use(httpAccessLogMiddleware);
 
+// Scoped app attestation enforcement (no-op unless APP_ATTESTATION_ENFORCE=true)
+enforceAttestationForSensitiveRoutes(app);
+
 // --- Health endpoints ---
 app.get("/healthz", (_req, res) => res.json({ ok: true }));
 app.get("/readyz", async (_req, res) => {
@@ -225,6 +243,15 @@ app.get("/readyz", async (_req, res) => {
     logger.warn("readyz.db_unreachable", { message: String(e?.message ?? e) });
     return res.status(503).json({ ok: false, db: false });
   }
+});
+
+// --- Metrics endpoint (disabled by default) ---
+const requireMetricsEnabled = createRequireMetricsEnabled(process.env);
+const basicAuthForMetrics = createBasicAuthForMetrics(process.env);
+app.get("/metrics", requireMetricsEnabled, basicAuthForMetrics, async (_req, res) => {
+  const text = await prometheusMetricsText();
+  res.setHeader("Content-Type", prometheusContentType());
+  return res.status(200).send(text);
 });
 
 // Transitional CSP strategy:
@@ -648,6 +675,20 @@ const notificationsLimiter = createRoleRateLimitRedis({
   windowMs: 60_000,
   limits: { UNKNOWN: 0, CONSUMER: 60, PROVIDER: 60, ADMIN: 300 },
   message: "Too many notification refreshes. Please slow down.",
+});
+
+const contactExchangeRequestLimiter = createRoleRateLimitRedis({
+  bucket: "contact_exchange_request",
+  windowMs: 60_000,
+  limits: { UNKNOWN: 0, CONSUMER: 3, PROVIDER: 3, ADMIN: 50 },
+  message: "Too many contact exchange requests. Please slow down.",
+});
+
+const contactExchangeDecideLimiter = createRoleRateLimitRedis({
+  bucket: "contact_exchange_decide",
+  windowMs: 60_000,
+  limits: { UNKNOWN: 0, CONSUMER: 10, PROVIDER: 10, ADMIN: 200 },
+  message: "Too many requests. Please slow down.",
 });
 
 
@@ -1340,6 +1381,20 @@ app.post(
   }
 );
 
+// GET /me/notification-preferences
+app.get(
+  "/me/notification-preferences",
+  authMiddleware,
+  createGetMeNotificationPreferencesHandler({ prisma })
+);
+
+// PUT /me/notification-preferences
+app.put(
+  "/me/notification-preferences",
+  authMiddleware,
+  createPutMeNotificationPreferencesHandler({ prisma })
+);
+
 
 // -----------------------------
 // Subscription endpoints
@@ -1457,7 +1512,6 @@ app.post(
   "/provider/addons/purchase",
   authMiddleware,
   requireVerifiedEmail,
-  requireAttestation,
   validate(purchaseAddonSchema),
   async (req: AuthRequest & { validated: Validated<typeof purchaseAddonSchema> }, res: Response) => {
     try {
@@ -1509,120 +1563,35 @@ app.post(
   "/subscription/upgrade",
   authMiddleware,
   requireVerifiedEmail,
-  requireAttestation,
   validate({ body: z.object({ tier: subscriptionUpgradeTierSchema }) }),
   async (req: AuthRequest, res: Response) => {
-  try {
-    if (!req.user) {
-      return res.status(401).json({ error: "Not authenticated" });
-    }
+    try {
+      if (!req.user) {
+        return res.status(401).json({ error: "Not authenticated" });
+      }
 
-    // NOTE: Upgrades should normally be handled via Stripe payment confirmation
-    // (see /payments/create-intent + /payments/confirm). This manual endpoint is
-    // disabled by default to prevent bypassing payments.
-    if (process.env.NODE_ENV === "production") {
+      const { tier } = (req as any).validated.body as {
+        tier: z.infer<typeof subscriptionUpgradeTierSchema>;
+      };
+
+      await logSecurityEvent(req, "subscription.mutation_blocked", {
+        targetType: "SUBSCRIPTION",
+        targetId: String(req.user.userId),
+        requestedTier: tier,
+        reason: "subscription_tier_can_only_change_via_stripe_webhooks",
+        route: "/subscription/upgrade",
+      });
+
       return res.status(403).json({
         error:
-          "Manual subscription upgrades are disabled in production. Stripe webhooks are the source of truth.",
+          "Subscription changes are only applied by Stripe webhooks. Use /payments/create-intent and complete payment, then rely on webhook processing.",
       });
+    } catch (err) {
+      console.error("POST /subscription/upgrade error:", err);
+      return res
+        .status(500)
+        .json({ error: "Internal server error while upgrading subscription." });
     }
-
-    const allowManualUpgrade =
-      String(process.env.ALLOW_MANUAL_SUBSCRIPTION_UPGRADE ?? "false") === "true";
-    if (!allowManualUpgrade) {
-      return res.status(403).json({
-        error:
-          "Manual subscription upgrades are disabled. Use /payments/create-intent and /payments/confirm.",
-      });
-    }
-
-    // Only providers can upgrade
-    if (req.user.role !== "PROVIDER") {
-      return res.status(403).json({ error: "Only providers can upgrade subscriptions." });
-    }
-
-    const { tier } = (req as any).validated.body as { tier: z.infer<typeof subscriptionUpgradeTierSchema> };
-
-    const userId = req.user.userId;
-
-    // Capture previous tier for webhook payload
-    const existing = await prisma.subscription.findUnique({
-      where: { userId },
-      select: { id: true, tier: true, renewsAt: true },
-    });
-    const previousTier = existing?.tier ?? "FREE";
-
-    // Price + renewal
-    const amountCents = getSubscriptionPriceCents(tier);
-    const now = new Date();
-    const renewsAt = new Date(now);
-    renewsAt.setMonth(renewsAt.getMonth() + 1);
-
-    // Transaction: subscription + payment consistent
-    const { subscription, payment } = await prisma.$transaction(async (tx) => {
-      const subscription = await tx.subscription.upsert({
-        where: { userId },
-        update: { tier, renewsAt },
-        create: { userId, tier, renewsAt },
-      });
-
-      const payment = await tx.subscriptionPayment.create({
-        data: {
-          userId,
-          subscriptionId: subscription.id,
-          tier,
-          amount: amountCents,
-          status: "SUCCEEDED",
-        },
-      });
-
-      return { subscription, payment };
-    });
-
-    // Webhook events (after successful commit)
-    await enqueueWebhookEvent({
-      eventType: "subscription.upgraded",
-      payload: {
-        userId,
-        previousTier,
-        newTier: tier,
-        subscriptionId: subscription.id,
-        renewsAt: subscription.renewsAt,
-      },
-    });
-
-    await enqueueWebhookEvent({
-      eventType: "subscription.payment_recorded",
-      payload: {
-        userId,
-        paymentId: payment.id,
-        subscriptionId: subscription.id,
-        tier,
-        amount: payment.amount,
-        status: payment.status,
-        createdAt: payment.createdAt,
-      },
-    });
-
-    await logSecurityEvent(req, "subscription.upgraded", {
-      targetType: "SUBSCRIPTION",
-      targetId: subscription.id,
-      userId,
-      previousTier,
-      newTier: tier,
-      amountCents,
-      paymentId: payment.id,
-    });
-
-    return res.json({
-      message: "Subscription upgraded and payment recorded.",
-      subscription,
-      payment,
-    });
-  } catch (err) {
-    console.error("POST /subscription/upgrade error:", err);
-    return res.status(500).json({ error: "Internal server error while upgrading subscription." });
-  }
 });
 
 // POST /subscription/downgrade  → downgrade my tier (FREE by default)
@@ -1631,88 +1600,35 @@ app.post(
   "/subscription/downgrade",
   authMiddleware,
   requireVerifiedEmail,
-  requireAttestation,
   validate({ body: z.object({ tier: subscriptionDowngradeTierSchema.optional() }) }),
   async (req: AuthRequest, res: Response) => {
-  try {
-    if (!req.user) {
-      return res.status(401).json({ error: "Not authenticated" });
-    }
+    try {
+      if (!req.user) {
+        return res.status(401).json({ error: "Not authenticated" });
+      }
 
-    if (req.user.role !== "PROVIDER") {
-      return res.status(403).json({ error: "Only providers can change subscriptions." });
-    }
+      const { tier: requestedTier } = (req as any).validated.body as {
+        tier?: z.infer<typeof subscriptionDowngradeTierSchema>;
+      };
 
-    const userId = req.user.userId;
-
-    const { tier: requestedTier } = (req as any).validated.body as { tier?: z.infer<typeof subscriptionDowngradeTierSchema> };
-    const targetTier: "FREE" | "BASIC" = requestedTier ?? "FREE";
-
-    const user = await prisma.user.findUnique({
-      where: { id: userId },
-      include: { subscription: true },
-    });
-
-    if (!user) {
-      return res.status(404).json({ error: "User not found." });
-    }
-
-    const previousTier = user.subscription?.tier ?? "FREE";
-
-    const tierRank: Record<"FREE" | "BASIC" | "PRO", number> = {
-      FREE: 0,
-      BASIC: 1,
-      PRO: 2,
-    };
-
-    // Prevent using this endpoint as an upgrade path (upgrades must go through Stripe).
-    if (tierRank[targetTier] >= tierRank[previousTier]) {
-      return res.status(400).json({
-        error: `Cannot change tier from ${previousTier} to ${targetTier} via downgrade endpoint.`,
+      await logSecurityEvent(req, "subscription.mutation_blocked", {
+        targetType: "SUBSCRIPTION",
+        targetId: String(req.user.userId),
+        requestedTier: requestedTier ?? null,
+        reason: "subscription_tier_can_only_change_via_stripe_webhooks",
+        route: "/subscription/downgrade",
       });
+
+      return res.status(403).json({
+        error:
+          "Subscription changes are only applied by Stripe webhooks. Downgrades/cancellations must be processed via Stripe and reflected by webhook updates.",
+      });
+    } catch (err) {
+      console.error("POST /subscription/downgrade error:", err);
+      return res
+        .status(500)
+        .json({ error: "Internal server error while downgrading subscription." });
     }
-
-    const nextRenewsAt =
-      targetTier === "FREE" ? null : user.subscription?.renewsAt ?? null;
-
-    const subscription = await prisma.subscription.upsert({
-      where: { userId },
-      update: { tier: targetTier, renewsAt: nextRenewsAt },
-      create: { userId, tier: targetTier, renewsAt: nextRenewsAt },
-    });
-
-    // Webhook event
-    await enqueueWebhookEvent({
-      eventType: "subscription.downgraded",
-      payload: {
-        userId,
-        previousTier,
-        newTier: targetTier,
-        subscriptionId: subscription.id,
-        renewsAt: subscription.renewsAt,
-      },
-    });
-
-    await logSecurityEvent(req, "subscription.downgraded", {
-      targetType: "SUBSCRIPTION",
-      targetId: subscription.id,
-      userId,
-      previousTier,
-      newTier: targetTier,
-    });
-
-    return res.json({
-      message: `Subscription downgraded to ${targetTier}.`,
-      subscription: {
-        tier: subscription.tier,
-        renewsAt: subscription.renewsAt,
-        createdAt: subscription.createdAt,
-      },
-    });
-  } catch (err) {
-    console.error("POST /subscription/downgrade error:", err);
-    return res.status(500).json({ error: "Internal server error while downgrading subscription." });
-  }
 });
 
 // GET /payments/subscriptions → list subscription payments for current user
@@ -1768,7 +1684,6 @@ const signupSchema = {
 app.post(
   "/auth/signup",
   signupLimiter,
-  requireAttestation,
   validate(signupSchema),
   async (req: ValidatedRequest<typeof signupSchema>, res) => {
   try {
@@ -1896,7 +1811,6 @@ const verifyEmailSchema = {
 app.post(
   "/auth/verify-email",
   verifyEmailLimiter,
-  requireAttestation,
   validate(verifyEmailSchema),
   async (req: ValidatedRequest<typeof verifyEmailSchema>, res) => {
   try {
@@ -1954,7 +1868,6 @@ const loginSchema = {
 app.post(
   "/auth/login",
   loginLimiter,
-  requireAttestation,
   validate(loginSchema),
   createAuthLoginHandler({
     prisma,
@@ -1978,7 +1891,6 @@ const forgotPasswordSchema = {
 app.post(
   "/auth/forgot-password",
   forgotPasswordLimiter,
-  requireAttestation,
   validate(forgotPasswordSchema),
   async (req: ValidatedRequest<typeof forgotPasswordSchema>, res) => {
   try {
@@ -2051,7 +1963,6 @@ const resetPasswordSchema = {
 app.post(
   "/auth/reset-password",
   resetPasswordLimiter,
-  requireAttestation,
   validate(resetPasswordSchema),
   async (req: ValidatedRequest<typeof resetPasswordSchema>, res) => {
   try {
@@ -2125,7 +2036,6 @@ app.post(
   "/jobs/suggest-price",
   authMiddleware,
   requireVerifiedEmail,
-  requireAttestation,
   validate(suggestPriceSchema),
   async (req: (AuthRequest & ValidatedRequest<typeof suggestPriceSchema>), res: Response) => {
     try {
@@ -2170,7 +2080,6 @@ app.post(
   "/jobs",
   authMiddleware,
   requireVerifiedEmail,
-  requireAttestation,
   jobCreateLimiter,
   validate(createJobSchema),
   async (req: (AuthRequest & ValidatedRequest<typeof createJobSchema>), res: Response) => {
@@ -2600,6 +2509,12 @@ app.post(
     try {
       if (!req.user) {
         return res.status(401).json({ error: "Not authenticated" });
+      }
+
+      if ((process.env.NODE_ENV ?? "development") === "production" && !attachmentStorageProvider) {
+        return res.status(500).json({
+          error: "Attachment storage is not configured. This server is misconfigured for production.",
+        });
       }
 
       const { jobId } = (req as any).validated.params as { jobId: number };
@@ -3114,7 +3029,6 @@ app.get(
   "/provider/quick-replies",
   authMiddleware,
   requireVerifiedEmail,
-  requireAttestation,
   async (req: AuthRequest, res: Response) => {
     try {
       if (!req.user) return res.status(401).json({ error: "Not authenticated" });
@@ -3140,7 +3054,6 @@ app.post(
   "/provider/quick-replies",
   authMiddleware,
   requireVerifiedEmail,
-  requireAttestation,
   validate(quickReplyCreateSchema),
   async (req: AuthRequest & { validated: Validated<typeof quickReplyCreateSchema> }, res: Response) => {
     try {
@@ -3171,7 +3084,6 @@ app.put(
   "/provider/quick-replies/:id",
   authMiddleware,
   requireVerifiedEmail,
-  requireAttestation,
   validate(quickReplyUpdateSchema),
   async (req: AuthRequest & { validated: Validated<typeof quickReplyUpdateSchema> }, res: Response) => {
     try {
@@ -3212,7 +3124,6 @@ app.delete(
   "/provider/quick-replies/:id",
   authMiddleware,
   requireVerifiedEmail,
-  requireAttestation,
   validate(quickReplyIdParamSchema),
   async (req: AuthRequest & { validated: Validated<typeof quickReplyIdParamSchema> }, res: Response) => {
     try {
@@ -3244,7 +3155,6 @@ app.get(
   "/provider/saved-searches",
   authMiddleware,
   requireVerifiedEmail,
-  requireAttestation,
   async (req: AuthRequest, res: Response) => {
     try {
       if (!req.user) return res.status(401).json({ error: "Not authenticated" });
@@ -3270,7 +3180,6 @@ app.post(
   "/provider/saved-searches",
   authMiddleware,
   requireVerifiedEmail,
-  requireAttestation,
   validate(providerSavedSearchCreateSchema),
   async (
     req: AuthRequest & { validated: Validated<typeof providerSavedSearchCreateSchema> },
@@ -3317,7 +3226,6 @@ app.put(
   "/provider/saved-searches/:id",
   authMiddleware,
   requireVerifiedEmail,
-  requireAttestation,
   validate(providerSavedSearchUpdateSchema),
   async (
     req: AuthRequest & { validated: Validated<typeof providerSavedSearchUpdateSchema> },
@@ -3367,7 +3275,6 @@ app.delete(
   "/provider/saved-searches/:id",
   authMiddleware,
   requireVerifiedEmail,
-  requireAttestation,
   validate(providerSavedSearchIdParamSchema),
   async (
     req: AuthRequest & { validated: Validated<typeof providerSavedSearchIdParamSchema> },
@@ -3401,7 +3308,6 @@ app.get(
   "/provider/bid-templates",
   authMiddleware,
   requireVerifiedEmail,
-  requireAttestation,
   async (req: AuthRequest, res: Response) => {
     try {
       if (!req.user) return res.status(401).json({ error: "Not authenticated" });
@@ -3427,7 +3333,6 @@ app.post(
   "/provider/bid-templates",
   authMiddleware,
   requireVerifiedEmail,
-  requireAttestation,
   validate(bidTemplateCreateSchema),
   async (req: AuthRequest & { validated: Validated<typeof bidTemplateCreateSchema> }, res: Response) => {
     try {
@@ -3462,7 +3367,6 @@ app.get(
   "/provider/bid-templates/:id",
   authMiddleware,
   requireVerifiedEmail,
-  requireAttestation,
   validate(bidTemplateIdParamSchema),
   async (req: AuthRequest & { validated: Validated<typeof bidTemplateIdParamSchema> }, res: Response) => {
     try {
@@ -3490,7 +3394,6 @@ app.put(
   "/provider/bid-templates/:id",
   authMiddleware,
   requireVerifiedEmail,
-  requireAttestation,
   validate(bidTemplateUpdateSchema),
   async (req: AuthRequest & { validated: Validated<typeof bidTemplateUpdateSchema> }, res: Response) => {
     try {
@@ -3538,7 +3441,6 @@ app.delete(
   "/provider/bid-templates/:id",
   authMiddleware,
   requireVerifiedEmail,
-  requireAttestation,
   validate(bidTemplateIdParamSchema),
   async (req: AuthRequest & { validated: Validated<typeof bidTemplateIdParamSchema> }, res: Response) => {
     try {
@@ -3569,7 +3471,6 @@ app.get(
   "/provider/availability",
   authMiddleware,
   requireVerifiedEmail,
-  requireAttestation,
   async (req: AuthRequest, res: Response) => {
     try {
       if (!req.user) return res.status(401).json({ error: "Not authenticated" });
@@ -3596,7 +3497,6 @@ app.put(
   "/provider/availability",
   authMiddleware,
   requireVerifiedEmail,
-  requireAttestation,
   validate(providerAvailabilityReplaceSchema),
   async (
     req: AuthRequest & { validated: Validated<typeof providerAvailabilityReplaceSchema> },
@@ -3768,7 +3668,6 @@ app.post(
   "/appointments/:id/confirm",
   authMiddleware,
   requireVerifiedEmail,
-  requireAttestation,
   validate(appointmentIdParamSchema),
   async (req: AuthRequest & { validated: Validated<typeof appointmentIdParamSchema> }, res: Response) => {
     try {
@@ -3864,7 +3763,6 @@ app.post(
   "/appointments/:id/calendar-event",
   authMiddleware,
   requireVerifiedEmail,
-  requireAttestation,
   validate(appointmentCalendarEventSchema),
   async (
     req: AuthRequest & { validated: Validated<typeof appointmentCalendarEventSchema> },
@@ -3920,7 +3818,6 @@ app.post(
   "/jobs/:jobId/bids",
   authMiddleware,
   requireVerifiedEmail,
-  requireAttestation,
   bidLimiter,
   validate(placeBidSchema),
   async (req: AuthRequest & { validated: Validated<typeof placeBidSchema> }, res: Response) => {
@@ -4139,16 +4036,25 @@ app.post(
       const tier = result.entitlements.tier;
 
       // 🔔 Notify the job owner (consumer)
-      await createNotification({
-        userId: job.consumerId,
-        type: "NEW_BID",
-        content: {
-          title: "New bid",
-          body: `New bid (#${bid.id}) on your job "${job.title}".`,
-          jobId: job.id,
-          bidId: bid.id,
-        },
-      });
+      {
+        const now = new Date();
+        const prefMap = await getNotificationPreferencesMap({
+          prisma: prisma as any,
+          userIds: [job.consumerId],
+        });
+        if (shouldSendNotification(prefMap.get(job.consumerId), "BID", now)) {
+          await createNotification({
+            userId: job.consumerId,
+            type: "NEW_BID",
+            content: {
+              title: "New bid",
+              body: `New bid (#${bid.id}) on your job "${job.title}".`,
+              jobId: job.id,
+              bidId: bid.id,
+            },
+          });
+        }
+      }
 
       // ✅ Webhook: bid placed (you can later split into bid.updated vs bid.placed)
       await enqueueWebhookEvent({
@@ -6125,272 +6031,8 @@ app.get(
 
 
 // GET /providers/search
-// Query params:
-//   q?: string
-//   location?: string
-//   specialty?: string
-//   minRating?: number
-//   minReviews?: number
-//   zip?: string (optional; used only for featured-zip ranking boost)
-//   page?: number (1-based, default 1)
-//   pageSize?: number (default 10, max 50)
-app.get(
-  "/providers/search",
-  authMiddleware,
-  async (req: AuthRequest, res: Response) => {
-    try {
-      const {
-        q,
-        location,
-        specialty,
-        minRating,
-        minReviews,
-        zip,
-        page = "1",
-        pageSize = "10",
-      } = req.query as {
-        q?: string;
-        location?: string;
-        specialty?: string;
-        minRating?: string;
-        minReviews?: string;
-        zip?: string;
-        page?: string;
-        pageSize?: string;
-      };
-
-      const pageNum = Math.max(Number(page) || 1, 1);
-      const take = Math.min(Number(pageSize) || 10, 50);
-      const skip = (pageNum - 1) * take;
-
-      const { userWhereVisible } = visibilityFilters(req);
-
-      // Build where clause for ProviderProfile + related provider
-      const where: any = {
-        provider: {
-          role: "PROVIDER",
-          ...userWhereVisible, // ✅ hide suspended providers for non-admin
-        },
-      };
-
-      if (q && q.trim()) {
-        where.provider.name = { contains: q.trim(), mode: "insensitive" };
-      }
-
-      if (location && location.trim()) {
-        where.provider.location = { contains: location.trim(), mode: "insensitive" };
-      }
-
-      if (specialty && specialty.trim()) {
-        where.specialties = { contains: specialty.trim(), mode: "insensitive" };
-      }
-
-      const minRatingNum = Number(minRating);
-      if (!Number.isNaN(minRatingNum) && minRatingNum > 0) {
-        where.rating = { gte: minRatingNum };
-      }
-
-      const minReviewsNum = Number(minReviews);
-      if (!Number.isNaN(minReviewsNum) && minReviewsNum > 0) {
-        where.reviewCount = { gte: minReviewsNum };
-      }
-
-      const boostedZip = normalizeZipForBoost({ zip, location });
-
-      // We compute a deterministic ranking score in JS (includes subscription + featured zip boosts).
-      // To keep pagination reasonably accurate without expensive raw SQL, we rank a capped window
-      // (first N results under the existing rating/review ordering) then slice.
-      const rankWindowTake = Math.min(skip + take, 200);
-
-      const [profilesWindow, total] = await Promise.all([
-        prisma.providerProfile.findMany({
-          where,
-          select: {
-            experience: true,
-            specialties: true,
-            rating: true,
-            reviewCount: true,
-            // Back-compat: some older rows may still set these on the profile.
-            verificationBadge: true,
-            featuredZipCodes: true,
-            categories: { select: { id: true, name: true, slug: true } },
-            provider: {
-              select: {
-                id: true,
-                name: true,
-                email: true,
-                phone: true,
-                location: true,
-                subscription: { select: { tier: true } },
-                providerStats: {
-                  select: {
-                    avgRating: true,
-                    ratingCount: true,
-                    jobsCompleted30d: true,
-                    medianResponseTimeSeconds30d: true,
-                    cancellationRate30d: true,
-                    disputeRate30d: true,
-                    reportRate30d: true,
-                    updatedAt: true,
-                  },
-                },
-                providerEntitlement: {
-                  select: {
-                    verificationBadge: true,
-                    featuredZipCodes: true,
-                  },
-                },
-                providerVerification: { select: { status: true } },
-              },
-            },
-          },
-          orderBy: [{ rating: "desc" }, { reviewCount: "desc" }, { provider: { name: "asc" } }],
-          skip: 0,
-          take: rankWindowTake,
-        }),
-        prisma.providerProfile.count({ where }),
-      ]);
-
-      const ranked = profilesWindow
-        .map((p) => {
-          const entitlement = p.provider.providerEntitlement;
-          const verificationBadge = Boolean(entitlement?.verificationBadge ?? p.verificationBadge);
-
-          const featuredZipCodes = entitlement?.featuredZipCodes ?? p.featuredZipCodes ?? [];
-          const isFeaturedForZip = boostedZip ? featuredZipCodes.includes(boostedZip) : false;
-
-          const subscriptionTier = p.provider.subscription?.tier ?? "FREE";
-
-          const stats = p.provider.providerStats;
-          const avgRating = stats?.avgRating ?? p.rating ?? null;
-          const ratingCount = stats?.ratingCount ?? p.reviewCount ?? 0;
-
-          const viewerZip = boostedZip;
-          const providerZip = extractZip5(p.provider.location ?? null);
-          const distanceMiles =
-            viewerZip && providerZip
-              ? viewerZip === providerZip
-                ? 0
-                : (zipcodes.distance(viewerZip, providerZip) as number | null)
-              : null;
-
-          const ranking = rankProvider({
-            distanceMiles,
-            avgRating,
-            ratingCount,
-            medianResponseTimeSeconds30d: stats?.medianResponseTimeSeconds30d ?? null,
-            subscriptionTier,
-            isFeaturedForZip,
-            verificationBadge,
-          });
-
-          return {
-            profile: p,
-            verificationBadge,
-            isFeaturedForZip,
-            ranking,
-            stats,
-          };
-        })
-        .sort((a, b) => {
-          // Deterministic ordering: score desc, then rating/reviews, then name, then providerId.
-          if (b.ranking.finalScore !== a.ranking.finalScore) {
-            return b.ranking.finalScore - a.ranking.finalScore;
-          }
-
-          const ar = a.profile.rating ?? 0;
-          const br = b.profile.rating ?? 0;
-          if (br !== ar) return br - ar;
-
-          const ac = a.profile.reviewCount ?? 0;
-          const bc = b.profile.reviewCount ?? 0;
-          if (bc !== ac) return bc - ac;
-
-          const an = a.profile.provider.name ?? "";
-          const bn = b.profile.provider.name ?? "";
-          const nameCmp = an.localeCompare(bn);
-          if (nameCmp !== 0) return nameCmp;
-
-          return a.profile.provider.id - b.profile.provider.id;
-        });
-
-      const pageItems = ranked.slice(skip, skip + take);
-
-      // Favorites for consumer
-      let favoriteIds = new Set<number>();
-      if (req.user?.role === "CONSUMER" && pageItems.length > 0) {
-        const providerIds = pageItems.map((it) => it.profile.provider.id);
-        const favorites = await prisma.favoriteProvider.findMany({
-          where: {
-            consumerId: req.user.userId,
-            providerId: { in: providerIds },
-          },
-        });
-        favoriteIds = new Set(favorites.map((f) => f.providerId));
-      }
-
-      return res.json({
-        page: pageNum,
-        pageSize: take,
-        total,
-        totalPages: Math.ceil(total / take) || 1,
-        providers: pageItems.map(({ profile: p, verificationBadge, isFeaturedForZip, ranking, stats }) => ({
-          id: p.provider.id,
-          name: p.provider.name,
-          email: p.provider.email,
-          phone: p.provider.phone,
-          location: p.provider.location,
-          experience: p.experience,
-          specialties: p.specialties,
-          rating: stats?.avgRating ?? p.rating,
-          reviewCount: stats?.ratingCount ?? p.reviewCount,
-          verificationBadge,
-          verificationStatus: p.provider.providerVerification?.status ?? "NONE",
-          isVerified: p.provider.providerVerification?.status === "VERIFIED",
-
-          // Do not leak featured zip lists; only expose what UI needs.
-          isFeaturedForZip,
-          ranking: {
-            baseScore: ranking.baseScore,
-            distanceScore: ranking.distanceScore,
-            ratingScore: ranking.ratingScore,
-            responseScore: ranking.responseScore,
-            tierBoost: ranking.tierBoost,
-            featuredBoost: ranking.featuredBoost,
-            verifiedBoost: ranking.verifiedBoost,
-            finalScore: ranking.finalScore,
-          },
-
-          stats: stats
-            ? {
-                avgRating: stats.avgRating,
-                ratingCount: stats.ratingCount,
-                jobsCompleted30d: stats.jobsCompleted30d,
-                medianResponseTimeSeconds30d: stats.medianResponseTimeSeconds30d,
-                cancellationRate30d: stats.cancellationRate30d,
-                disputeRate30d: stats.disputeRate30d,
-                reportRate30d: stats.reportRate30d,
-                updatedAt: stats.updatedAt,
-              }
-            : null,
-
-          isFavorited:
-            req.user?.role === "CONSUMER" ? favoriteIds.has(p.provider.id) : false,
-          categories: p.categories.map((c) => ({
-            id: c.id,
-            name: c.name,
-            slug: c.slug,
-          })),
-        })),
-      });
-    } catch (err) {
-      console.error("GET /providers/search error:", err);
-      return res.status(500).json({
-        error: "Internal server error while searching providers.",
-      });
-    }
-  }
-);
+// Marketplace provider search with filters + deterministic ranking.
+app.get("/providers/search", authMiddleware, createGetProvidersSearchHandler({ prisma }));
 
 // GET /providers/search/feed
 // Cursor-based provider feed (stable ordering by providerId)
@@ -6716,13 +6358,18 @@ app.post(
   "/provider/verification/attachments/upload",
   authMiddleware,
   requireVerifiedEmail,
-  requireAttestation,
   uploadSingleVerificationAttachment,
   async (req: AuthRequest, res: Response) => {
     try {
       if (!req.user) return res.status(401).json({ error: "Not authenticated" });
       if (req.user.role !== "PROVIDER") {
         return res.status(403).json({ error: "Only providers can upload verification documents." });
+      }
+
+      if ((process.env.NODE_ENV ?? "development") === "production" && !attachmentStorageProvider) {
+        return res.status(500).json({
+          error: "Attachment storage is not configured. This server is misconfigured for production.",
+        });
       }
 
       const file = (req as any).file as Express.Multer.File | undefined;
@@ -6900,7 +6547,6 @@ app.post(
   "/provider/verification/submit",
   authMiddleware,
   requireVerifiedEmail,
-  requireAttestation,
   validate(providerVerificationSubmitSchema),
   async (req: AuthRequest, res: Response) => {
     try {
@@ -7050,13 +6696,6 @@ app.post(
           },
           select: { providerId: true, status: true, verifiedAt: true },
         });
-
-        await tx.providerProfile.upsert({
-          where: { providerId },
-          create: { providerId, verificationBadge: true },
-          update: { verificationBadge: true },
-        });
-
         return v;
       });
 
@@ -7094,13 +6733,6 @@ app.post(
           },
           select: { providerId: true, status: true, verifiedAt: true },
         });
-
-        await tx.providerProfile.upsert({
-          where: { providerId },
-          create: { providerId, verificationBadge: false },
-          update: { verificationBadge: false },
-        });
-
         return v;
       });
 
@@ -7762,6 +7394,32 @@ app.get(
 // Messaging endpoints
 // -----------------------------
 
+// -----------------------------
+// Contact exchange gate
+// -----------------------------
+
+app.post(
+  "/jobs/:id/contact-exchange/request",
+  authMiddleware,
+  contactExchangeRequestLimiter,
+  express.json(),
+  createPostContactExchangeRequestHandler({ prisma: prisma as any, logSecurityEvent })
+);
+
+app.post(
+  "/jobs/:id/contact-exchange/decide",
+  authMiddleware,
+  contactExchangeDecideLimiter,
+  express.json(),
+  createPostContactExchangeDecideHandler({ prisma: prisma as any, logSecurityEvent })
+);
+
+app.get(
+  "/jobs/:id/contact-exchange",
+  authMiddleware,
+  createGetContactExchangeHandler({ prisma: prisma as any })
+);
+
 // Helper to extract user from Authorization header (Bearer token)
 function getUserFromAuthHeader(req: express.Request) {
   const authHeader = req.headers.authorization;
@@ -8142,7 +7800,6 @@ app.post(
   "/jobs/:jobId/messages",
   authMiddleware,
   requireVerifiedEmail,
-  requireAttestation,
   messageSendLimiter,
   validate(sendMessageSchema),
   uploadSingleAttachment,
@@ -8180,6 +7837,7 @@ app.post(
           id: true,
           consumerId: true,
           awardedProviderId: true,
+          status: true,
           title: true,
           isHidden: true,
           consumer: { select: { isSuspended: true } },
@@ -8192,6 +7850,7 @@ app.post(
         select: {
           id: true,
           consumerId: true,
+          status: true,
           title: true,
           isHidden: true,
           consumer: { select: { isSuspended: true } },
@@ -8258,121 +7917,27 @@ app.post(
 
     // Risk scoring / spam detection (best-effort)
     try {
-      const risk = await assessRepeatedMessageRisk({ jobId, senderId: req.user.userId, text: messageText });
+      const outcome = await moderateJobMessageSend({
+        prisma,
+        req,
+        isAdmin: isAdmin(req),
+        jobId,
+        jobStatus: (job as any).status,
+        senderId,
+        messageText,
+        appealUrl,
+        logSecurityEvent,
+      });
 
-      const moderation = decideMessageModeration(risk);
-      if (moderation.action === "BLOCK" && !isAdmin(req)) {
-        try {
-          await prisma.user.update({
-            where: { id: req.user.userId },
-            data: { riskScore: { increment: risk.totalScore } },
-          });
-        } catch (e: any) {
-          if (!isMissingDbColumnError(e)) throw e;
-        }
-
-        await logSecurityEvent(req, "message.blocked", {
-          targetType: "JOB",
-          targetId: jobId,
-          jobId,
-          senderId: req.user.userId,
-          reasonCodes: moderation.reasonCodes,
-          riskTotalScore: risk.totalScore,
-          riskSignals: risk.signals,
-          textPreview: messageText.slice(0, 200),
-        });
-
-        // Repeat-offender throttling: if a user triggers multiple blocks in a short window,
-        // temporarily restrict to slow down spam/scams.
-        try {
-          const windowMinutes = 60;
-          const since = new Date(Date.now() - windowMinutes * 60_000);
-          const recentBlocks = await prisma.securityEvent.count({
-            where: {
-              actorUserId: req.user.userId,
-              actionType: "message.blocked",
-              createdAt: { gt: since },
-            },
-          });
-
-          if (recentBlocks >= 3) {
-            const until = computeRestrictedUntil();
-            try {
-              await prisma.user.update({
-                where: { id: req.user.userId },
-                data: { restrictedUntil: until },
-              });
-            } catch (e: any) {
-              if (!isMissingDbColumnError(e)) throw e;
-            }
-
-            await logSecurityEvent(req, "user.restricted", {
-              targetType: "USER",
-              targetId: req.user.userId,
-              reason: "repeated_message_blocks",
-              restrictedUntil: until.toISOString(),
-              recentBlocks,
-              windowMinutes,
-            });
-
-            return restrictedResponse(res, {
-              message:
-                "Your account is temporarily restricted due to repeated blocked messages. Please try again later.",
-              restrictedUntil: until,
-            });
-          }
-        } catch {
-          // ignore throttling failures
-        }
-
-        const isContactInfo = moderation.reasonCodes.includes("CONTACT_INFO");
-        return res.status(400).json({
-          error: isContactInfo
-            ? "For your safety, sharing phone numbers or emails in messages is not allowed. Please keep communication in-app."
-            : "For your safety, messages asking to move off-platform or use risky payment methods are blocked. Please keep communication in-app.",
-          code: isContactInfo ? "CONTACT_INFO_NOT_ALLOWED" : "MESSAGE_BLOCKED",
-          blocked: true,
-          reasonCodes: moderation.reasonCodes,
-          appealUrl,
-        });
-      }
-
-      if (risk.totalScore >= RISK_RESTRICT_THRESHOLD && !isAdmin(req)) {
-        const until = computeRestrictedUntil();
-        try {
-          await prisma.user.update({
-            where: { id: req.user.userId },
-            data: { riskScore: { increment: risk.totalScore }, restrictedUntil: until },
-          });
-        } catch (e: any) {
-          if (!isMissingDbColumnError(e)) throw e;
-        }
-
-        await logSecurityEvent(req, "user.restricted", {
-          targetType: "USER",
-          targetId: req.user.userId,
-          reason: "message_risk_threshold",
-          jobId,
-          riskTotalScore: risk.totalScore,
-          riskSignals: risk.signals,
-          restrictedUntil: until.toISOString(),
-        });
-
+      if (outcome.action === "RESTRICTED") {
         return restrictedResponse(res, {
-          message: "Your account is temporarily restricted due to suspicious activity.",
-          restrictedUntil: until,
+          message: outcome.message,
+          restrictedUntil: outcome.restrictedUntil,
         });
       }
 
-      if (risk.totalScore > 0) {
-        try {
-          await prisma.user.update({
-            where: { id: req.user.userId },
-            data: { riskScore: { increment: risk.totalScore } },
-          });
-        } catch (e: any) {
-          if (!isMissingDbColumnError(e)) throw e;
-        }
+      if (outcome.action === "BLOCK") {
+        return res.status(outcome.status).json(outcome.body);
       }
     } catch {
       // ignore scoring failures
@@ -8397,6 +7962,11 @@ app.post(
           },
         };
       } else {
+        if ((process.env.NODE_ENV ?? "development") === "production") {
+          return res.status(500).json({
+            error: "Attachment storage is not configured. This server is misconfigured for production.",
+          });
+        }
         const diskPath = path.posix.join("attachments", basename);
         const abs = path.join(UPLOADS_DIR, diskPath);
         await fs.promises.mkdir(path.dirname(abs), { recursive: true });
@@ -8463,32 +8033,46 @@ app.post(
         distinct: ["providerId"],
       });
 
-      for (const b of bids) {
-        if (b.providerId !== senderId) {
-          notifiedUserIds.push(b.providerId);
-          await createNotification({
-            userId: b.providerId,
-            type: "NEW_MESSAGE",
-            content: {
-              title: "New message",
-              body: `New message on job "${job.title}".`,
-              jobId: job.id,
-            },
-          });
-        }
+      const providerIds = bids.map((b) => b.providerId).filter((id) => id !== senderId);
+      const prefMap = await getNotificationPreferencesMap({
+        prisma: prisma as any,
+        userIds: providerIds,
+      });
+      const notifyNow = new Date();
+
+      for (const providerId of providerIds) {
+        if (!shouldSendNotification(prefMap.get(providerId), "MESSAGE", notifyNow)) continue;
+
+        notifiedUserIds.push(providerId);
+        await createNotification({
+          userId: providerId,
+          type: "NEW_MESSAGE",
+          content: {
+            title: "New message",
+            body: `New message on job "${job.title}".`,
+            jobId: job.id,
+          },
+        });
       }
     } else {
       // Provider → notify consumer
-      notifiedUserIds.push(job.consumerId);
-      await createNotification({
-        userId: job.consumerId,
-        type: "NEW_MESSAGE",
-        content: {
-          title: "New message",
-          body: `New message on your job "${job.title}".`,
-          jobId: job.id,
-        },
+      const prefMap = await getNotificationPreferencesMap({
+        prisma: prisma as any,
+        userIds: [job.consumerId],
       });
+      const notifyNow = new Date();
+      if (shouldSendNotification(prefMap.get(job.consumerId), "MESSAGE", notifyNow)) {
+        notifiedUserIds.push(job.consumerId);
+        await createNotification({
+          userId: job.consumerId,
+          type: "NEW_MESSAGE",
+          content: {
+            title: "New message",
+            body: `New message on your job "${job.title}".`,
+            jobId: job.id,
+          },
+        });
+      }
     }
 
     // ✅ Webhook: message sent
@@ -9375,6 +8959,7 @@ app.get("/notifications", authMiddleware, notificationsLimiter, async (req: Auth
         type: n.type,
         content: n.content,
         read: n.read,
+        readAt: n.readAt,
         createdAt: n.createdAt,
       })),
       pageInfo: { limit: take, nextCursor },
@@ -9410,6 +8995,7 @@ app.get("/me/notifications", authMiddleware, notificationsLimiter, async (req: A
         type: n.type,
         content: n.content,
         read: n.read,
+        readAt: n.readAt,
         createdAt: n.createdAt,
       })),
       pageInfo: { limit: take, nextCursor },
@@ -9436,7 +9022,7 @@ app.post(
 
     const notif = await prisma.notification.findUnique({
       where: { id: notifId },
-      select: { id: true, userId: true, read: true, type: true, createdAt: true },
+      select: { id: true, userId: true, read: true, readAt: true, type: true, createdAt: true },
     });
 
     if (!notif || notif.userId !== req.user.userId) {
@@ -9444,13 +9030,15 @@ app.post(
     }
 
     // already read → idempotent response (still OK)
-    const updated = notif.read
-      ? notif
-      : await prisma.notification.update({
+    // If legacy data has read=true but readAt is missing, we backfill readAt on this write.
+    const shouldWrite = !notif.read || !notif.readAt;
+    const updated = shouldWrite
+      ? await prisma.notification.update({
           where: { id: notifId },
-          data: { read: true },
-          select: { id: true, userId: true, read: true, type: true, createdAt: true },
-        });
+          data: { read: true, readAt: notif.readAt ?? new Date() },
+          select: { id: true, userId: true, read: true, readAt: true, type: true, createdAt: true },
+        })
+      : notif;
 
     // ✅ Webhook (only emit when it actually changed)
     if (!notif.read) {
@@ -9461,7 +9049,7 @@ app.post(
           userId: updated.userId,
           type: updated.type,
           createdAt: updated.createdAt,
-          readAt: new Date(),
+          readAt: updated.readAt ?? new Date(),
         },
       });
     }
@@ -9469,6 +9057,7 @@ app.post(
     return res.json({
       id: updated.id,
       read: true,
+      readAt: updated.readAt ?? null,
     });
   } catch (err) {
     console.error("Mark notification read error:", err);
@@ -9488,7 +9077,7 @@ app.post("/notifications/read-all", authMiddleware, validate({}), async (req: Au
         userId: req.user.userId,
         read: false,
       },
-      data: { read: true },
+      data: { read: true, readAt: new Date() },
     });
 
     // ✅ Webhook (only if anything changed)

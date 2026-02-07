@@ -15,7 +15,7 @@ Set these on the Railway service (do **not** commit to git):
 
 Optional but recommended production guardrails:
 
-- Object storage for attachments (required in `NODE_ENV=production` unless escape hatch is set):
+- Object storage for attachments (required in `NODE_ENV=production`):
   - `OBJECT_STORAGE_PROVIDER=s3`
   - `OBJECT_STORAGE_S3_BUCKET`
   - `OBJECT_STORAGE_S3_REGION`
@@ -24,7 +24,10 @@ Optional but recommended production guardrails:
   - `OBJECT_STORAGE_S3_ENDPOINT` (optional; required for Cloudflare R2)
   - `OBJECT_STORAGE_S3_FORCE_PATH_STYLE` (optional)
   - `ATTACHMENTS_SIGNED_URL_TTL_SECONDS` (optional; default `300`)
-  - Emergency escape hatch (not recommended): `OBJECT_STORAGE_ALLOW_DISK_IN_PROD=true`
+
+  Recommended bucket policy:
+  - Keep the bucket **private** (block all public access).
+  - Serve attachments via short-lived **pre-signed URLs** only.
 
 - App attestation enforcement (only required if you turn it on):
   - `APP_ATTESTATION_ENFORCE=true`

@@ -30,7 +30,7 @@ These are enforced by runtime env loading in `src/config/env.ts`.
 
 **Attachments object storage**
 - In production, `OBJECT_STORAGE_PROVIDER` must be `s3`.
-- Emergency escape hatch only: `OBJECT_STORAGE_ALLOW_DISK_IN_PROD=true`.
+- Object storage is required in production.
 - If `OBJECT_STORAGE_PROVIDER=s3`, the following must be set:
   - `OBJECT_STORAGE_S3_BUCKET`
   - `OBJECT_STORAGE_S3_REGION`

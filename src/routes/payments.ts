@@ -1,7 +1,6 @@
 import express from "express";
 import { prisma } from "../prisma";
 import { authMiddleware } from "../middleware/authMiddleware";
-import { requireAttestation } from "../middleware/requireAttestation";
 import { requireVerifiedEmail } from "../middleware/requireVerifiedEmail";
 import { requireAdmin } from "../middleware/requireAdmin";
 import {
@@ -15,8 +14,131 @@ import { z } from "zod";
 import { validate } from "../middleware/validate";
 import { logSecurityEvent } from "../services/securityEventLogger";
 import { createAsyncRouter } from "../middleware/asyncWrap";
+import { recordStripeWebhookEventOnce } from "../services/billing/stripeWebhookIdempotency";
+import crypto from "node:crypto";
 
 const router = createAsyncRouter(express);
+
+export function createStripeWebhookHandler(deps?: {
+  prismaClient?: typeof prisma;
+  stripeWebhooks?: { constructEvent: (body: any, sig: string, secret: string) => any };
+  applySucceeded?: typeof applyPaymentIntentSucceededFromWebhook;
+  applyFailed?: typeof applyPaymentIntentFailedFromWebhook;
+  logSecurityEventImpl?: typeof logSecurityEvent;
+  webhookSecret?: string | undefined;
+}) {
+  const prismaClient = deps?.prismaClient ?? prisma;
+  const stripeWebhooks = deps?.stripeWebhooks ?? stripe.webhooks;
+  const applySucceeded = deps?.applySucceeded ?? applyPaymentIntentSucceededFromWebhook;
+  const applyFailed = deps?.applyFailed ?? applyPaymentIntentFailedFromWebhook;
+  const logSecurityEventImpl = deps?.logSecurityEventImpl ?? logSecurityEvent;
+  const webhookSecret = deps?.webhookSecret ?? env.STRIPE_WEBHOOK_SECRET;
+
+  return async (req: any, res: any) => {
+    try {
+      const sig = req.headers["stripe-signature"];
+
+      if (!sig) {
+        await logSecurityEventImpl(req, "payment.webhook_failed", {
+          reason: "missing_signature",
+        });
+        return res.status(400).json({ error: "Missing stripe signature" });
+      }
+
+      if (!webhookSecret) {
+        await logSecurityEventImpl(req, "payment.webhook_failed", {
+          reason: "webhook_secret_not_configured",
+        });
+        return res.status(500).json({
+          error: "Stripe webhook secret not configured (set STRIPE_WEBHOOK_SECRET)",
+        });
+      }
+
+      const event = stripeWebhooks.constructEvent(req.body, sig as string, webhookSecret);
+
+      const stripeEventId = (event as any)?.id ? String((event as any).id) : null;
+
+      await logSecurityEventImpl(req, "payment.webhook_received", {
+        stripeEventType: event.type,
+        stripeEventId,
+      });
+
+      // DB-level replay protection by Stripe event id.
+      if (stripeEventId) {
+        const payloadHash = Buffer.isBuffer(req.body)
+          ? crypto.createHash("sha256").update(req.body).digest("hex")
+          : null;
+
+        const { alreadyProcessed } = await recordStripeWebhookEventOnce({
+          stripeEventId,
+          type: String(event.type ?? "unknown"),
+          paymentIntentId: (event.data?.object as any)?.id ?? null,
+          payloadHash,
+          deps: { prisma: prismaClient as any },
+        });
+
+        if (alreadyProcessed) {
+          await logSecurityEventImpl(req, "payment.webhook_replayed", {
+            stripeEventType: event.type,
+            stripeEventId,
+          });
+          return res.json({ received: true, replay: true });
+        }
+      }
+
+      if (event.type === "payment_intent.succeeded") {
+        const paymentIntent = event.data.object as any;
+        const r: any = await applySucceeded(paymentIntent.id);
+
+        const kind = String(paymentIntent?.metadata?.kind ?? "unknown");
+        const idempotent = Boolean(r?.idempotent);
+        const addonGranted = Boolean(r?.addonResult?.granted);
+        const granted = !idempotent || addonGranted;
+
+        if (granted) {
+          await logSecurityEventImpl(req, "billing.webhook_grant_applied", {
+            targetType: "STRIPE",
+            targetId: paymentIntent.id,
+            stripeEventType: event.type,
+            stripeEventId,
+            paymentIntentId: paymentIntent.id,
+            kind,
+            idempotent,
+            tier: r?.subscription?.tier ?? r?.stripePayment?.tier ?? null,
+            addonType: r?.stripePayment?.addonType ?? paymentIntent?.metadata?.addonType ?? null,
+            providerId: r?.addonResult?.providerId ?? null,
+          });
+        }
+
+        await logSecurityEventImpl(req, "payment.webhook_processed", {
+          stripeEventType: event.type,
+          stripeEventId,
+          paymentIntentId: paymentIntent.id,
+          idempotent,
+          kind,
+        });
+      } else if (event.type === "payment_intent.payment_failed") {
+        const paymentIntent = event.data.object as any;
+        await applyFailed(paymentIntent.id);
+        await logSecurityEventImpl(req, "payment.webhook_processed", {
+          stripeEventType: event.type,
+          stripeEventId,
+          paymentIntentId: paymentIntent.id,
+          kind: String(paymentIntent?.metadata?.kind ?? "unknown"),
+        });
+      }
+
+      return res.json({ received: true });
+    } catch (error: any) {
+      console.error("Webhook error:", error);
+      await logSecurityEventImpl(req, "payment.webhook_failed", {
+        reason: "exception",
+        message: String(error?.message ?? error),
+      });
+      return res.status(400).json({ error: error.message });
+    }
+  };
+}
 
 export function createConfirmPaymentHandler(deps?: {
   stripeClient?: { paymentIntents: { retrieve: (id: string) => Promise<any> } };
@@ -140,7 +262,6 @@ router.post(
   "/create-intent",
   authMiddleware,
   requireVerifiedEmail,
-  requireAttestation,
   validate(createIntentSchema),
   async (req, res) => {
   try {
@@ -177,7 +298,6 @@ router.post(
   "/confirm",
   authMiddleware,
   requireVerifiedEmail,
-  requireAttestation,
   validate(confirmPaymentSchema),
   createConfirmPaymentHandler()
 );
@@ -190,76 +310,14 @@ router.post(
   "/webhook",
   express.raw({ type: "application/json" }),
   validate({}),
-  async (req, res) => {
-    try {
-      const sig = req.headers["stripe-signature"];
-
-      if (!sig) {
-        await logSecurityEvent(req, "payment.webhook_failed", {
-          reason: "missing_signature",
-        });
-        return res.status(400).json({ error: "Missing stripe signature" });
-      }
-
-      if (!env.STRIPE_WEBHOOK_SECRET) {
-        await logSecurityEvent(req, "payment.webhook_failed", {
-          reason: "webhook_secret_not_configured",
-        });
-        return res.status(500).json({
-          error:
-            "Stripe webhook secret not configured (set STRIPE_WEBHOOK_SECRET)",
-        });
-      }
-
-      const event = stripe.webhooks.constructEvent(
-        req.body,
-        sig as string,
-        env.STRIPE_WEBHOOK_SECRET
-      );
-
-      await logSecurityEvent(req, "payment.webhook_received", {
-        stripeEventType: event.type,
-        stripeEventId: (event as any)?.id ?? null,
-      });
-
-      if (event.type === "payment_intent.succeeded") {
-        const paymentIntent = event.data.object as any;
-        const r = await applyPaymentIntentSucceededFromWebhook(paymentIntent.id);
-        await logSecurityEvent(req, "payment.webhook_processed", {
-          stripeEventType: event.type,
-          stripeEventId: (event as any)?.id ?? null,
-          paymentIntentId: paymentIntent.id,
-          idempotent: Boolean((r as any)?.idempotent),
-          kind: String(paymentIntent?.metadata?.kind ?? "unknown"),
-        });
-      } else if (event.type === "payment_intent.payment_failed") {
-        const paymentIntent = event.data.object as any;
-        await applyPaymentIntentFailedFromWebhook(paymentIntent.id);
-        await logSecurityEvent(req, "payment.webhook_processed", {
-          stripeEventType: event.type,
-          stripeEventId: (event as any)?.id ?? null,
-          paymentIntentId: paymentIntent.id,
-          kind: String(paymentIntent?.metadata?.kind ?? "unknown"),
-        });
-      }
-
-      res.json({ received: true });
-    } catch (error: any) {
-      console.error("Webhook error:", error);
-      await logSecurityEvent(req, "payment.webhook_failed", {
-        reason: "exception",
-        message: String(error?.message ?? error),
-      });
-      res.status(400).json({ error: error.message });
-    }
-  }
+  createStripeWebhookHandler()
 );
 
 /**
  * GET /payments/subscription/:userId
  * Get user's subscription status and payment history
  */
-router.get("/subscription/:userId", authMiddleware, requireVerifiedEmail, requireAttestation, async (req, res) => {
+router.get("/subscription/:userId", authMiddleware, requireVerifiedEmail, async (req, res) => {
   try {
     const { userId } = req.params;
     const requestUserId = req.user!.userId;
