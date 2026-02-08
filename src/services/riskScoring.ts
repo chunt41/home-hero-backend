@@ -32,8 +32,12 @@ const BANNED_KEYWORDS: Array<{ phrase: string; score: number }> = [
   { phrase: "zelle", score: 25 },
   { phrase: "telegram", score: 25 },
   { phrase: "whatsapp", score: 20 },
+  { phrase: "whats app", score: 20 },
   { phrase: "cashapp", score: 20 },
+  { phrase: "cash app", score: 20 },
+  { phrase: "venmo", score: 20 },
   { phrase: "venmo me", score: 20 },
+  { phrase: "paypal", score: 20 },
 ];
 
 const EMAIL_RE = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i;

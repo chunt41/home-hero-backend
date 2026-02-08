@@ -15,6 +15,9 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { router } from "expo-router";
 import { api } from "../../src/lib/apiClient";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import Slider from "@react-native-community/slider";
+import { useAuth } from "../context/AuthContext";
 
 type ProviderItem = {
   id: number;
@@ -65,11 +68,91 @@ type Category = {
   slug: string;
 };
 
+type SortMode = "relevance" | "distance" | "rating" | "responseTime";
+
+type PersistedDiscoveryFiltersV1 = {
+  v: 1;
+  zip: string;
+  radiusMiles: number;
+  verifiedOnly: boolean;
+  selectedCategorySlugs: string[];
+  minRating: number | null;
+  sort: SortMode;
+};
+
+const DEFAULT_FILTERS: Omit<PersistedDiscoveryFiltersV1, "v"> = {
+  zip: "",
+  radiusMiles: 25,
+  verifiedOnly: false,
+  selectedCategorySlugs: [],
+  minRating: null,
+  sort: "relevance",
+};
+
+const ANON_DISCOVERY_FILTERS_KEY = "homeHero.providerDiscovery.filters.v1.anon";
+
+function safeParsePersistedFilters(raw: string | null): PersistedDiscoveryFiltersV1 | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as PersistedDiscoveryFiltersV1;
+    if (!parsed || parsed.v !== 1) return null;
+    if (typeof parsed.zip !== "string") return null;
+    if (!Number.isFinite(parsed.radiusMiles)) return null;
+    if (!Array.isArray(parsed.selectedCategorySlugs)) return null;
+    if (parsed.minRating !== null && !Number.isFinite(parsed.minRating)) return null;
+    if (!["relevance", "distance", "rating", "responseTime"].includes(parsed.sort)) return null;
+
+    return {
+      v: 1,
+      zip: parsed.zip,
+      radiusMiles: Math.max(1, Math.min(100, Math.round(parsed.radiusMiles))),
+      verifiedOnly: !!(parsed as any).verifiedOnly,
+      selectedCategorySlugs: parsed.selectedCategorySlugs.filter((s) => typeof s === "string" && s.trim()),
+      minRating: parsed.minRating === null ? null : Math.max(0, Math.min(5, Number(parsed.minRating))),
+      sort: parsed.sort,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function sortLabel(sort: SortMode): string {
+  if (sort === "relevance") return "Relevance";
+  if (sort === "distance") return "Distance";
+  if (sort === "rating") return "Rating";
+  return "Response time";
+}
+
+function minRatingLabel(minRating: number | null): string {
+  if (minRating === null) return "Any";
+  if (minRating >= 4.5) return "4.5+";
+  if (minRating >= 4) return "4.0+";
+  if (minRating >= 3) return "3.0+";
+  return `${minRating.toFixed(1)}+`;
+}
+
 export default function ProviderDiscoveryScreen() {
+  const { user, isBooting } = useAuth();
+
+  const [filtersHydrated, setFiltersHydrated] = useState(false);
+  const [persistEnabled, setPersistEnabled] = useState(false);
+  const [activeStorageKey, setActiveStorageKey] = useState(ANON_DISCOVERY_FILTERS_KEY);
+  const [hydratedUserId, setHydratedUserId] = useState<number | null>(null);
+
   const [zip, setZip] = useState("");
-  const [radiusMiles, setRadiusMiles] = useState(25);
-  const [verifiedOnly, setVerifiedOnly] = useState(false);
-  const [selectedCategorySlugs, setSelectedCategorySlugs] = useState<string[]>([]);
+  const [radiusMiles, setRadiusMiles] = useState(DEFAULT_FILTERS.radiusMiles);
+  const [verifiedOnly, setVerifiedOnly] = useState(DEFAULT_FILTERS.verifiedOnly);
+  const [selectedCategorySlugs, setSelectedCategorySlugs] = useState<string[]>(DEFAULT_FILTERS.selectedCategorySlugs);
+  const [minRating, setMinRating] = useState<number | null>(DEFAULT_FILTERS.minRating);
+  const [sort, setSort] = useState<SortMode>(DEFAULT_FILTERS.sort);
+
+  // Draft values inside the modal (applied on "Apply")
+  const [draftRadiusMiles, setDraftRadiusMiles] = useState(DEFAULT_FILTERS.radiusMiles);
+  const [draftVerifiedOnly, setDraftVerifiedOnly] = useState(DEFAULT_FILTERS.verifiedOnly);
+  const [draftSelectedCategorySlugs, setDraftSelectedCategorySlugs] = useState<string[]>(DEFAULT_FILTERS.selectedCategorySlugs);
+  const [draftMinRating, setDraftMinRating] = useState<number | null>(DEFAULT_FILTERS.minRating);
+  const [draftSort, setDraftSort] = useState<SortMode>(DEFAULT_FILTERS.sort);
+
   const [categories, setCategories] = useState<Category[]>([]);
   const [showFiltersModal, setShowFiltersModal] = useState(false);
 
@@ -93,6 +176,153 @@ export default function ProviderDiscoveryScreen() {
   useEffect(() => {
     fetchCategories();
   }, [fetchCategories]);
+
+  const userStorageKey = useMemo(() => {
+    return user?.id ? `homeHero.providerDiscovery.filters.v1.${String(user.id)}` : null;
+  }, [user?.id]);
+
+  const applyMergedFilters = useCallback((merged: typeof DEFAULT_FILTERS) => {
+    setZip(merged.zip);
+    setRadiusMiles(merged.radiusMiles);
+    setVerifiedOnly(merged.verifiedOnly);
+    setSelectedCategorySlugs(merged.selectedCategorySlugs);
+    setMinRating(merged.minRating);
+    setSort(merged.sort);
+
+    // Keep drafts in sync so opening the modal reflects applied filters.
+    setDraftRadiusMiles(merged.radiusMiles);
+    setDraftVerifiedOnly(merged.verifiedOnly);
+    setDraftSelectedCategorySlugs(merged.selectedCategorySlugs);
+    setDraftMinRating(merged.minRating);
+    setDraftSort(merged.sort);
+  }, []);
+
+  const hydrateFromStorageKey = useCallback(async (key: string, opts?: { applyIfMissing?: boolean }) => {
+    const raw = await AsyncStorage.getItem(key);
+    const persisted = safeParsePersistedFilters(raw);
+
+    if (!persisted && opts?.applyIfMissing === false) {
+      return { found: false };
+    }
+
+    const merged = {
+      ...DEFAULT_FILTERS,
+      ...(persisted
+        ? {
+            zip: persisted.zip,
+            radiusMiles: persisted.radiusMiles,
+            verifiedOnly: persisted.verifiedOnly,
+            selectedCategorySlugs: persisted.selectedCategorySlugs,
+            minRating: persisted.minRating,
+            sort: persisted.sort,
+          }
+        : null),
+    };
+
+    applyMergedFilters(merged);
+    return { found: !!persisted };
+  }, [applyMergedFilters]);
+
+  // 1) Hydrate anonymous filters ASAP on app launch (before auth finishes).
+  useEffect(() => {
+    let mounted = true;
+
+    (async () => {
+      setPersistEnabled(false);
+      try {
+        setActiveStorageKey(ANON_DISCOVERY_FILTERS_KEY);
+        await hydrateFromStorageKey(ANON_DISCOVERY_FILTERS_KEY, { applyIfMissing: true });
+      } finally {
+        if (!mounted) return;
+        setFiltersHydrated(true);
+        setPersistEnabled(true);
+      }
+    })();
+
+    return () => {
+      mounted = false;
+    };
+  }, [hydrateFromStorageKey]);
+
+  // 2) Once auth is ready, hydrate user-specific filters and switch persistence to that key.
+  useEffect(() => {
+    if (isBooting) return;
+    if (!user?.id) {
+      // Logged out state: ensure persistence goes back to anon.
+      setHydratedUserId(null);
+      setActiveStorageKey(ANON_DISCOVERY_FILTERS_KEY);
+      return;
+    }
+
+    if (hydratedUserId === user.id) return;
+
+    let mounted = true;
+    (async () => {
+      setPersistEnabled(false);
+      try {
+        const key = userStorageKey;
+        if (!key) return;
+        setActiveStorageKey(key);
+        // Only apply user filters if they exist; otherwise keep current (likely anon) filters.
+        await hydrateFromStorageKey(key, { applyIfMissing: false });
+        if (!mounted) return;
+        setHydratedUserId(user.id);
+      } finally {
+        if (!mounted) return;
+        setPersistEnabled(true);
+      }
+    })();
+
+    return () => {
+      mounted = false;
+    };
+  }, [isBooting, user?.id, userStorageKey, hydratedUserId, hydrateFromStorageKey]);
+
+  // If the user logs out, restore the anon filters (best-effort).
+  useEffect(() => {
+    if (isBooting) return;
+    if (user?.id) return;
+
+    let mounted = true;
+    (async () => {
+      setPersistEnabled(false);
+      try {
+        setActiveStorageKey(ANON_DISCOVERY_FILTERS_KEY);
+        await hydrateFromStorageKey(ANON_DISCOVERY_FILTERS_KEY, { applyIfMissing: true });
+      } finally {
+        if (!mounted) return;
+        setPersistEnabled(true);
+      }
+    })();
+
+    return () => {
+      mounted = false;
+    };
+  }, [isBooting, user?.id, hydrateFromStorageKey]);
+
+  // Persist applied filters (per-user).
+  useEffect(() => {
+    if (!filtersHydrated) return;
+    if (!persistEnabled) return;
+
+    const payload: PersistedDiscoveryFiltersV1 = {
+      v: 1,
+      zip,
+      radiusMiles,
+      verifiedOnly,
+      selectedCategorySlugs,
+      minRating,
+      sort,
+    };
+
+    const t = setTimeout(() => {
+      AsyncStorage.setItem(activeStorageKey, JSON.stringify(payload)).catch(() => {
+        // ignore
+      });
+    }, 250);
+
+    return () => clearTimeout(t);
+  }, [filtersHydrated, persistEnabled, zip, radiusMiles, verifiedOnly, selectedCategorySlugs, minRating, sort, activeStorageKey]);
 
   const fetchProviders = useCallback(
     async (mode: "initial" | "refresh" | "more") => {
@@ -126,6 +356,8 @@ export default function ProviderDiscoveryScreen() {
         if (selectedCategorySlugs.length > 0) {
           query.set("categories", selectedCategorySlugs.join(","));
         }
+        if (minRating !== null) query.set("minRating", String(minRating));
+        query.set("sort", sort);
         query.set("limit", "15");
         if (isMore && nextCursor) query.set("cursor", nextCursor);
 
@@ -155,7 +387,7 @@ export default function ProviderDiscoveryScreen() {
         else setLoadingMore(false);
       }
     },
-    [zip, radiusMiles, verifiedOnly, selectedCategorySlugs, nextCursor]
+    [zip, radiusMiles, verifiedOnly, selectedCategorySlugs, minRating, sort, nextCursor]
   );
 
   const toggleFavorite = useCallback(async (providerId: number) => {
@@ -181,19 +413,15 @@ export default function ProviderDiscoveryScreen() {
     }
   }, [providers]);
 
-  // Debounced search
+  // Debounced search (after filters hydrate so we don't immediately overwrite restored state)
   useEffect(() => {
+    if (!filtersHydrated) return;
     const t = setTimeout(() => {
       setNextCursor(null);
       fetchProviders("initial");
     }, 400);
     return () => clearTimeout(t);
-  }, [zip, radiusMiles, verifiedOnly, selectedCategorySlugs, fetchProviders]);
-
-  // First load
-  useEffect(() => {
-    fetchProviders("initial");
-  }, [fetchProviders]);
+  }, [filtersHydrated, zip, radiusMiles, verifiedOnly, selectedCategorySlugs, minRating, sort, fetchProviders]);
 
   const onRefresh = useCallback(() => {
     setNextCursor(null);
@@ -211,8 +439,20 @@ export default function ProviderDiscoveryScreen() {
     if (radiusMiles !== 25) count++;
     if (verifiedOnly) count++;
     if (selectedCategorySlugs.length) count++;
+    if (minRating !== null) count++;
+    if (sort !== "relevance") count++;
     return count;
-  }, [radiusMiles, verifiedOnly, selectedCategorySlugs]);
+  }, [radiusMiles, verifiedOnly, selectedCategorySlugs, minRating, sort]);
+
+  const openFilters = useCallback(() => {
+    // Snapshot applied values into draft
+    setDraftRadiusMiles(radiusMiles);
+    setDraftVerifiedOnly(verifiedOnly);
+    setDraftSelectedCategorySlugs(selectedCategorySlugs);
+    setDraftMinRating(minRating);
+    setDraftSort(sort);
+    setShowFiltersModal(true);
+  }, [radiusMiles, verifiedOnly, selectedCategorySlugs, minRating, sort]);
 
   const renderProviderCard = ({ item }: { item: ProviderItem }) => (
     <Pressable
@@ -308,7 +548,7 @@ export default function ProviderDiscoveryScreen() {
         <Text style={styles.screenTitle}>Find Providers</Text>
         <Pressable
           style={styles.filterButton}
-          onPress={() => setShowFiltersModal(true)}
+          onPress={openFilters}
         >
           <MaterialCommunityIcons name="tune" size={24} color="#38bdf8" />
           {activeFilterCount > 0 && (
@@ -329,6 +569,11 @@ export default function ProviderDiscoveryScreen() {
           keyboardType="number-pad"
           maxLength={10}
         />
+
+        <View style={styles.metaRow}>
+          <Text style={styles.metaText}>Sort: {sortLabel(sort)}</Text>
+          {minRating !== null ? <Text style={styles.metaText}>Min rating: {minRatingLabel(minRating)}</Text> : null}
+        </View>
       </View>
 
       {error && (
@@ -395,30 +640,72 @@ export default function ProviderDiscoveryScreen() {
           </View>
 
           <ScrollView style={styles.modalContent}>
-            {/* Radius */}
+            {/* Sort */}
             <View style={styles.filterSection}>
-              <Text style={styles.filterSectionTitle}>Search Radius</Text>
+              <Text style={styles.filterSectionTitle}>Sort By</Text>
               <View style={styles.ratingSelector}>
-                {[5, 10, 25, 50].map((miles) => (
+                {([
+                  { key: "relevance", label: "Relevance" },
+                  { key: "distance", label: "Distance" },
+                  { key: "rating", label: "Rating" },
+                  { key: "responseTime", label: "Response" },
+                ] as { key: SortMode; label: string }[]).map((opt) => (
                   <Pressable
-                    key={miles}
-                    style={[
-                      styles.ratingButton,
-                      radiusMiles === miles && styles.ratingButtonActive,
-                    ]}
-                    onPress={() => setRadiusMiles(miles)}
+                    key={opt.key}
+                    style={[styles.ratingButton, draftSort === opt.key && styles.ratingButtonActive]}
+                    onPress={() => setDraftSort(opt.key)}
                   >
-                    <Text
-                      style={[
-                        styles.ratingButtonText,
-                        radiusMiles === miles &&
-                          styles.ratingButtonTextActive,
-                      ]}
-                    >
-                      {miles} mi
+                    <Text style={[styles.ratingButtonText, draftSort === opt.key && styles.ratingButtonTextActive]}>
+                      {opt.label}
                     </Text>
                   </Pressable>
                 ))}
+              </View>
+            </View>
+
+            {/* Radius */}
+            <View style={styles.filterSection}>
+              <Text style={styles.filterSectionTitle}>Search Radius</Text>
+              <View style={styles.sliderHeaderRow}>
+                <Text style={styles.sliderLabel}>1 mi</Text>
+                <Text style={styles.sliderValue}>{draftRadiusMiles} mi</Text>
+                <Text style={styles.sliderLabel}>100 mi</Text>
+              </View>
+              <Slider
+                value={draftRadiusMiles}
+                minimumValue={1}
+                maximumValue={100}
+                step={1}
+                onValueChange={(v) => setDraftRadiusMiles(Math.round(v))}
+                minimumTrackTintColor="#38bdf8"
+                maximumTrackTintColor="#1e293b"
+                thumbTintColor="#38bdf8"
+              />
+            </View>
+
+            {/* Min rating */}
+            <View style={styles.filterSection}>
+              <Text style={styles.filterSectionTitle}>Minimum Rating</Text>
+              <View style={styles.ratingSelector}>
+                {([
+                  { key: null, label: "Any" },
+                  { key: 3, label: "3.0+" },
+                  { key: 4, label: "4.0+" },
+                  { key: 4.5, label: "4.5+" },
+                ] as { key: number | null; label: string }[]).map((opt) => {
+                  const isActive = draftMinRating === opt.key;
+                  return (
+                    <Pressable
+                      key={String(opt.key)}
+                      style={[styles.ratingButton, isActive && styles.ratingButtonActive]}
+                      onPress={() => setDraftMinRating(opt.key)}
+                    >
+                      <Text style={[styles.ratingButtonText, isActive && styles.ratingButtonTextActive]}>
+                        {opt.label}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
               </View>
             </View>
 
@@ -427,7 +714,7 @@ export default function ProviderDiscoveryScreen() {
               <Text style={styles.filterSectionTitle}>Verified Only</Text>
               <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
                 <Text style={{ color: "#cbd5e1" }}>Show only verified providers</Text>
-                <Switch value={verifiedOnly} onValueChange={setVerifiedOnly} />
+                <Switch value={draftVerifiedOnly} onValueChange={setDraftVerifiedOnly} />
               </View>
             </View>
 
@@ -437,7 +724,7 @@ export default function ProviderDiscoveryScreen() {
                 <Text style={styles.filterSectionTitle}>Categories</Text>
                 <View style={styles.categoryGrid}>
                   {categories.map((cat) => {
-                    const isSelected = selectedCategorySlugs.includes(cat.slug);
+                    const isSelected = draftSelectedCategorySlugs.includes(cat.slug);
                     return (
                       <Pressable
                         key={cat.id}
@@ -446,7 +733,7 @@ export default function ProviderDiscoveryScreen() {
                           isSelected && styles.categoryButtonActive,
                         ]}
                         onPress={() => {
-                          setSelectedCategorySlugs((prev) =>
+                          setDraftSelectedCategorySlugs((prev) =>
                             isSelected
                               ? prev.filter((c) => c !== cat.slug)
                               : [...prev, cat.slug]
@@ -473,9 +760,11 @@ export default function ProviderDiscoveryScreen() {
               <Pressable
                 style={styles.clearBtn}
                 onPress={() => {
-                  setRadiusMiles(25);
-                  setVerifiedOnly(false);
-                  setSelectedCategorySlugs([]);
+                  setDraftRadiusMiles(DEFAULT_FILTERS.radiusMiles);
+                  setDraftVerifiedOnly(DEFAULT_FILTERS.verifiedOnly);
+                  setDraftSelectedCategorySlugs(DEFAULT_FILTERS.selectedCategorySlugs);
+                  setDraftMinRating(DEFAULT_FILTERS.minRating);
+                  setDraftSort(DEFAULT_FILTERS.sort);
                 }}
               >
                 <Text style={styles.clearBtnText}>Clear All Filters</Text>
@@ -487,6 +776,13 @@ export default function ProviderDiscoveryScreen() {
             style={styles.applyBtn}
             onPress={() => {
               setShowFiltersModal(false);
+
+              setRadiusMiles(draftRadiusMiles);
+              setVerifiedOnly(draftVerifiedOnly);
+              setSelectedCategorySlugs(draftSelectedCategorySlugs);
+              setMinRating(draftMinRating);
+              setSort(draftSort);
+
               setNextCursor(null);
               fetchProviders("initial");
             }}
@@ -537,6 +833,15 @@ const styles = StyleSheet.create({
   },
 
   searchRow: { paddingHorizontal: 16, gap: 10, marginBottom: 10 },
+  metaRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    gap: 12,
+  },
+  metaText: {
+    color: "#94a3b8",
+    fontSize: 12,
+  },
   input: {
     backgroundColor: "#0f172a",
     color: "#ffffff",
@@ -720,6 +1025,14 @@ const styles = StyleSheet.create({
   modalContent: { flex: 1, padding: 16 },
 
   filterSection: { marginBottom: 24 },
+  sliderHeaderRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 8,
+  },
+  sliderLabel: { color: "#94a3b8", fontSize: 12 },
+  sliderValue: { color: "#fff", fontSize: 14, fontWeight: "800" },
   filterSectionTitle: {
     color: "#e2e8f0",
     fontSize: 16,

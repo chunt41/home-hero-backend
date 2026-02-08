@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   Pressable,
@@ -8,8 +8,9 @@ import {
   View,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { useLocalSearchParams, router } from "expo-router";
+import { useLocalSearchParams, router, useFocusEffect } from "expo-router";
 import { api } from "../../../src/lib/apiClient";
+import { JobTimeline } from "../../../src/components/JobTimeline";
 
 type JobDetail = {
   id: number;
@@ -20,6 +21,11 @@ type JobDetail = {
   status: string;
   location: string | null;
   createdAt: string;
+  awardedAt?: string | null;
+  completedAt?: string | null;
+  cancelledAt?: string | null;
+  cancellationReasonCode?: string | null;
+  cancellationReasonDetails?: string | null;
 };
 
 export default function ConsumerJobDetailScreen() {
@@ -41,7 +47,7 @@ export default function ConsumerJobDetailScreen() {
     setError(null);
 
     try {
-      const data = await api.get<JobDetail>(`/jobs/${jobId}`);
+      const data = await api.get<JobDetail>(`/consumer/jobs/${jobId}`);
       setJob(data);
     } catch (e: any) {
       setError(e?.message ?? "Failed to load job.");
@@ -51,9 +57,11 @@ export default function ConsumerJobDetailScreen() {
     }
   }, [jobId]);
 
-  useEffect(() => {
-    fetchJob();
-  }, [fetchJob]);
+  useFocusEffect(
+    useCallback(() => {
+      fetchJob();
+    }, [fetchJob])
+  );
 
   const budgetText =
     job?.budgetMin != null || job?.budgetMax != null
@@ -90,6 +98,18 @@ export default function ConsumerJobDetailScreen() {
         <ScrollView contentContainerStyle={styles.content}>
           <Text style={styles.title}>{job.title}</Text>
 
+          <JobTimeline
+            job={{
+              status: job.status,
+              createdAt: job.createdAt,
+              awardedAt: job.awardedAt ?? null,
+              completedAt: job.completedAt ?? null,
+              cancelledAt: job.cancelledAt ?? null,
+              cancellationReasonCode: job.cancellationReasonCode ?? null,
+              cancellationReasonDetails: job.cancellationReasonDetails ?? null,
+            }}
+          />
+
           <View style={styles.card}>
             <Text style={styles.sectionTitle}>Description</Text>
             <Text style={styles.body}>
@@ -106,6 +126,24 @@ export default function ConsumerJobDetailScreen() {
             <Text style={styles.sectionTitle}>Status</Text>
             <Text style={styles.body}>{job.status}</Text>
           </View>
+
+          {(job.status === "OPEN" || job.status === "AWARDED" || job.status === "IN_PROGRESS") ? (
+            <Pressable
+              style={styles.dangerBtn}
+              onPress={() => router.push(`/job/${jobId}/cancel`)}
+            >
+              <Text style={styles.dangerText}>Cancel Job</Text>
+            </Pressable>
+          ) : null}
+
+          {(job.status === "COMPLETED" || job.status === "COMPLETED_PENDING_CONFIRMATION") ? (
+            <Pressable
+              style={styles.dangerBtn}
+              onPress={() => router.push({ pathname: "/open-dispute", params: { jobId: String(job.id) } } as any)}
+            >
+              <Text style={styles.dangerText}>Open Dispute</Text>
+            </Pressable>
+          ) : null}
 
           <Pressable
             style={styles.primaryBtn}
@@ -172,4 +210,13 @@ const styles = StyleSheet.create({
     alignItems: "center",
   },
   primaryText: { color: "#020617", fontWeight: "900" },
+
+  dangerBtn: {
+    marginTop: 12,
+    backgroundColor: "#ef4444",
+    padding: 14,
+    borderRadius: 12,
+    alignItems: "center",
+  },
+  dangerText: { color: "#0b1220", fontWeight: "900" },
 });

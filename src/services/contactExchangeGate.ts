@@ -16,7 +16,7 @@ export function classifyOffPlatformRisk(risk: RiskAssessment): {
   hasContactInfo: boolean;
   offPlatformKeywords: string[];
   scamKeywords: string[];
-  isOnlyContactLike: boolean;
+  hasAnyOffPlatformVector: boolean;
 } {
   const hasContactInfo = risk.signals.some((s) => s.code === "CONTACT_INFO");
 
@@ -28,15 +28,14 @@ export function classifyOffPlatformRisk(risk: RiskAssessment): {
   const offPlatformKeywords = bannedKeywordDetails.filter((d) => OFFPLATFORM_KEYWORDS.has(d));
   const scamKeywords = bannedKeywordDetails.filter((d) => !OFFPLATFORM_KEYWORDS.has(d));
 
-  const isOnlyContactLike = (hasContactInfo || offPlatformKeywords.length > 0) && scamKeywords.length === 0;
+  const hasAnyOffPlatformVector = hasContactInfo || offPlatformKeywords.length > 0 || scamKeywords.length > 0;
 
-  return { hasContactInfo, offPlatformKeywords, scamKeywords, isOnlyContactLike };
+  return { hasContactInfo, offPlatformKeywords, scamKeywords, hasAnyOffPlatformVector };
 }
 
 export type OffPlatformGateReason =
   | "job_status_awarded_or_later"
-  | "contact_exchange_approved"
-  | "sender_verified_low_risk";
+  | "contact_exchange_approved";
 
 /**
  * Decide whether we should bypass CONTACT_INFO/telegram/whatsapp blocking.
@@ -47,10 +46,9 @@ export function shouldBypassOffPlatformContactBlock(params: {
   risk: RiskAssessment;
   jobStatus: string | null | undefined;
   contactExchangeApproved: boolean;
-  senderVerifiedLowRisk: boolean;
 }): { bypass: boolean; reason?: OffPlatformGateReason } {
   const classification = classifyOffPlatformRisk(params.risk);
-  if (!classification.isOnlyContactLike) return { bypass: false };
+  if (!classification.hasAnyOffPlatformVector) return { bypass: false };
 
   if (jobStatusAllowsOffPlatformContact(params.jobStatus)) {
     return { bypass: true, reason: "job_status_awarded_or_later" };
@@ -60,19 +58,17 @@ export function shouldBypassOffPlatformContactBlock(params: {
     return { bypass: true, reason: "contact_exchange_approved" };
   }
 
-  if (params.senderVerifiedLowRisk) {
-    return { bypass: true, reason: "sender_verified_low_risk" };
-  }
-
   return { bypass: false };
 }
 
-export function computeRiskScoreExcludingContactLike(risk: RiskAssessment): number {
+export function computeRiskScoreExcludingOffPlatformVectors(risk: RiskAssessment): number {
   const signals = risk.signals.filter((s) => {
     if (s.code === "CONTACT_INFO") return false;
     if (s.code === "BANNED_KEYWORD") {
       const d = String((s as any).detail ?? "").toLowerCase();
       if (OFFPLATFORM_KEYWORDS.has(d)) return false;
+      // Any other BANNED_KEYWORD phrases represent off-platform payment prompts.
+      return false;
     }
     return true;
   });

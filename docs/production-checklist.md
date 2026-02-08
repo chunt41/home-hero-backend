@@ -29,6 +29,51 @@ Optional but recommended production guardrails:
   - Keep the bucket **private** (block all public access).
   - Serve attachments via short-lived **pre-signed URLs** only.
 
+### 1b) Migrate legacy disk uploads to object storage
+
+Production is multi-instance, so **new uploads must go to object storage**. Disk is supported only for **legacy reads** (`diskPath` without `storageKey`).
+
+This repo includes a migration script that uploads legacy files from `uploads/` to S3-compatible object storage and sets `storageKey` while keeping `diskPath` for rollback.
+
+Prereqs:
+
+- Confirm production env vars for S3 are set (see above)
+- Ensure the production container has access to the legacy `uploads/` directory you want to migrate from
+
+Step-by-step:
+
+1) Run a dry run first:
+
+- `npm run migrate:attachments -- --dry-run --limit=50 --concurrency=5`
+
+2) Run the migration for real (start small):
+
+- `npm run migrate:attachments -- --limit=200 --concurrency=5`
+
+3) Increase throughput once stable:
+
+- `npm run migrate:attachments -- --concurrency=10`
+
+4) Validate in production:
+
+- Pick a migrated attachment and request `GET /attachments/:id` → should return `302` to a signed URL
+- For provider verification docs, request `GET /provider/verification/attachments/:id` → should return `302` to a signed URL
+
+Notes:
+
+- Flags supported: `--dry-run`, `--limit=<n>`, `--concurrency=<n>`
+- The script is resumable; it only migrates rows where `storageKey` is null and `diskPath` is not null.
+
+Rollback (if needed):
+
+- Because the API prefers `storageKey` when present, you can revert reads back to disk by clearing `storageKey` for affected rows.
+- Example (Postgres) — run carefully on the correct DB:
+  - `UPDATE "JobAttachment" SET "storageKey" = NULL WHERE "diskPath" IS NOT NULL;`
+  - `UPDATE "MessageAttachment" SET "storageKey" = NULL WHERE "diskPath" IS NOT NULL;`
+  - `UPDATE "ProviderVerificationAttachment" SET "storageKey" = NULL WHERE "diskPath" IS NOT NULL;`
+
+Keep `diskPath` until you are confident migrations are complete and verified.
+
 - App attestation enforcement (only required if you turn it on):
   - `APP_ATTESTATION_ENFORCE=true`
   - Optional: `APP_ATTESTATION_PLATFORMS=android,ios` (defaults to both)
@@ -85,4 +130,5 @@ Make sure `EXPO_PUBLIC_ADMOB_USE_TEST_IDS` is not `true` in production.
 ## Notes
 - Keep `.env` local only; use Railway/EAS for production secrets.
 - DB schema changes ship via Prisma migrations; production deploys should run `prisma migrate deploy` (already part of the backend `start` flow).
+- Backup/restore + zero-downtime migration runbook: see `docs/backups.md`.
 - Rotate any keys that were ever pasted into chat/logs.

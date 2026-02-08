@@ -31,6 +31,14 @@ test("production readiness: .env.example includes required production keys", () 
     "OBJECT_STORAGE_S3_ACCESS_KEY_ID",
     "OBJECT_STORAGE_S3_SECRET_ACCESS_KEY",
 
+    // Email (required in production; provider-specific credentials required)
+    "EMAIL_PROVIDER",
+    "EMAIL_FROM",
+    "SMTP_HOST",
+    "SMTP_PORT",
+    "SMTP_USER",
+    "SMTP_PASS",
+
     // Attestation (enforced => required)
     "APP_ATTESTATION_ENFORCE",
     "ANDROID_PLAY_INTEGRITY_PACKAGE_NAME",

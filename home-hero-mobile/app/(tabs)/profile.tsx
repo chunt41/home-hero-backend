@@ -1,9 +1,10 @@
-import { View, Text, Pressable } from "react-native";
+import { View, Text, Pressable, Linking } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { router } from "expo-router";
 import { useAuth } from "../../src/context/AuthContext";
 import { useSubscription } from "../../src/hooks/useSubscription";
 import { StatusBar } from "expo-status-bar";
+import { PRIVACY_POLICY_URL, TERMS_OF_SERVICE_URL } from "../../src/config";
 
 export default function ProfileScreen() {
   const { logout, user } = useAuth();
@@ -96,7 +97,7 @@ export default function ProfileScreen() {
       </Pressable>
 
       <Pressable
-        onPress={() => router.push("/notification-preferences")}
+        onPress={() => router.push("/notification-preferences" as any)}
         style={{
           backgroundColor: "#1e293b",
           padding: 16,
@@ -109,6 +110,52 @@ export default function ProfileScreen() {
           Notification Settings
         </Text>
       </Pressable>
+
+      <View style={{ height: 8 }} />
+
+      <Pressable
+        onPress={() => {
+          if (PRIVACY_POLICY_URL) return Linking.openURL(PRIVACY_POLICY_URL);
+          router.push("/legal/privacy" as any);
+        }}
+        style={{
+          backgroundColor: "#0f172a",
+          padding: 12,
+          borderRadius: 10,
+          minWidth: 220,
+          alignItems: "center",
+          borderWidth: 1,
+          borderColor: "#1e293b",
+        }}
+      >
+        <Text style={{ color: "#cbd5e1", fontWeight: "900", fontSize: 14 }}>
+          Privacy Policy
+        </Text>
+      </Pressable>
+
+      <Pressable
+        onPress={() => {
+          if (TERMS_OF_SERVICE_URL) return Linking.openURL(TERMS_OF_SERVICE_URL);
+          router.push("/legal/terms" as any);
+        }}
+        style={{
+          backgroundColor: "#0f172a",
+          padding: 12,
+          borderRadius: 10,
+          minWidth: 220,
+          alignItems: "center",
+          borderWidth: 1,
+          borderColor: "#1e293b",
+        }}
+      >
+        <Text style={{ color: "#cbd5e1", fontWeight: "900", fontSize: 14 }}>
+          Terms of Service
+        </Text>
+      </Pressable>
+
+      <Text style={{ color: "#64748b", fontSize: 12, maxWidth: 260, textAlign: "center" }}>
+        Ads + data collection disclosure is included in the policies.
+      </Text>
 
       <Pressable
         onPress={() => logout()}

@@ -17,3 +17,7 @@ export function canMarkComplete(status: string): boolean {
 export function canConfirmComplete(status: string): boolean {
   return status === "COMPLETED_PENDING_CONFIRMATION";
 }
+
+export function canCancelJob(status: string): boolean {
+  return status === "OPEN" || status === "AWARDED" || status === "IN_PROGRESS";
+}

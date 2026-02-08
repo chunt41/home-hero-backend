@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   classifyOffPlatformRisk,
-  computeRiskScoreExcludingContactLike,
+  computeRiskScoreExcludingOffPlatformVectors,
   jobStatusAllowsOffPlatformContact,
   shouldBypassOffPlatformContactBlock,
 } from "./contactExchangeGate";
@@ -19,7 +19,7 @@ test("classifyOffPlatformRisk: phone/email is contact-like", () => {
   const r = risk([{ code: "CONTACT_INFO", score: 35, detail: "phone" }]);
   const c = classifyOffPlatformRisk(r as any);
   assert.equal(c.hasContactInfo, true);
-  assert.equal(c.isOnlyContactLike, true);
+  assert.equal(c.hasAnyOffPlatformVector, true);
   assert.deepEqual(c.scamKeywords, []);
 });
 
@@ -29,7 +29,7 @@ test("classifyOffPlatformRisk: telegram/whatsapp treated as contact-like", () =>
     { code: "BANNED_KEYWORD", score: 20, detail: "whatsapp" },
   ]);
   const c = classifyOffPlatformRisk(r as any);
-  assert.equal(c.isOnlyContactLike, true);
+  assert.equal(c.hasAnyOffPlatformVector, true);
   assert.deepEqual(c.offPlatformKeywords.sort(), ["telegram", "whatsapp"]);
   assert.deepEqual(c.scamKeywords, []);
 });
@@ -37,7 +37,7 @@ test("classifyOffPlatformRisk: telegram/whatsapp treated as contact-like", () =>
 test("classifyOffPlatformRisk: payment keywords are scam-like", () => {
   const r = risk([{ code: "BANNED_KEYWORD", score: 50, detail: "western union" }]);
   const c = classifyOffPlatformRisk(r as any);
-  assert.equal(c.isOnlyContactLike, false);
+  assert.equal(c.hasAnyOffPlatformVector, true);
   assert.deepEqual(c.scamKeywords, ["western union"]);
 });
 
@@ -50,15 +50,15 @@ test("jobStatusAllowsOffPlatformContact: OPEN blocks, AWARDED+ allows", () => {
   assert.equal(jobStatusAllowsOffPlatformContact("CANCELLED"), true);
 });
 
-test("shouldBypassOffPlatformContactBlock: does not bypass when scam keywords present", () => {
+test("shouldBypassOffPlatformContactBlock: bypasses when job is awarded (includes payment prompts)", () => {
   const risk = assessTextRisk("send me your email and pay with zelle");
   const decision = shouldBypassOffPlatformContactBlock({
     risk,
     jobStatus: "AWARDED",
-    contactExchangeApproved: true,
-    senderVerifiedLowRisk: true,
+    contactExchangeApproved: false,
   });
-  assert.equal(decision.bypass, false);
+  assert.equal(decision.bypass, true);
+  assert.equal(decision.reason, "job_status_awarded_or_later");
 });
 
 test("shouldBypassOffPlatformContactBlock: bypasses for awarded job on contact-only", () => {
@@ -67,7 +67,6 @@ test("shouldBypassOffPlatformContactBlock: bypasses for awarded job on contact-o
     risk,
     jobStatus: "AWARDED",
     contactExchangeApproved: false,
-    senderVerifiedLowRisk: false,
   });
   assert.equal(decision.bypass, true);
   assert.equal(decision.reason, "job_status_awarded_or_later");
@@ -79,25 +78,12 @@ test("shouldBypassOffPlatformContactBlock: bypasses for approved exchange", () =
     risk,
     jobStatus: "OPEN",
     contactExchangeApproved: true,
-    senderVerifiedLowRisk: false,
   });
   assert.equal(decision.bypass, true);
   assert.equal(decision.reason, "contact_exchange_approved");
 });
 
-test("shouldBypassOffPlatformContactBlock: bypasses for verified low risk", () => {
-  const risk = assessTextRisk("hit me on telegram");
-  const decision = shouldBypassOffPlatformContactBlock({
-    risk,
-    jobStatus: "OPEN",
-    contactExchangeApproved: false,
-    senderVerifiedLowRisk: true,
-  });
-  assert.equal(decision.bypass, true);
-  assert.equal(decision.reason, "sender_verified_low_risk");
-});
-
-test("computeRiskScoreExcludingContactLike strips CONTACT_INFO + telegram/whatsapp", () => {
+test("computeRiskScoreExcludingOffPlatformVectors strips CONTACT_INFO + all BANNED_KEYWORD", () => {
   const risk = {
     totalScore: 999,
     signals: [
@@ -107,5 +93,5 @@ test("computeRiskScoreExcludingContactLike strips CONTACT_INFO + telegram/whatsa
     ],
   };
 
-  assert.equal(computeRiskScoreExcludingContactLike(risk as any), 25);
+  assert.equal(computeRiskScoreExcludingOffPlatformVectors(risk as any), 25);
 });

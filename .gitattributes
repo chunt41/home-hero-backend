@@ -1,0 +1,17 @@
+# Secret hygiene: ensure sensitive file patterns are never included in release archives
+# (This cannot prevent commits by itself; use .gitignore + pre-commit + CI.)
+
+.env* export-ignore
+*.pem export-ignore
+*.p12 export-ignore
+*.key export-ignore
+**/*service*account*.json export-ignore
+**/*service_account*.json export-ignore
+**/google-credentials.json export-ignore
+**/google-service-account*.json export-ignore
+**/service-account*.json export-ignore
+
+# Avoid EOL normalization touching key material if it ever appears
+*.pem -text
+*.key -text
+*.p12 -text

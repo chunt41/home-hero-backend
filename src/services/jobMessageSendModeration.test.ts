@@ -16,7 +16,6 @@ test("moderation: blocks contact info pre-award (OPEN)", async () => {
 
   const prisma = {
     contactExchangeRequest: { findFirst: async () => null },
-    providerVerification: { findUnique: async () => null },
     securityEvent: { count: async () => 0 },
     user: {
       update: async (args: any) => {
@@ -56,7 +55,6 @@ test("moderation: allows contact info when job is AWARDED+ (bypass)", async () =
 
   const prisma = {
     contactExchangeRequest: { findFirst: async () => null },
-    providerVerification: { findUnique: async () => null },
     securityEvent: { count: async () => 0 },
     user: {
       update: async (args: any) => {
@@ -93,7 +91,6 @@ test("moderation: allows telegram/whatsapp when contact exchange approved", asyn
 
   const prisma = {
     contactExchangeRequest: { findFirst: async () => ({ id: 123 }) },
-    providerVerification: { findUnique: async () => null },
     securityEvent: { count: async () => 0 },
     user: {
       update: async (args: any) => {
@@ -126,12 +123,11 @@ test("moderation: allows telegram/whatsapp when contact exchange approved", asyn
   assert.ok(calls.events.some((e: any) => e.actionType === "message.offplatform_allowed"));
 });
 
-test("moderation: still blocks scam/payment keywords even if awarded or approved", async () => {
+test("moderation: allows off-platform payment prompts when job is AWARDED+", async () => {
   const calls: any = { userUpdates: [], events: [] };
 
   const prisma = {
     contactExchangeRequest: { findFirst: async () => ({ id: 123 }) },
-    providerVerification: { findUnique: async () => ({ status: "VERIFIED" }) },
     securityEvent: { count: async () => 0 },
     user: {
       update: async (args: any) => {
@@ -158,45 +154,7 @@ test("moderation: still blocks scam/payment keywords even if awarded or approved
     assessRepeatedMessageRisk: async () => makeRisk([{ code: "BANNED_KEYWORD", score: 25, detail: "zelle" }]),
   });
 
-  assert.equal(out.action, "BLOCK");
-  assert.equal(out.body.code, "MESSAGE_BLOCKED");
-  assert.ok(calls.events.some((e: any) => e.actionType === "message.blocked"));
-});
-
-test("moderation: provider verified + low risk bypasses contact info", async () => {
-  const calls: any = { userUpdates: [], events: [] };
-
-  const prisma = {
-    contactExchangeRequest: { findFirst: async () => null },
-    providerVerification: { findUnique: async () => ({ status: "VERIFIED" }) },
-    securityEvent: { count: async () => 0 },
-    user: {
-      update: async (args: any) => {
-        calls.userUpdates.push(args);
-        return {};
-      },
-    },
-  };
-
-  const req = { user: { userId: 99, role: "PROVIDER", riskScore: 10 } };
-
-  const out = await moderateJobMessageSend({
-    prisma,
-    req,
-    isAdmin: false,
-    jobId: 1,
-    jobStatus: "OPEN",
-    senderId: 99,
-    messageText: "Text me at 555-555-5555",
-    appealUrl: "https://example.com/appeal",
-    logSecurityEvent: async (_req, actionType, payload) => {
-      calls.events.push({ actionType, payload });
-    },
-    assessRepeatedMessageRisk: async () => makeRisk([{ code: "CONTACT_INFO", score: 35, detail: "phone" }]),
-  });
-
   assert.deepEqual(out, { action: "ALLOW" });
-  assert.equal(calls.userUpdates.length, 0);
   assert.ok(calls.events.some((e: any) => e.actionType === "message.offplatform_allowed"));
 });
 
@@ -205,7 +163,6 @@ test("moderation: repeated blocks can trigger restriction", async () => {
 
   const prisma = {
     contactExchangeRequest: { findFirst: async () => null },
-    providerVerification: { findUnique: async () => null },
     securityEvent: { count: async () => 3 },
     user: {
       update: async (args: any) => {
@@ -235,5 +192,8 @@ test("moderation: repeated blocks can trigger restriction", async () => {
   assert.equal(out.action, "RESTRICTED");
   assert.equal(out.status, 403);
   assert.ok(out.restrictedUntil instanceof Date);
+  // Should be a short restriction window (~30 minutes)
+  const minutes = (out.restrictedUntil.getTime() - Date.now()) / 60_000;
+  assert.ok(minutes > 20 && minutes < 40);
   assert.ok(calls.events.some((e: any) => e.actionType === "user.restricted"));
 });

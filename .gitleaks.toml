@@ -1,0 +1,49 @@
+# Gitleaks configuration
+# - Extends the default ruleset
+# - Allowlists known-safe placeholders used in docs/.env.example/CI
+
+title = "home-hero gitleaks config"
+
+[extend]
+useDefault = true
+
+# Global allowlist to reduce noise from intentional placeholders.
+[allowlist]
+# Do not blanket-ignore docs; instead ignore explicit placeholder patterns.
+description = "Allow known placeholders"
+regexes = [
+  # Stripe placeholders in .env.example
+  "sk_test_\\.\\.\\.",
+  "pk_test_\\.\\.\\.",
+  "whsec_\\.\\.\\.",
+
+  # CI dummy secrets
+  "ci_dummy_secret",
+  "sk_test_ci_dummy",
+
+  # Example DB URL placeholders
+  "postgresql://USER:PASSWORD@HOST:5432/DB\\?sslmode=require",
+  "postgresql://user:pass@localhost:5432/db\\?sslmode=disable",
+
+  # Documentation-only placeholder wording
+  "replace_me_with_a_long_random_string",
+]
+
+paths = [
+  # Allow placeholders in the example env file; real secrets must never be committed in .env
+  ".env.example",
+]
+
+# CI rule: forbidden secret files must never appear (even briefly) in PR history.
+# This intentionally matches on path, not content.
+[[rules]]
+id = "forbidden-files"
+description = "Forbidden secret/key files present"
+
+# Match even empty files (single match per file) but only for forbidden paths.
+regex = "(?s)^"
+
+# If these paths appear in git history, fail the scan.
+path = '''(?i)(^|/)(\.env(\..*)?|.*\.(pem|p12|key)|.*service[_-]?account.*\.json|google-credentials\.json|google-service-account.*\.json|service-account.*\.json)$'''
+
+keywords = [".env", "pem", "p12", "key", "service account"]

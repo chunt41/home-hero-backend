@@ -5,6 +5,18 @@ dist/
 .env.*
 !.env.example
 !.env.prisma.example
+
+# Private keys / cert bundles (never commit)
+*.pem
+*.p12
+*.key
+
+# Common cloud/service-account credential files (never commit)
+**/*service*account*.json
+**/*service_account*.json
+**/google-credentials.json
+**/google-service-account*.json
+**/service-account*.json
 npm-debug.log*
 .DS_Store
 

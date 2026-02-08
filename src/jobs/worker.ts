@@ -2,6 +2,8 @@ import os from "os";
 import { prisma } from "../prisma";
 import { BackgroundJobStatus } from "@prisma/client";
 import { processJobMatchNotify } from "../services/jobMatchNotifier";
+import { processJobMatchDigest } from "../services/jobMatchDigest";
+import { isRescheduleJobError } from "./jobErrors";
 import {
   getNextDailyRunAtUtc,
   recomputeProviderStatsForAllProviders,
@@ -93,6 +95,21 @@ async function markSuccess(jobId: number) {
 }
 
 async function markFailure(jobId: number, attempts: number, maxAttempts: number, err: unknown) {
+  if (isRescheduleJobError(err)) {
+    await prisma.backgroundJob.update({
+      where: { id: jobId },
+      data: {
+        status: BackgroundJobStatus.PENDING,
+        attempts,
+        lockedAt: null,
+        lockedBy: null,
+        lastError: null,
+        runAt: err.runAt,
+      },
+    });
+    return;
+  }
+
   const message = String((err as any)?.message ?? err);
   const nextAttempts = attempts + 1;
 
@@ -129,6 +146,9 @@ async function processOne(job: any) {
   switch (job.type) {
     case "JOB_MATCH_NOTIFY":
       await processJobMatchNotify(job.payload);
+      return;
+    case "JOB_MATCH_DIGEST":
+      await processJobMatchDigest(job.payload);
       return;
     case "PROVIDER_STATS_RECOMPUTE": {
       const providerId = Number(job.payload?.providerId);

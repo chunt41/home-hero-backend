@@ -33,6 +33,8 @@ const hhmm = z
 const updateSchema = z
   .object({
     jobMatchEnabled: z.boolean().optional(),
+    jobMatchDigestEnabled: z.boolean().optional(),
+    jobMatchDigestIntervalMinutes: z.number().int().min(5).max(1440).optional(),
     bidEnabled: z.boolean().optional(),
     messageEnabled: z.boolean().optional(),
 
@@ -76,7 +78,37 @@ const updateSchema = z
         message: "Invalid IANA timezone",
       });
     }
+
+    if (
+      typeof val.jobMatchDigestEnabled === "boolean" &&
+      val.jobMatchDigestEnabled &&
+      Object.prototype.hasOwnProperty.call(val, "jobMatchDigestIntervalMinutes") &&
+      typeof val.jobMatchDigestIntervalMinutes !== "number"
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["jobMatchDigestIntervalMinutes"],
+        message: "jobMatchDigestIntervalMinutes must be a number",
+      });
+    }
   });
+
+function toApiRow(row: any) {
+  return {
+    userId: row.userId,
+    jobMatchEnabled: !!row.jobMatchEnabled,
+    jobMatchDigestEnabled: !!row.jobMatchDigestEnabled,
+    jobMatchDigestIntervalMinutes:
+      Number.isFinite(Number(row.jobMatchDigestIntervalMinutes))
+        ? Number(row.jobMatchDigestIntervalMinutes)
+        : DEFAULT_NOTIFICATION_PREFERENCE.jobMatchDigestIntervalMinutes,
+    bidEnabled: !!row.bidEnabled,
+    messageEnabled: !!row.messageEnabled,
+    quietHoursStart: row.quietHoursStart ?? null,
+    quietHoursEnd: row.quietHoursEnd ?? null,
+    timezone: row.timezone ?? DEFAULT_TIMEZONE,
+  };
+}
 
 export function createGetMeNotificationPreferencesHandler(deps: {
   prisma: {
@@ -105,21 +137,15 @@ export function createGetMeNotificationPreferencesHandler(deps: {
         });
       }
 
-      return res.json({
-        userId: row.userId,
-        jobMatchEnabled: !!row.jobMatchEnabled,
-        bidEnabled: !!row.bidEnabled,
-        messageEnabled: !!row.messageEnabled,
-        quietHoursStart: row.quietHoursStart ?? null,
-        quietHoursEnd: row.quietHoursEnd ?? null,
-        timezone: row.timezone ?? DEFAULT_TIMEZONE,
-      });
+      return res.json(toApiRow(row));
     } catch (err) {
       if (isMissingTableOrRelationError(err)) {
-        return res.json({
-          userId: (req as any).user?.userId,
-          ...DEFAULT_NOTIFICATION_PREFERENCE,
-        });
+        return res.json(
+          toApiRow({
+            userId: (req as any).user?.userId,
+            ...DEFAULT_NOTIFICATION_PREFERENCE,
+          })
+        );
       }
 
       console.error("GET /me/notification-preferences error:", err);
@@ -156,6 +182,9 @@ export function createPutMeNotificationPreferencesHandler(deps: {
         create: {
           userId: req.user.userId,
           jobMatchEnabled: body.jobMatchEnabled ?? DEFAULT_NOTIFICATION_PREFERENCE.jobMatchEnabled,
+          jobMatchDigestEnabled: body.jobMatchDigestEnabled ?? DEFAULT_NOTIFICATION_PREFERENCE.jobMatchDigestEnabled,
+          jobMatchDigestIntervalMinutes:
+            body.jobMatchDigestIntervalMinutes ?? DEFAULT_NOTIFICATION_PREFERENCE.jobMatchDigestIntervalMinutes,
           bidEnabled: body.bidEnabled ?? DEFAULT_NOTIFICATION_PREFERENCE.bidEnabled,
           messageEnabled: body.messageEnabled ?? DEFAULT_NOTIFICATION_PREFERENCE.messageEnabled,
           quietHoursStart:
@@ -166,6 +195,8 @@ export function createPutMeNotificationPreferencesHandler(deps: {
         },
         update: {
           jobMatchEnabled: body.jobMatchEnabled,
+          jobMatchDigestEnabled: body.jobMatchDigestEnabled,
+          jobMatchDigestIntervalMinutes: body.jobMatchDigestIntervalMinutes,
           bidEnabled: body.bidEnabled,
           messageEnabled: body.messageEnabled,
           quietHoursStart:
@@ -176,21 +207,15 @@ export function createPutMeNotificationPreferencesHandler(deps: {
         },
       });
 
-      return res.json({
-        userId: updated.userId,
-        jobMatchEnabled: !!updated.jobMatchEnabled,
-        bidEnabled: !!updated.bidEnabled,
-        messageEnabled: !!updated.messageEnabled,
-        quietHoursStart: updated.quietHoursStart ?? null,
-        quietHoursEnd: updated.quietHoursEnd ?? null,
-        timezone: updated.timezone ?? DEFAULT_TIMEZONE,
-      });
+      return res.json(toApiRow(updated));
     } catch (err) {
       if (isMissingTableOrRelationError(err)) {
-        return res.json({
-          userId: (req as any).user?.userId,
-          ...DEFAULT_NOTIFICATION_PREFERENCE,
-        });
+        return res.json(
+          toApiRow({
+            userId: (req as any).user?.userId,
+            ...DEFAULT_NOTIFICATION_PREFERENCE,
+          })
+        );
       }
 
       console.error("PUT /me/notification-preferences error:", err);

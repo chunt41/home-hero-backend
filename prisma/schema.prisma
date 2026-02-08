@@ -35,6 +35,7 @@ model User {
   jobs                        Job[]                 @relation("UserJobs")
   awardedJobs                 Job[]                 @relation("JobAwardedProvider")
   completionConfirmationsPending Job[]              @relation("JobCompletionPendingForUser")
+  cancelledJobs               Job[]                 @relation("JobCancelledBy")
   hiddenJobs                  Job[]                 @relation("HiddenJobsByAdmin")
   messageReadStates           JobMessageReadState[]
   hiddenMessages              Message[]             @relation("HiddenMessagesByAdmin")
@@ -169,6 +170,10 @@ model Job {
   budgetMin   Int?
   budgetMax   Int?
   status      JobStatus             @default(OPEN)
+  cancelledAt DateTime?
+  cancelledByUserId Int?
+  cancellationReasonCode String?
+  cancellationReasonDetails String?
   location    String?
   category    String?
   trade       String?
@@ -189,6 +194,7 @@ model Job {
   consumer    User                  @relation("UserJobs", fields: [consumerId], references: [id])
   awardedProvider User?             @relation("JobAwardedProvider", fields: [awardedProviderId], references: [id])
   completionPendingForUser User?    @relation("JobCompletionPendingForUser", fields: [completionPendingForUserId], references: [id])
+  cancelledBy User?                 @relation("JobCancelledBy", fields: [cancelledByUserId], references: [id])
   hiddenBy    User?                 @relation("HiddenJobsByAdmin", fields: [hiddenById], references: [id])
   attachments JobAttachment[]
   readStates  JobMessageReadState[]
@@ -203,6 +209,8 @@ model Job {
 
   @@index([awardedProviderId])
   @@index([completionPendingForUserId])
+  @@index([cancelledAt])
+  @@index([cancelledByUserId])
   @@index([completedAt])
   @@index([consumerId, createdAt])
   @@index([status, createdAt])
@@ -413,6 +421,9 @@ model Notification {
 model NotificationPreference {
   userId           Int      @id
   jobMatchEnabled  Boolean  @default(true)
+  jobMatchDigestEnabled Boolean @default(false)
+  jobMatchDigestIntervalMinutes Int @default(15)
+  jobMatchDigestLastSentAt DateTime?
   bidEnabled       Boolean  @default(true)
   messageEnabled   Boolean  @default(true)
   quietHoursStart  String?
@@ -471,6 +482,7 @@ model JobMatchNotification {
   jobId      Int
   providerId Int
   score      Float?
+  digestedAt DateTime?
   createdAt  DateTime @default(now())
 
   job        Job      @relation(fields: [jobId], references: [id], onDelete: Cascade)
@@ -478,6 +490,7 @@ model JobMatchNotification {
 
   @@unique([jobId, providerId])
   @@index([providerId, createdAt])
+  @@index([providerId, digestedAt, createdAt])
   @@index([jobId, createdAt])
 }
 

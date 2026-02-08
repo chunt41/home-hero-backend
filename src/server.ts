@@ -6,7 +6,7 @@ import { prisma } from "./prisma";
 import express = require("express");
 import type { Request, Response, NextFunction } from "express";
 import { AdminActionType } from "@prisma/client";
-import { createRoleRateLimitRedis, validateRateLimitRedisStartupOrThrow } from "./middleware/rateLimitRedis";
+import { createRoleRateLimitRedis } from "./middleware/rateLimitRedis";
 import {
   canAccessJobAttachment,
   resolveDiskPathInsideUploadsDir,
@@ -20,6 +20,7 @@ import {
   createPostJobMarkCompleteHandler,
 } from "./routes/jobCompletion";
 import { createPostJobStartHandler } from "./routes/jobStart";
+import { createPostJobCancelHandler } from "./routes/jobCancellation";
 import { createGetProviderEntitlementsHandler } from "./routes/providerEntitlements";
 import { createPostJobReviewsHandler } from "./routes/jobReviews";
 import {
@@ -39,8 +40,9 @@ import { env } from "./config/env";
 import { requireVerifiedEmail } from "./middleware/requireVerifiedEmail";
 import { sendMail } from "./services/mailer";
 import { logSecurityEvent } from "./services/securityEventLogger";
+import { cancellationReasonLabel } from "./services/jobCancellationReasons";
 import { logger } from "./services/logger";
-import { stripe, validateStripeStartupOrThrow } from "./services/stripeService";
+import { stripe } from "./services/stripeService";
 import {
   createProviderAddonPaymentIntentV2,
   type LegacyProviderAddonPurchaseRequest,
@@ -69,12 +71,14 @@ import {
   RISK_REVIEW_THRESHOLD,
 } from "./services/riskScoring";
 import { moderateJobMessageSend } from "./services/jobMessageSendModeration";
+import { computeNewUploadTargets } from "./services/objectStorageUploads";
 import { z } from "zod";
 import { validate, type Validated, type ValidatedRequest } from "./middleware/validate";
 import { enqueueBackgroundJob } from "./jobs/enqueue";
 import { patchAppForAsyncErrors } from "./middleware/asyncWrap";
 import { createGlobalErrorHandler } from "./middleware/globalErrorHandler";
 import { createBasicAuthForAdminUi, createRequireAdminUiEnabled } from "./routes/adminWebhooksUiGuard";
+import { createGetAdminOpsKpisHandler } from "./routes/adminOpsKpis";
 import { normalizeZipForBoost } from "./services/providerDiscoveryRanking";
 import { extractZip5, rankProvider } from "./matching/rankProviders";
 import zipcodes from "zipcodes";
@@ -86,17 +90,17 @@ import { getNotificationPreferencesMap, shouldSendNotification } from "./service
 import { recomputeProviderStatsForProvider } from "./services/providerStats";
 import { createGetProvidersSearchHandler } from "./routes/providersSearch";
 import { getCurrentMonthKeyUtc } from "./ai/aiGateway";
-import { validateAttestationStartupOrThrow } from "./attestation/startupValidation";
 import { enforceAttestationForSensitiveRoutes } from "./attestation/enforceAttestationForSensitiveRoutes";
 import { createLoginBruteForceProtector } from "./services/loginBruteForceProtector";
 import { createAuthLoginHandler } from "./routes/authLogin";
 import { createBasicAuthForMetrics, createRequireMetricsEnabled } from "./routes/metricsGuard";
 import { prometheusContentType, prometheusMetricsText } from "./metrics/prometheus";
+import { validateEnvAtStartup } from "./config/validateEnv";
+import { createGetAdminMessageViolationsHandler } from "./routes/adminMessageViolations";
 import {
   getAttachmentSignedUrlTtlSeconds,
   getObjectStorageProviderName,
   getStorageProviderOrThrow,
-  validateObjectStorageStartupOrThrow,
 } from "./storage/storageFactory";
 
 let webhookWorkerStartedAt: Date | null = null;
@@ -182,17 +186,8 @@ if (process.env.NODE_ENV !== "production") {
   dotenv.config();
 }
 
-// Fail fast in production if app attestation is enforced but verifier config is missing.
-validateAttestationStartupOrThrow();
-
-// Fail fast in production if Redis-backed rate limiting is not configured.
-validateRateLimitRedisStartupOrThrow();
-
-// Fail fast in production if attachment object storage is required but not configured.
-validateObjectStorageStartupOrThrow();
-
-// Fail fast in production if Stripe webhook processing cannot be verified.
-validateStripeStartupOrThrow();
+// Fail-fast startup config validation (prod throws; non-prod warns for optional features).
+validateEnvAtStartup();
 
 const app = express();
 // Ensure async route errors bubble into the single global error handler.
@@ -258,7 +253,7 @@ app.get("/metrics", requireMetricsEnabled, basicAuthForMetrics, async (_req, res
 // - Strict CSP for API responses (safe for JSON, file streams, etc.)
 // - /admin/webhooks/ui sets its own minimal CSP to allow inlined JS/CSS for the single-file UI.
 app.use((req, res, next) => {
-  if (req.path === "/admin/webhooks/ui") return next();
+  if (req.path === "/admin/webhooks/ui" || req.path === "/admin/ops/ui") return next();
   return helmet.contentSecurityPolicy({
     useDefaults: true,
     directives: {
@@ -2511,12 +2506,6 @@ app.post(
         return res.status(401).json({ error: "Not authenticated" });
       }
 
-      if ((process.env.NODE_ENV ?? "development") === "production" && !attachmentStorageProvider) {
-        return res.status(500).json({
-          error: "Attachment storage is not configured. This server is misconfigured for production.",
-        });
-      }
-
       const { jobId } = (req as any).validated.params as { jobId: number };
 
       const file = (req as any).file as Express.Multer.File | undefined;
@@ -2545,12 +2534,12 @@ app.post(
 
       const kind = file.mimetype.startsWith("video/") ? "video" : "image";
       const basename = makeUploadBasename(file.originalname);
-      const storageKey = attachmentStorageProvider
-        ? path.posix.join("attachments", "job", String(jobId), basename)
-        : null;
-      const diskPath = !attachmentStorageProvider
-        ? path.posix.join("attachments", basename)
-        : null;
+      const { storageKey, diskPath } = computeNewUploadTargets({
+        namespace: "job",
+        ownerId: jobId,
+        basename,
+        storageProvider: attachmentStorageProvider,
+      });
 
       let cleanupOnDbFailure: null | (() => Promise<void>) = null;
       if (attachmentStorageProvider && storageKey) {
@@ -4651,6 +4640,11 @@ app.get("/consumer/jobs/:jobId", authMiddleware, async (req: AuthRequest, res: R
       budgetMax: true,
       location: true,
       status: true,
+      awardedAt: true,
+      cancelledAt: true,
+      cancelledByUserId: true,
+      cancellationReasonCode: true,
+      cancellationReasonDetails: true,
       completionPendingForUserId: true,
       completedAt: true,
       createdAt: true,
@@ -4727,6 +4721,12 @@ app.get("/consumer/jobs/:jobId", authMiddleware, async (req: AuthRequest, res: R
       budgetMax: job.budgetMax,
       location: job.location,
       status: job.status,
+      awardedAt: (job as any).awardedAt ?? null,
+      cancelledAt: (job as any).cancelledAt ?? null,
+      cancelledByUserId: (job as any).cancelledByUserId ?? null,
+      cancellationReasonCode: (job as any).cancellationReasonCode ?? null,
+      cancellationReasonDetails: (job as any).cancellationReasonDetails ?? null,
+      cancellationReasonLabel: cancellationReasonLabel((job as any).cancellationReasonCode ?? null),
       completionPendingForUserId: (job as any).completionPendingForUserId ?? null,
       completedAt: (job as any).completedAt ?? null,
       category: cls.category,
@@ -4902,6 +4902,11 @@ app.get(
         budgetMax: true,
         location: true,
         status: true,
+        awardedAt: true,
+        cancelledAt: true,
+        cancelledByUserId: true,
+        cancellationReasonCode: true,
+        cancellationReasonDetails: true,
         createdAt: true,
         consumer: {
           select: { id: true, name: true },
@@ -4969,6 +4974,12 @@ app.get(
         suggestedTags: cls.suggestedTags ?? [],
         completionPendingForUserId: (job as any).completionPendingForUserId ?? null,
         completedAt: (job as any).completedAt ?? null,
+        awardedAt: (job as any).awardedAt ?? null,
+        cancelledAt: (job as any).cancelledAt ?? null,
+        cancelledByUserId: (job as any).cancelledByUserId ?? null,
+        cancellationReasonCode: (job as any).cancellationReasonCode ?? null,
+        cancellationReasonDetails: (job as any).cancellationReasonDetails ?? null,
+        cancellationReasonLabel: cancellationReasonLabel((job as any).cancellationReasonCode ?? null),
       };
 
       // Fetch this provider's bid on the job, if any
@@ -6366,12 +6377,6 @@ app.post(
         return res.status(403).json({ error: "Only providers can upload verification documents." });
       }
 
-      if ((process.env.NODE_ENV ?? "development") === "production" && !attachmentStorageProvider) {
-        return res.status(500).json({
-          error: "Attachment storage is not configured. This server is misconfigured for production.",
-        });
-      }
-
       const file = (req as any).file as Express.Multer.File | undefined;
       if (!file) {
         return res.status(400).json({ error: "file is required" });
@@ -6385,12 +6390,12 @@ app.post(
       });
 
       const basename = makeUploadBasename(file.originalname);
-      const storageKey = attachmentStorageProvider
-        ? path.posix.join("attachments", "verification", String(req.user.userId), basename)
-        : null;
-      const diskPath = !attachmentStorageProvider
-        ? path.posix.join("attachments", basename)
-        : null;
+      const { storageKey, diskPath } = computeNewUploadTargets({
+        namespace: "verification",
+        ownerId: req.user.userId,
+        basename,
+        storageProvider: attachmentStorageProvider,
+      });
 
       let cleanupOnDbFailure: null | (() => Promise<void>) = null;
       if (attachmentStorageProvider && storageKey) {
@@ -7951,8 +7956,14 @@ app.post(
 
     if (file) {
       const basename = makeUploadBasename(file.originalname);
-      if (attachmentStorageProvider) {
-        const storageKey = path.posix.join("attachments", "message", String(jobId), basename);
+      const { storageKey, diskPath } = computeNewUploadTargets({
+        namespace: "message",
+        ownerId: jobId,
+        basename,
+        storageProvider: attachmentStorageProvider,
+      });
+
+      if (attachmentStorageProvider && storageKey) {
         await attachmentStorageProvider.putObject(storageKey, file.buffer, file.mimetype);
         pendingAttachment = {
           diskPath: null,
@@ -7961,13 +7972,7 @@ app.post(
             await attachmentStorageProvider.deleteObject(storageKey).catch(() => null);
           },
         };
-      } else {
-        if ((process.env.NODE_ENV ?? "development") === "production") {
-          return res.status(500).json({
-            error: "Attachment storage is not configured. This server is misconfigured for production.",
-          });
-        }
-        const diskPath = path.posix.join("attachments", basename);
+      } else if (diskPath) {
         const abs = path.join(UPLOADS_DIR, diskPath);
         await fs.promises.mkdir(path.dirname(abs), { recursive: true });
         await fs.promises.writeFile(abs, file.buffer);
@@ -8183,6 +8188,14 @@ app.get("/admin/risk/flagged", authMiddleware, async (req: AuthRequest, res: Res
     return res.status(500).json({ error: "Internal server error while fetching flagged items." });
   }
 });
+
+// --- Admin: repeated message violations queue ---
+// GET /admin/messages/violations?windowMinutes=10&minBlocks=3&limit=50
+app.get(
+  "/admin/messages/violations",
+  authMiddleware,
+  createGetAdminMessageViolationsHandler({ prisma: prisma as any })
+);
 
 // POST /reports
 // Body: { type: "USER" | "JOB" | "MESSAGE", targetId: number, reason: string, details?: string }
@@ -8497,132 +8510,17 @@ app.post(
   })
 );
 
-// POST /jobs/:jobId/cancel  → consumer cancels a job
-app.post("/jobs/:jobId/cancel", validate({ params: jobIdParamsSchema }), async (req, res) => {
-  try {
-    const user = getUserFromAuthHeader(req);
-    if (!user) {
-      return res.status(401).json({ error: "Unauthorized" });
-    }
-
-    // Only consumers can cancel jobs
-    if (user.role !== "CONSUMER") {
-      return res.status(403).json({ error: "Only consumers can cancel jobs." });
-    }
-
-    const { jobId } = (req as any).validated.params as { jobId: number };
-
-    // Fetch job & ownership
-    const job = await prisma.job.findUnique({
-      where: { id: jobId },
-      select: {
-        id: true,
-        consumerId: true,
-        awardedProviderId: true,
-        status: true,
-        title: true,
-        location: true,
-        createdAt: true,
-      },
-    });
-
-    if (!job) {
-      return res.status(404).json({ error: "Job not found." });
-    }
-
-    // Ensure this user owns the job
-    if (job.consumerId !== user.userId) {
-      return res.status(403).json({ error: "You can only cancel jobs that you created." });
-    }
-
-    // Only allow cancel if job is OPEN, AWARDED, or IN_PROGRESS
-    if (job.status !== "OPEN" && job.status !== "AWARDED" && job.status !== "IN_PROGRESS") {
-      return res.status(400).json({
-        error: `Only jobs that are OPEN, AWARDED, or IN_PROGRESS can be cancelled. Current status: ${job.status}.`,
-      });
-    }
-
-    const previousStatus = job.status;
-
-    // Transaction: reject all bids, set job to CANCELLED
-    const [_, updatedJob] = await prisma.$transaction([
-      prisma.bid.updateMany({
-        where: { jobId },
-        data: { status: "DECLINED" },
-      }),
-      prisma.job.update({
-        where: { id: jobId },
-        data: { status: "CANCELLED" },
-        select: {
-          id: true,
-          title: true,
-          location: true,
-          status: true,
-          createdAt: true,
-        },
-      }),
-    ]);
-
-    // Notify both parties (if a provider has been awarded)
-    await createNotification({
-      userId: job.consumerId,
-      type: "JOB_CANCELLED",
-      content: `Job "${job.title}" was cancelled.`,
-    });
-    if (typeof job.awardedProviderId === "number") {
-      await createNotification({
-        userId: job.awardedProviderId,
-        type: "JOB_CANCELLED",
-        content: `Job "${job.title}" was cancelled.`,
-      });
-    }
-
-    await logSecurityEvent(req as any, "job.cancelled", {
-      targetType: "JOB",
-      targetId: String(jobId),
-      jobId,
-      previousStatus,
-      newStatus: updatedJob.status,
-      awardedProviderId: typeof job.awardedProviderId === "number" ? job.awardedProviderId : null,
-    });
-
-    // ✅ Webhook 1: job cancelled
-    await enqueueWebhookEvent({
-      eventType: "job.cancelled",
-      payload: {
-        jobId: updatedJob.id,
-        consumerId: job.consumerId,
-        previousStatus,
-        newStatus: updatedJob.status,
-        title: updatedJob.title,
-        location: updatedJob.location,
-        createdAt: updatedJob.createdAt,
-        cancelledAt: new Date(),
-      },
-    });
-
-    // ✅ Webhook 2: job status changed
-    await enqueueWebhookEvent({
-      eventType: "job.status_changed",
-      payload: {
-        jobId: updatedJob.id,
-        consumerId: job.consumerId,
-        previousStatus,
-        newStatus: updatedJob.status,
-        title: updatedJob.title,
-        changedAt: new Date(),
-      },
-    });
-
-    return res.json({
-      message: "Job cancelled successfully.",
-      job: updatedJob,
-    });
-  } catch (err) {
-    console.error("Error cancelling job:", err);
-    return res.status(500).json({ error: "Internal server error while cancelling job." });
-  }
-});
+// POST /jobs/:jobId/cancel  → consumer/provider cancels a job (with reason)
+app.post(
+  "/jobs/:jobId/cancel",
+  authMiddleware,
+  createPostJobCancelHandler({
+    prisma,
+    createNotification,
+    enqueueWebhookEvent,
+    auditSecurityEvent: logSecurityEvent,
+  })
+);
 
 // POST /jobs/:jobId/complete  → consumer marks job as completed
 app.post("/jobs/:jobId/complete", validate({ params: jobIdParamsSchema }), async (req, res) => {
@@ -10107,6 +10005,13 @@ app.post(
       },
     });
 
+    await logSecurityEvent(req, "admin.job_hidden", {
+      targetType: "JOB",
+      targetId: jobId,
+      reportId: typeof reportId === "number" ? reportId : null,
+      notes: notes?.trim() || null,
+    });
+
     return res.json({ message: "Job hidden.", job: updated });
   } catch (err) {
     console.error("POST /admin/jobs/:id/hide error:", err);
@@ -10183,6 +10088,13 @@ app.post(
       },
     });
 
+    await logSecurityEvent(req, "admin.job_unhidden", {
+      targetType: "JOB",
+      targetId: jobId,
+      reportId: typeof reportId === "number" ? reportId : null,
+      notes: notes?.trim() || null,
+    });
+
     return res.json({ message: "Job unhidden.", job: updated });
   } catch (err) {
     console.error("POST /admin/jobs/:id/unhide error:", err);
@@ -10248,6 +10160,13 @@ app.post(
         reportId: typeof reportId === "number" ? reportId : null,
         notes: notes?.trim() || null,
       },
+    });
+
+    await logSecurityEvent(req, "admin.message_hidden", {
+      targetType: "MESSAGE",
+      targetId: messageId,
+      reportId: typeof reportId === "number" ? reportId : null,
+      notes: notes?.trim() || null,
     });
 
     return res.json({ message: "Message hidden.", messageObj: updated });
@@ -10316,6 +10235,13 @@ app.post(
         reportId: typeof reportId === "number" ? reportId : null,
         notes: notes?.trim() || null,
       },
+    });
+
+    await logSecurityEvent(req, "admin.message_unhidden", {
+      targetType: "MESSAGE",
+      targetId: messageId,
+      reportId: typeof reportId === "number" ? reportId : null,
+      notes: notes?.trim() || null,
     });
 
     return res.json({ message: "Message unhidden.", messageObj: updated });
@@ -10888,6 +10814,603 @@ app.get("/admin/webhooks/deliveries/:id", authMiddleware, async (req: AuthReques
 // It expects an Admin JWT in localStorage under "adminToken".
 const requireAdminUiEnabled = createRequireAdminUiEnabled(process.env);
 const basicAuthForAdminUi = createBasicAuthForAdminUi(process.env);
+
+// GET /admin/ops/ui
+// Lightweight admin ops dashboard (no separate frontend).
+// It expects an Admin JWT in localStorage under "adminToken".
+app.get(
+  "/admin/ops/ui",
+  // Gate the route entirely (returns 404 when disabled).
+  requireAdminUiEnabled,
+  // Clickjacking protections (explicit for this HTML route)
+  helmet.frameguard({ action: "deny" }),
+  helmet.contentSecurityPolicy({
+    useDefaults: true,
+    directives: {
+      "default-src": ["'self'"],
+      "base-uri": ["'self'"],
+      "frame-ancestors": ["'none'"],
+      "form-action": ["'self'"],
+      "object-src": ["'none'"],
+      "img-src": ["'self'", "data:"],
+      "connect-src": ["'self'"],
+      "script-src": ["'self'", "'unsafe-inline'"],
+      "style-src": ["'self'", "'unsafe-inline'"],
+    },
+  }),
+  basicAuthForAdminUi,
+  async (_req, res) => {
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    return res.send(`<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ops Admin</title>
+  <style>
+    body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 16px; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: end; }
+    label { display: flex; flex-direction: column; gap: 6px; font-size: 12px; }
+    input, select, button, textarea { padding: 8px; font-size: 14px; }
+    button { cursor: pointer; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 16px; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 12px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; border-bottom: 1px solid #eee; padding: 8px; font-size: 13px; vertical-align: top; }
+    tr:hover { background: #fafafa; }
+    tr.attn { background: #fff7ed; }
+    tr.attn:hover { background: #ffedd5; }
+    .muted { color: #666; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; border: 1px solid #ddd; }
+    .ok { border-color: #9ae6b4; }
+    .bad { border-color: #feb2b2; }
+    .warn { border-color: #fbd38d; }
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .small { font-size: 12px; padding: 6px 8px; }
+  </style>
+</head>
+<body>
+  <h2>Ops Admin</h2>
+  <p class="muted" style="margin-top: -6px;">Quick triage: flagged content, disputes, webhook failures, KPIs. <a href="/admin/webhooks/ui">Webhooks UI</a></p>
+
+  <div class="card">
+    <div class="row">
+      <label>
+        Admin Token (JWT)
+        <input id="token" placeholder="paste admin token here" style="min-width:420px" />
+      </label>
+      <label>
+        Window (days)
+        <input id="windowDays" value="30" style="width:100px" />
+      </label>
+      <button id="saveToken">Save Token</button>
+      <button id="refreshAll">Refresh All</button>
+    </div>
+    <p class="muted" style="margin:10px 0 0;">
+      Requests send <span class="mono">Authorization: Bearer &lt;token&gt;</span>.
+    </p>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h3 style="margin-top:0;">KPIs</h3>
+      <div id="kpis" class="muted">Click “Refresh All”.</div>
+    </div>
+
+    <div class="card">
+      <h3 style="margin-top:0;">Recent webhook failures</h3>
+      <div class="actions" style="margin-bottom:8px;">
+        <button class="small" id="refreshWebhooks">Refresh</button>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Event</th>
+            <th>Status</th>
+            <th>Attempts</th>
+            <th>Last error</th>
+          </tr>
+        </thead>
+        <tbody id="webhookFailures"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h3 style="margin-top:0;">Flagged queue (reports)</h3>
+      <div class="actions" style="margin-bottom:8px;">
+        <button class="small" id="refreshFlagged">Refresh</button>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Target</th>
+            <th>Reason</th>
+            <th>Reporter</th>
+            <th>Created</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="flagged"></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h3 style="margin-top:0;">Disputes queue</h3>
+      <div class="actions" style="margin-bottom:8px;">
+        <button class="small" id="refreshDisputes">Refresh</button>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Job</th>
+            <th>Status</th>
+            <th>Reason</th>
+            <th>Opened</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="disputes"></tbody>
+      </table>
+    </div>
+  </div>
+
+<script>
+  console.log("[admin ops ui] script loaded");
+
+  const tokenEl = document.getElementById("token");
+  const windowDaysEl = document.getElementById("windowDays");
+  const kpisEl = document.getElementById("kpis");
+  const webhookFailuresEl = document.getElementById("webhookFailures");
+  const flaggedEl = document.getElementById("flagged");
+  const disputesEl = document.getElementById("disputes");
+
+  function escapeHtml(s) {
+    return String(s ?? "").replace(/[&<>"']/g, (c) => ({
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",
+      "'": "&#039;",
+    }[c]));
+  }
+
+  function getToken() {
+    const typed = (tokenEl.value || "").trim();
+    if (typed) return typed;
+    return (localStorage.getItem("adminToken") || "").trim();
+  }
+
+  async function api(method, path, body) {
+    const token = getToken();
+    if (!token) throw new Error("Missing admin token");
+    const r = await fetch(path, {
+      method,
+      headers: {
+        "content-type": "application/json",
+        "authorization": "Bearer " + token,
+        "cache-control": "no-store",
+        "pragma": "no-cache",
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const text = await r.text();
+    if (!r.ok) throw new Error(r.status + " " + text);
+    return text ? JSON.parse(text) : null;
+  }
+
+  function pill(status) {
+    const cls = (status === "SUCCESS") ? "ok" : (status === "FAILED") ? "bad" : (status === "OPEN" || status === "INVESTIGATING") ? "warn" : "";
+    return "<span class='pill " + cls + "'>" + escapeHtml(status) + "</span>";
+  }
+
+  function isFiniteNumber(n) {
+    return typeof n === "number" && Number.isFinite(n);
+  }
+
+  function fmtPercent(rate) {
+    if (!isFiniteNumber(rate)) return "n/a";
+    return (Math.round(rate * 1000) / 10) + "%";
+  }
+
+  let lastChurnCsv = "";
+
+  function toCsvCell(v) {
+    const s = String(v ?? "");
+    if (/[",\n\r]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
+    return s;
+  }
+
+  async function copyTextToClipboard(text) {
+    try {
+      if (navigator?.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+        return true;
+      }
+    } catch {}
+    return false;
+  }
+
+  async function refreshKpis() {
+    const windowDays = Number(windowDaysEl.value || 30);
+    kpisEl.innerHTML = "<div class='muted'>Loading…</div>";
+    const d = await api("GET", "/admin/ops/kpis?windowDays=" + encodeURIComponent(windowDays), null);
+    const conv = d.postToAwardConversion?.conversion;
+
+    const churned = d.churnByTier?.churnedByTier || {};
+    const active = d.churnByTier?.activePaidByTier || {};
+    const expiringSoon = d.churnByTier?.expiringSoonByTier || {};
+    const payments = d.churnByTier?.successfulSubscriptionPaymentsByTier || {};
+    const churnRate = d.churnByTier?.churnRateByTier || {};
+
+    const tiers = Array.from(new Set(
+      []
+        .concat(Object.keys(active || {}))
+        .concat(Object.keys(churned || {}))
+        .concat(Object.keys(expiringSoon || {}))
+        .concat(Object.keys(payments || {}))
+        .concat(Object.keys(churnRate || {}))
+    ));
+
+    tiers.sort((a, b) => {
+      const ar = isFiniteNumber(churnRate?.[a]) ? churnRate[a] : -1;
+      const br = isFiniteNumber(churnRate?.[b]) ? churnRate[b] : -1;
+      if (br !== ar) return br - ar;
+      const ae = isFiniteNumber(expiringSoon?.[a]) ? expiringSoon[a] : 0;
+      const be = isFiniteNumber(expiringSoon?.[b]) ? expiringSoon[b] : 0;
+      if (be !== ae) return be - ae;
+      return String(a).localeCompare(String(b));
+    });
+
+    const churnRows = tiers.map((tier) => {
+      const a = isFiniteNumber(active?.[tier]) ? active[tier] : 0;
+      const c = isFiniteNumber(churned?.[tier]) ? churned[tier] : 0;
+      const e = isFiniteNumber(expiringSoon?.[tier]) ? expiringSoon[tier] : 0;
+      const p = isFiniteNumber(payments?.[tier]) ? payments[tier] : 0;
+      const r = churnRate?.[tier];
+      const cls = e > 0 ? "attn" : "";
+      return "<tr class='" + cls + "'>" +
+        "<td class='mono'>" + escapeHtml(tier) + "</td>" +
+        "<td>" + escapeHtml(a) + "</td>" +
+        "<td>" + escapeHtml(c) + "</td>" +
+        "<td>" + escapeHtml(e) + "</td>" +
+        "<td>" + escapeHtml(p) + "</td>" +
+        "<td>" + escapeHtml(fmtPercent(r)) + "</td>" +
+      "</tr>";
+    }).join("") || "<tr><td colspan='6' class='muted'>(no subscription data)</td></tr>";
+
+    lastChurnCsv = "" +
+      [
+        ["tier", "active", "expiredWithinWindow", "expiringSoon7d", "subscriptionPaymentsWindow", "approxChurnRate"].map(toCsvCell).join(","),
+      ].concat(tiers.map((tier) => {
+        const a = isFiniteNumber(active?.[tier]) ? active[tier] : 0;
+        const c = isFiniteNumber(churned?.[tier]) ? churned[tier] : 0;
+        const e = isFiniteNumber(expiringSoon?.[tier]) ? expiringSoon[tier] : 0;
+        const p = isFiniteNumber(payments?.[tier]) ? payments[tier] : 0;
+        const r = churnRate?.[tier];
+        return [tier, a, c, e, p, (isFiniteNumber(r) ? r : "")].map(toCsvCell).join(",");
+      })).join("\n");
+
+    const churnTable = "" +
+      "<div style='margin-top:6px; display:flex; align-items:center; justify-content:space-between; gap:8px;'>" +
+        "<b>Churn by tier</b>" +
+        "<div class='actions'><button class='small' id='copyChurnCsv'>Copy churn CSV</button></div>" +
+      "</div>" +
+      "<div class='muted' style='margin-top:4px; font-size:12px;'>" +
+        "Rows highlighted when <span class='mono'>expiringSoon(7d)</span> &gt; 0." +
+      "</div>" +
+      "<table style='margin-top:6px;'>" +
+        "<thead><tr>" +
+          "<th>Tier</th>" +
+          "<th>Active</th>" +
+          "<th>Expired (window)</th>" +
+          "<th>Expiring soon (7d)</th>" +
+          "<th>Payments (window)</th>" +
+          "<th>Approx churn rate</th>" +
+        "</tr></thead>" +
+        "<tbody>" + churnRows + "</tbody>" +
+      "</table>";
+
+    kpisEl.innerHTML = "" +
+      "<div><b>Time to first bid</b>: avg " + escapeHtml(d.timeToFirstBid?.avgMinutes) + "m, p50 " + escapeHtml(d.timeToFirstBid?.p50Minutes) + "m, p90 " + escapeHtml(d.timeToFirstBid?.p90Minutes) + "m (" + escapeHtml(d.timeToFirstBid?.jobsWithAtLeastOneBid) + "/" + escapeHtml(d.timeToFirstBid?.sampledJobs) + " jobs)</div>" +
+      "<div style='margin-top:6px;'><b>Post→Award conversion</b>: " + (conv == null ? "n/a" : (Math.round(conv * 1000)/10 + "%")) + " (" + escapeHtml(d.postToAwardConversion?.jobsAwarded) + "/" + escapeHtml(d.postToAwardConversion?.jobsPosted) + ")</div>" +
+      "<div style='margin-top:6px;'><b>Report rate</b>: " + (d.reportRate?.per100JobsPosted == null ? "n/a" : (Math.round(d.reportRate.per100JobsPosted * 10)/10 + " per 100 jobs")) + ", " + (d.reportRate?.per1000MessagesCreated == null ? "n/a" : (Math.round(d.reportRate.per1000MessagesCreated * 10)/10 + " per 1000 messages")) + "</div>" +
+      churnTable +
+      "<div class='muted' style='margin-top:6px; font-size:12px;'>" + escapeHtml(d.churnByTier?.churnDefinition || "") + "</div>";
+  }
+
+  async function refreshWebhookFailures() {
+    webhookFailuresEl.innerHTML = "<tr><td colspan='5' class='muted'>Loading…</td></tr>";
+    const d = await api("GET", "/admin/ops/webhook-failures?take=50", null);
+    const rows = (d.items || []).map((x) => {
+      return "<tr>" +
+        "<td class='mono'>" + escapeHtml(x.id) + "</td>" +
+        "<td class='mono'>" + escapeHtml(x.event) + "</td>" +
+        "<td>" + pill(x.status) + "</td>" +
+        "<td>" + escapeHtml(x.attempts) + "</td>" +
+        "<td class='muted'>" + escapeHtml((x.lastError || "").slice(0, 160)) + "</td>" +
+      "</tr>";
+    }).join("");
+    webhookFailuresEl.innerHTML = rows || "<tr><td colspan='5' class='muted'>(none)</td></tr>";
+  }
+
+  async function refreshFlagged() {
+    flaggedEl.innerHTML = "<tr><td colspan='6' class='muted'>Loading…</td></tr>";
+    const d = await api("GET", "/admin/ops/flagged?take=50&status=OPEN", null);
+    const rows = (d.items || []).map((r) => {
+      const target = r.targetType + ": " + (r.targetUser?.id || r.targetJob?.id || r.targetMessage?.id || "?");
+      const actions = [];
+      if (r.targetUser?.id) actions.push("<button class='small' data-act='suspend-user' data-user='" + r.targetUser.id + "' data-report='" + r.id + "'>Suspend user</button>");
+      if (r.targetJob?.id) actions.push("<button class='small' data-act='hide-job' data-job='" + r.targetJob.id + "' data-report='" + r.id + "'>Hide job</button>");
+      if (r.targetMessage?.id) actions.push("<button class='small' data-act='hide-message' data-msg='" + r.targetMessage.id + "' data-report='" + r.id + "'>Hide msg</button>");
+      actions.push("<button class='small' data-act='mark-review' data-report='" + r.id + "'>Mark IN_REVIEW</button>");
+      actions.push("<button class='small' data-act='dismiss' data-report='" + r.id + "'>Dismiss</button>");
+      return "<tr>" +
+        "<td class='mono'>" + escapeHtml(r.id) + "</td>" +
+        "<td>" + escapeHtml(target) + "</td>" +
+        "<td>" + escapeHtml(r.reason || "") + "</td>" +
+        "<td class='muted'>" + escapeHtml(r.reporter?.email || r.reporter?.name || "") + "</td>" +
+        "<td class='muted'>" + escapeHtml(new Date(r.createdAt).toLocaleString()) + "</td>" +
+        "<td><div class='actions'>" + actions.join("") + "</div></td>" +
+      "</tr>";
+    }).join("");
+    flaggedEl.innerHTML = rows || "<tr><td colspan='6' class='muted'>(none)</td></tr>";
+  }
+
+  async function refreshDisputes() {
+    disputesEl.innerHTML = "<tr><td colspan='6' class='muted'>Loading…</td></tr>";
+    const d = await api("GET", "/admin/ops/disputes?take=50", null);
+    const rows = (d.items || []).map((x) => {
+      return "<tr>" +
+        "<td class='mono'>" + escapeHtml(x.id) + "</td>" +
+        "<td class='mono'>" + escapeHtml(x.jobId) + (x.jobTitle ? (" — " + escapeHtml(x.jobTitle)) : "") + "</td>" +
+        "<td>" + pill(x.status) + "</td>" +
+        "<td>" + escapeHtml(x.reasonCode || "") + "</td>" +
+        "<td class='muted'>" + escapeHtml(new Date(x.createdAt).toLocaleString()) + "</td>" +
+        "<td><div class='actions'><button class='small' data-act='resolve-dispute' data-dispute='" + x.id + "'>Resolve…</button></div></td>" +
+      "</tr>";
+    }).join("");
+    disputesEl.innerHTML = rows || "<tr><td colspan='6' class='muted'>(none)</td></tr>";
+  }
+
+  document.getElementById("saveToken").addEventListener("click", () => {
+    const t = (tokenEl.value || "").trim();
+    if (!t) { alert("Paste a token first."); return; }
+    localStorage.setItem("adminToken", t);
+    alert("Saved.");
+  });
+
+  document.getElementById("refreshAll").addEventListener("click", async () => {
+    try {
+      await Promise.all([refreshKpis(), refreshWebhookFailures(), refreshFlagged(), refreshDisputes()]);
+    } catch (e) {
+      alert(String(e?.message || e));
+      console.error(e);
+    }
+  });
+  document.getElementById("refreshWebhooks").addEventListener("click", () => refreshWebhookFailures().catch((e) => alert(String(e))));
+  document.getElementById("refreshFlagged").addEventListener("click", () => refreshFlagged().catch((e) => alert(String(e))));
+  document.getElementById("refreshDisputes").addEventListener("click", () => refreshDisputes().catch((e) => alert(String(e))));
+
+  kpisEl.addEventListener("click", async (ev) => {
+    const btn = ev.target.closest("button");
+    if (!btn) return;
+    if (btn.id !== "copyChurnCsv") return;
+    if (!lastChurnCsv) {
+      alert("No churn data yet. Click Refresh All first.");
+      return;
+    }
+    const ok = await copyTextToClipboard(lastChurnCsv);
+    if (ok) {
+      alert("Copied churn CSV.");
+      return;
+    }
+    prompt("Copy churn CSV:", lastChurnCsv);
+  });
+
+  flaggedEl.addEventListener("click", async (ev) => {
+    const btn = ev.target.closest("button");
+    if (!btn) return;
+    const act = btn.getAttribute("data-act");
+    try {
+      if (act === "suspend-user") {
+        const userId = Number(btn.getAttribute("data-user"));
+        const reportId = Number(btn.getAttribute("data-report"));
+        const reason = prompt("Suspend reason (optional):", "");
+        await api("POST", "/admin/users/" + userId + "/suspend", { reason: reason || null, reportId });
+        alert("User suspended.");
+        await refreshFlagged();
+      } else if (act === "hide-job") {
+        const jobId = Number(btn.getAttribute("data-job"));
+        const reportId = Number(btn.getAttribute("data-report"));
+        const notes = prompt("Notes (optional):", "");
+        await api("POST", "/admin/jobs/" + jobId + "/hide", { reportId, notes: notes || null });
+        alert("Job hidden.");
+        await refreshFlagged();
+      } else if (act === "hide-message") {
+        const msgId = Number(btn.getAttribute("data-msg"));
+        const reportId = Number(btn.getAttribute("data-report"));
+        const notes = prompt("Notes (optional):", "");
+        await api("POST", "/admin/messages/" + msgId + "/hide", { reportId, notes: notes || null });
+        alert("Message hidden.");
+        await refreshFlagged();
+      } else if (act === "mark-review") {
+        const reportId = Number(btn.getAttribute("data-report"));
+        await api("PATCH", "/admin/reports/" + reportId, { status: "IN_REVIEW" });
+        await refreshFlagged();
+      } else if (act === "dismiss") {
+        const reportId = Number(btn.getAttribute("data-report"));
+        const note = prompt("Dismiss note (optional):", "");
+        await api("PATCH", "/admin/reports/" + reportId, { status: "DISMISSED", adminNotes: note || null });
+        await refreshFlagged();
+      }
+    } catch (e) {
+      alert(String(e?.message || e));
+      console.error(e);
+    }
+  });
+
+  disputesEl.addEventListener("click", async (ev) => {
+    const btn = ev.target.closest("button");
+    if (!btn) return;
+    const act = btn.getAttribute("data-act");
+    if (act !== "resolve-dispute") return;
+    const disputeId = Number(btn.getAttribute("data-dispute"));
+    try {
+      const jobStatus = prompt("Resolve dispute → set job status to COMPLETED or CANCELLED:", "COMPLETED");
+      if (!jobStatus) return;
+      const resolutionNotes = prompt("Resolution notes (required):", "");
+      if (!resolutionNotes || !resolutionNotes.trim()) { alert("Resolution notes required."); return; }
+      await api("POST", "/admin/disputes/" + disputeId + "/resolve", { jobStatus, resolutionNotes });
+      alert("Dispute resolved.");
+      await refreshDisputes();
+    } catch (e) {
+      alert(String(e?.message || e));
+      console.error(e);
+    }
+  });
+</script>
+</body>
+</html>`);
+  }
+);
+
+// --- Admin Ops JSON endpoints (admin-only) ---
+app.get("/admin/ops/kpis", authMiddleware, createGetAdminOpsKpisHandler({ prisma }));
+
+// GET /admin/ops/flagged
+// Query: status=OPEN|IN_REVIEW|RESOLVED|DISMISSED (default OPEN), type=USER|JOB|MESSAGE, take (default 50, max 100)
+app.get("/admin/ops/flagged", authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    if (!requireAdmin(req, res)) return;
+
+    const takeRaw = Number(req.query.take ?? 50);
+    const take = Number.isFinite(takeRaw) ? Math.min(Math.max(takeRaw, 1), 100) : 50;
+    const status = typeof req.query.status === "string" ? req.query.status : "OPEN";
+    const type = typeof req.query.type === "string" ? req.query.type : undefined;
+
+    const where: any = {};
+    if (["OPEN", "IN_REVIEW", "RESOLVED", "DISMISSED"].includes(status)) where.status = status;
+    if (type && ["USER", "JOB", "MESSAGE"].includes(type)) where.targetType = type;
+
+    const reports = await prisma.report.findMany({
+      where,
+      take,
+      orderBy: { createdAt: "desc" },
+      include: { reporter: true, targetUser: true, targetJob: true, targetMessage: true },
+    });
+
+    return res.json({
+      items: reports.map((r: any) => ({
+        id: r.id,
+        targetType: r.targetType,
+        status: r.status,
+        reason: r.reason,
+        details: r.details,
+        adminNotes: r.adminNotes,
+        createdAt: r.createdAt,
+        reporter: r.reporter
+          ? { id: r.reporter.id, name: r.reporter.name, email: r.reporter.email, role: r.reporter.role }
+          : null,
+        targetUser: r.targetUser
+          ? { id: r.targetUser.id, name: r.targetUser.name, email: r.targetUser.email, role: r.targetUser.role }
+          : null,
+        targetJob: r.targetJob ? { id: r.targetJob.id, title: r.targetJob.title, consumerId: r.targetJob.consumerId } : null,
+        targetMessage: r.targetMessage
+          ? { id: r.targetMessage.id, jobId: r.targetMessage.jobId, senderId: r.targetMessage.senderId, text: r.targetMessage.text }
+          : null,
+      })),
+    });
+  } catch (err) {
+    console.error("GET /admin/ops/flagged error:", err);
+    return res.status(500).json({ error: "Internal server error while fetching flagged queue." });
+  }
+});
+
+// GET /admin/ops/disputes
+// Default queue: OPEN + INVESTIGATING
+app.get("/admin/ops/disputes", authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    if (!requireAdmin(req, res)) return;
+
+    const takeRaw = Number(req.query.take ?? 50);
+    const take = Number.isFinite(takeRaw) ? Math.min(Math.max(takeRaw, 1), 100) : 50;
+    const status = typeof req.query.status === "string" ? req.query.status : undefined;
+
+    const where: any = {};
+    if (status && ["OPEN", "INVESTIGATING", "RESOLVED"].includes(status)) {
+      where.status = status;
+    } else {
+      where.status = { in: ["OPEN", "INVESTIGATING"] };
+    }
+
+    const disputes = await prisma.dispute.findMany({
+      where,
+      take,
+      orderBy: { createdAt: "desc" },
+      include: {
+        job: { select: { id: true, title: true, status: true, consumerId: true, awardedProviderId: true } },
+        openedBy: { select: { id: true, email: true, role: true, name: true } },
+      },
+    });
+
+    return res.json({
+      items: disputes.map((d: any) => ({
+        id: d.id,
+        jobId: d.jobId,
+        jobTitle: d.job?.title ?? null,
+        jobStatus: d.job?.status ?? null,
+        openedByUserId: d.openedByUserId,
+        openedBy: d.openedBy,
+        reasonCode: d.reasonCode,
+        status: d.status,
+        createdAt: d.createdAt,
+        resolvedAt: d.resolvedAt,
+      })),
+    });
+  } catch (err) {
+    console.error("GET /admin/ops/disputes error:", err);
+    return res.status(500).json({ error: "Internal server error while fetching disputes queue." });
+  }
+});
+
+// GET /admin/ops/webhook-failures
+app.get("/admin/ops/webhook-failures", authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    if (!requireAdmin(req, res)) return;
+
+    const takeRaw = Number(req.query.take ?? 50);
+    const take = Number.isFinite(takeRaw) ? Math.min(Math.max(takeRaw, 1), 100) : 50;
+
+    const failures = await prisma.webhookDelivery.findMany({
+      where: { status: "FAILED" },
+      take,
+      orderBy: { id: "desc" },
+      select: {
+        id: true,
+        event: true,
+        status: true,
+        attempts: true,
+        lastError: true,
+        lastStatusCode: true,
+        lastAttemptAt: true,
+        nextAttempt: true,
+        createdAt: true,
+        endpoint: { select: { id: true, url: true, enabled: true } },
+      },
+    });
+
+    return res.json({ items: failures });
+  } catch (err) {
+    console.error("GET /admin/ops/webhook-failures error:", err);
+    return res.status(500).json({ error: "Internal server error while fetching webhook failures." });
+  }
+});
 
 app.get(
   "/admin/webhooks/ui",

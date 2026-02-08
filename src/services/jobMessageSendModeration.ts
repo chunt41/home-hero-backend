@@ -7,7 +7,7 @@ import {
 } from "./riskScoring";
 import {
   classifyOffPlatformRisk,
-  computeRiskScoreExcludingContactLike,
+  computeRiskScoreExcludingOffPlatformVectors,
   shouldBypassOffPlatformContactBlock,
 } from "./contactExchangeGate";
 
@@ -73,101 +73,88 @@ export async function moderateJobMessageSend(params: {
   if (moderation.action === "BLOCK") {
     const offPlatform = classifyOffPlatformRisk(risk);
 
-    if (offPlatform.isOnlyContactLike) {
-      let contactExchangeApproved = false;
-      try {
-        const approved = await params.prisma.contactExchangeRequest.findFirst({
-          where: { jobId: params.jobId, status: "APPROVED" },
-          select: { id: true },
-        });
-        contactExchangeApproved = !!approved;
-      } catch {
-        contactExchangeApproved = false;
-      }
+    let contactExchangeApproved = false;
+    try {
+      const approved = await params.prisma.contactExchangeRequest.findFirst({
+        where: { jobId: params.jobId, status: "APPROVED" },
+        select: { id: true },
+      });
+      contactExchangeApproved = !!approved;
+    } catch {
+      contactExchangeApproved = false;
+    }
 
-      const VERIFIED_LOW_RISK_MAX = 25;
-      let senderVerifiedLowRisk = false;
-      if (params.req?.user?.role === "PROVIDER") {
-        try {
-          const verification = await params.prisma.providerVerification.findUnique({
-            where: { providerId: params.senderId },
-            select: { status: true },
-          });
+    const gate = shouldBypassOffPlatformContactBlock({
+      risk,
+      jobStatus: params.jobStatus,
+      contactExchangeApproved,
+    });
 
-          const score = typeof params.req?.user?.riskScore === "number" ? params.req.user.riskScore : 0;
-          senderVerifiedLowRisk = verification?.status === "VERIFIED" && score <= VERIFIED_LOW_RISK_MAX;
-        } catch {
-          senderVerifiedLowRisk = false;
-        }
-      }
+    if (gate.bypass) {
+      // If the job is awarded or contact exchange is approved, allow sharing details.
+      // Keep defense-in-depth by still logging and only applying non-offplatform risk scoring.
+      riskScoreToApply = computeRiskScoreExcludingOffPlatformVectors(risk);
 
-      const gate = shouldBypassOffPlatformContactBlock({
-        risk,
+      await params.logSecurityEvent(params.req, "message.offplatform_allowed", {
+        targetType: "JOB",
+        targetId: params.jobId,
+        jobId: params.jobId,
+        senderId: params.senderId,
+        gateReason: gate.reason,
         jobStatus: params.jobStatus,
         contactExchangeApproved,
-        senderVerifiedLowRisk,
+        offPlatform: {
+          hasContactInfo: offPlatform.hasContactInfo,
+          chatAppKeywords: offPlatform.offPlatformKeywords,
+          paymentKeywords: offPlatform.scamKeywords,
+        },
+        riskTotalScore: risk.totalScore,
+        riskSignals: risk.signals,
+        appliedRiskScore: riskScoreToApply,
+        textPreview: params.messageText.slice(0, 200),
       });
 
-      if (gate.bypass) {
-        riskScoreToApply = computeRiskScoreExcludingContactLike(risk);
+      if (riskScoreToApply >= RISK_RESTRICT_THRESHOLD) {
+        const until = computeRestrictedUntil();
+        try {
+          await params.prisma.user.update({
+            where: { id: params.senderId },
+            data: { riskScore: { increment: riskScoreToApply }, restrictedUntil: until },
+          });
+        } catch (e: any) {
+          if (!isMissingDbColumnError(e)) throw e;
+        }
 
-        await params.logSecurityEvent(params.req, "message.offplatform_allowed", {
-          targetType: "JOB",
-          targetId: params.jobId,
+        await params.logSecurityEvent(params.req, "user.restricted", {
+          targetType: "USER",
+          targetId: params.senderId,
+          reason: "message_risk_threshold",
           jobId: params.jobId,
-          senderId: params.senderId,
-          gateReason: gate.reason,
-          jobStatus: params.jobStatus,
-          contactExchangeApproved,
-          senderVerifiedLowRisk,
-          riskTotalScore: risk.totalScore,
+          riskTotalScore: riskScoreToApply,
           riskSignals: risk.signals,
-          appliedRiskScore: riskScoreToApply,
-          textPreview: params.messageText.slice(0, 200),
+          restrictedUntil: until.toISOString(),
         });
 
-        if (riskScoreToApply >= RISK_RESTRICT_THRESHOLD) {
-          const until = computeRestrictedUntil();
-          try {
-            await params.prisma.user.update({
-              where: { id: params.senderId },
-              data: { riskScore: { increment: riskScoreToApply }, restrictedUntil: until },
-            });
-          } catch (e: any) {
-            if (!isMissingDbColumnError(e)) throw e;
-          }
-
-          await params.logSecurityEvent(params.req, "user.restricted", {
-            targetType: "USER",
-            targetId: params.senderId,
-            reason: "message_risk_threshold",
-            jobId: params.jobId,
-            riskTotalScore: riskScoreToApply,
-            riskSignals: risk.signals,
-            restrictedUntil: until.toISOString(),
-          });
-
-          return {
-            action: "RESTRICTED",
-            status: 403,
-            restrictedUntil: until,
-            message: "Your account is temporarily restricted due to suspicious activity.",
-          };
-        }
-
-        if (riskScoreToApply > 0) {
-          try {
-            await params.prisma.user.update({
-              where: { id: params.senderId },
-              data: { riskScore: { increment: riskScoreToApply } },
-            });
-          } catch (e: any) {
-            if (!isMissingDbColumnError(e)) throw e;
-          }
-        }
-
-        return { action: "ALLOW" };
+        return {
+          action: "RESTRICTED",
+          status: 403,
+          restrictedUntil: until,
+          message: "Your account is temporarily restricted due to suspicious activity.",
+        };
       }
+
+      if (riskScoreToApply > 0) {
+        try {
+          await params.prisma.user.update({
+            where: { id: params.senderId },
+            data: { riskScore: { increment: riskScoreToApply } },
+          });
+        } catch (e: any) {
+          if (!isMissingDbColumnError(e)) throw e;
+        }
+      }
+
+      return { action: "ALLOW" };
     }
 
     // If we got here, we are blocking (either scam-like keywords OR gate rejected).
@@ -192,7 +179,10 @@ export async function moderateJobMessageSend(params: {
     });
 
     try {
-      const windowMinutes = 60;
+      // Repeat offender logic:
+      // after 3 blocked attempts in 10 minutes → restrict messaging for 30 minutes
+      const windowMinutes = 10;
+      const restrictMinutes = 30;
       const since = new Date(Date.now() - windowMinutes * 60_000);
       const recentBlocks = await params.prisma.securityEvent.count({
         where: {
@@ -203,11 +193,12 @@ export async function moderateJobMessageSend(params: {
       });
 
       if (recentBlocks >= 3) {
-        const until = computeRestrictedUntil();
+        const until = computeRestrictedUntil(restrictMinutes / 60);
+        const restrictionRiskBump = 50;
         try {
           await params.prisma.user.update({
             where: { id: params.senderId },
-            data: { restrictedUntil: until },
+            data: { restrictedUntil: until, riskScore: { increment: restrictionRiskBump } },
           });
         } catch (e: any) {
           if (!isMissingDbColumnError(e)) throw e;
@@ -220,13 +211,16 @@ export async function moderateJobMessageSend(params: {
           restrictedUntil: until.toISOString(),
           recentBlocks,
           windowMinutes,
+          restrictMinutes,
+          restrictionRiskBump,
         });
 
         return {
           action: "RESTRICTED",
           status: 403,
           restrictedUntil: until,
-          message: "Your account is temporarily restricted due to repeated blocked messages. Please try again later.",
+          message:
+            "Your account is temporarily restricted due to repeated blocked messages. Please wait a bit and try again.",
         };
       }
     } catch {
@@ -238,9 +232,8 @@ export async function moderateJobMessageSend(params: {
       action: "BLOCK",
       status: 400,
       body: {
-        error: isContactInfo
-          ? "For your safety, sharing phone numbers or emails in messages is not allowed. Please keep communication in-app."
-          : "For your safety, messages asking to move off-platform or use risky payment methods are blocked. Please keep communication in-app.",
+        error:
+          "For your safety, sharing contact details or arranging payment off the app isn’t allowed yet. Please keep communication in-app. If you need to share details, use “Request contact exchange” on the job once it’s awarded or approved.",
         code: isContactInfo ? "CONTACT_INFO_NOT_ALLOWED" : "MESSAGE_BLOCKED",
         blocked: true,
         reasonCodes: moderation.reasonCodes,

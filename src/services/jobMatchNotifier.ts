@@ -1,6 +1,7 @@
 import { prisma } from "../prisma";
+import { BackgroundJobStatus } from "@prisma/client";
 import { isExpoPushToken, sendExpoPush } from "./expoPush";
-import { getNotificationPreferencesMap, shouldSendNotification } from "./notificationPreferences";
+import { getNotificationPreferencesMap, isKindEnabled, normalizePreference, shouldSendNotification } from "./notificationPreferences";
 import zipcodes from "zipcodes";
 import { matchSavedSearchToJob } from "./savedSearchMatcher";
 import { computeJobMatchScore, extractZip } from "./jobMatchRanking";
@@ -18,13 +19,81 @@ function isMissingTableOrRelationError(err: unknown): boolean {
   return (/relation/i.test(msg) || /table/i.test(msg)) && /does not exist/i.test(msg);
 }
 
-export async function processJobMatchNotify(payload: JobMatchPayload): Promise<void> {
-  const jobId = Number(payload?.jobId);
+async function ensureJobMatchDigestScheduled(params: {
+  prisma: typeof prisma;
+  providerId: number;
+  runAt: Date;
+  now: Date;
+}) {
+  const { prisma: prismaDep, providerId, runAt, now } = params;
+
+  try {
+    const existing = await prismaDep.backgroundJob.findFirst({
+      where: {
+        type: "JOB_MATCH_DIGEST",
+        status: { in: [BackgroundJobStatus.PENDING, BackgroundJobStatus.PROCESSING] },
+        payload: {
+          path: ["providerId"],
+          equals: providerId,
+        } as any,
+      },
+      orderBy: [{ runAt: "asc" }, { id: "asc" }],
+      select: { id: true, runAt: true, status: true },
+    });
+
+    if (existing) {
+      if (existing.status === BackgroundJobStatus.PROCESSING) return;
+      if (existing.runAt.getTime() <= runAt.getTime()) return;
+
+      await prismaDep.backgroundJob.update({
+        where: { id: existing.id },
+        data: {
+          runAt,
+          status: BackgroundJobStatus.PENDING,
+          lockedAt: null,
+          lockedBy: null,
+          lastError: null,
+        },
+      });
+      return;
+    }
+
+    await prismaDep.backgroundJob.create({
+      data: {
+        type: "JOB_MATCH_DIGEST",
+        payload: { providerId },
+        runAt: runAt.getTime() < now.getTime() ? now : runAt,
+        maxAttempts: 8,
+      },
+    });
+  } catch (err) {
+    if (isMissingTableOrRelationError(err)) return;
+    throw err;
+  }
+}
+
+function clampIntervalMinutes(value: unknown): number {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 15;
+  return Math.max(5, Math.min(1440, Math.floor(n)));
+}
+
+export async function processJobMatchNotifyWithDeps(deps: {
+  prisma: typeof prisma;
+  sendExpoPush: typeof sendExpoPush;
+  payload: JobMatchPayload;
+  now?: Date;
+}): Promise<void> {
+  const prismaDep = deps.prisma;
+  const sendExpoPushDep = deps.sendExpoPush;
+  const notifyNow = deps.now ?? new Date();
+
+  const jobId = Number(deps.payload?.jobId);
   if (!Number.isFinite(jobId)) {
     throw new Error("JOB_MATCH_NOTIFY missing jobId");
   }
 
-  const job = await prisma.job.findUnique({
+  const job = await prismaDep.job.findUnique({
     where: { id: jobId },
     select: {
       id: true,
@@ -89,7 +158,7 @@ export async function processJobMatchNotify(payload: JobMatchPayload): Promise<v
     try {
       const categoryVariants = Array.from(new Set([jobCategory, jobCategoryNorm].filter(Boolean)));
 
-      const searches = await prisma.providerSavedSearch.findMany({
+      const searches = await prismaDep.providerSavedSearch.findMany({
         where: {
           isEnabled: true,
           categories: categoryVariants.length ? { hasSome: categoryVariants } : undefined,
@@ -234,7 +303,7 @@ export async function processJobMatchNotify(payload: JobMatchPayload): Promise<v
   if (!scored) {
     // Pull candidate providers (by category + not-suspended)
     // If job.category is missing, we still try all providers but score will be weak.
-    const providers = await prisma.user.findMany({
+    const providers = await prismaDep.user.findMany({
       where: {
         role: "PROVIDER",
         isSuspended: false,
@@ -320,7 +389,7 @@ export async function processJobMatchNotify(payload: JobMatchPayload): Promise<v
   if (!scored.length) return;
 
   // Dedup: skip already-notified providers
-  const already = await prisma.jobMatchNotification.findMany({
+  const already = await prismaDep.jobMatchNotification.findMany({
     where: { jobId, providerId: { in: scored.map((s) => s.provider.id) } },
     select: { providerId: true },
   });
@@ -329,39 +398,82 @@ export async function processJobMatchNotify(payload: JobMatchPayload): Promise<v
   let toNotify = scored.filter((s) => !alreadySet.has(s.provider.id));
   if (!toNotify.length) return;
 
-  // Per-provider notification cap within a rolling window
-  if (Number.isFinite(providerWindowMinutes) && Number.isFinite(providerWindowMax) && providerWindowMinutes > 0 && providerWindowMax > 0) {
-    const windowStart = new Date(Date.now() - providerWindowMinutes * 60_000);
-    const grouped = await prisma.notification.groupBy({
+  // Load preferences once (fail-open if table isn't migrated yet)
+  const prefMap = await getNotificationPreferencesMap({
+    prisma: prismaDep as any,
+    userIds: toNotify.map((s) => s.provider.id),
+  });
+
+  // Partition by digest settings and enabled toggles.
+  let digestList: typeof toNotify = [];
+  let immediateList: typeof toNotify = [];
+
+  for (const item of toNotify) {
+    const pref = normalizePreference(prefMap.get(item.provider.id) as any);
+    if (!isKindEnabled(pref, "JOB_MATCH")) continue;
+    if (pref.jobMatchDigestEnabled) digestList.push(item);
+    else immediateList.push(item);
+  }
+
+  // Per-provider notification cap within a rolling window (only applies to immediate sends)
+  if (
+    immediateList.length &&
+    Number.isFinite(providerWindowMinutes) &&
+    Number.isFinite(providerWindowMax) &&
+    providerWindowMinutes > 0 &&
+    providerWindowMax > 0
+  ) {
+    const windowStart = new Date(notifyNow.getTime() - providerWindowMinutes * 60_000);
+    const grouped = await prismaDep.notification.groupBy({
       by: ["userId"],
       where: {
         type: "job.match",
         createdAt: { gte: windowStart },
-        userId: { in: toNotify.map((s) => s.provider.id) },
+        userId: { in: immediateList.map((s) => s.provider.id) },
       },
       _count: { _all: true },
     });
 
     const counts = new Map<number, number>(grouped.map((g) => [g.userId, g._count._all]));
-    toNotify = toNotify.filter((s) => (counts.get(s.provider.id) ?? 0) < providerWindowMax);
+    immediateList = immediateList.filter((s) => (counts.get(s.provider.id) ?? 0) < providerWindowMax);
   }
 
-  // Respect per-user preferences / quiet hours (fail-open if table isn't migrated yet)
-  const notifyNow = new Date();
-  const prefMap = await getNotificationPreferencesMap({
-    prisma: prisma as any,
-    userIds: toNotify.map((s) => s.provider.id),
-  });
-  toNotify = toNotify.filter((s) => shouldSendNotification(prefMap.get(s.provider.id), "JOB_MATCH", notifyNow));
+  // Per-provider match cap within a rolling window for digest accumulation.
+  // This reduces unbounded match-row accumulation and keeps digest counts reasonable.
+  if (
+    digestList.length &&
+    Number.isFinite(providerWindowMinutes) &&
+    Number.isFinite(providerWindowMax) &&
+    providerWindowMinutes > 0 &&
+    providerWindowMax > 0
+  ) {
+    const windowStart = new Date(notifyNow.getTime() - providerWindowMinutes * 60_000);
+    const grouped = await prismaDep.jobMatchNotification.groupBy({
+      by: ["providerId"],
+      where: {
+        createdAt: { gte: windowStart },
+        providerId: { in: digestList.map((s) => s.provider.id) },
+      },
+      _count: { _all: true },
+    });
 
-  if (!toNotify.length) return;
+    const counts = new Map<number, number>(grouped.map((g) => [g.providerId, g._count._all]));
+    digestList = digestList.filter((s) => (counts.get(s.provider.id) ?? 0) < providerWindowMax);
+  }
+
+  // Respect quiet hours for immediate sends
+  if (immediateList.length) {
+    immediateList = immediateList.filter((s) => shouldSendNotification(prefMap.get(s.provider.id), "JOB_MATCH", notifyNow));
+  }
+
+  if (!immediateList.length && !digestList.length) return;
 
   const title = "New job near you";
   const body = job.location ? `${job.title} • ${job.location}` : job.title;
 
   // Create DB notifications + match rows
-  await prisma.$transaction(async (tx) => {
-    for (const { provider, score, matchMeta } of toNotify) {
+  await prismaDep.$transaction(async (tx) => {
+    for (const { provider, score, matchMeta } of immediateList) {
       await tx.notification.create({
         data: {
           userId: provider.id,
@@ -388,10 +500,20 @@ export async function processJobMatchNotify(payload: JobMatchPayload): Promise<v
         },
       });
     }
+
+    for (const { provider, score } of digestList) {
+      await tx.jobMatchNotification.create({
+        data: {
+          jobId: job.id,
+          providerId: provider.id,
+          score,
+        },
+      });
+    }
   });
 
   // Send push notifications (best-effort)
-  const pushMessages = toNotify.flatMap(({ provider }) =>
+  const pushMessages = immediateList.flatMap(({ provider }) =>
     (provider.pushTokens ?? [])
       .map((t) => t.token)
       .filter((token) => isExpoPushToken(token))
@@ -407,8 +529,25 @@ export async function processJobMatchNotify(payload: JobMatchPayload): Promise<v
   );
 
   if (pushMessages.length) {
-    await sendExpoPush(pushMessages, { prisma, deadLetter: { enabled: true } });
+    await sendExpoPushDep(pushMessages, { prisma: prismaDep, deadLetter: { enabled: true } });
   }
+
+  // Schedule digest send(s) for digest-enabled providers
+  if (digestList.length) {
+    for (const item of digestList) {
+      const pref = normalizePreference(prefMap.get(item.provider.id) as any);
+      const intervalMinutes = clampIntervalMinutes(pref.jobMatchDigestIntervalMinutes);
+      const last = pref.jobMatchDigestLastSentAt ? new Date(pref.jobMatchDigestLastSentAt) : null;
+      const byNow = new Date(notifyNow.getTime() + intervalMinutes * 60_000);
+      const byLast = last ? new Date(last.getTime() + intervalMinutes * 60_000) : byNow;
+      const runAt = byLast.getTime() > byNow.getTime() ? byLast : byNow;
+      await ensureJobMatchDigestScheduled({ prisma: prismaDep, providerId: item.provider.id, runAt, now: notifyNow });
+    }
+  }
+}
+
+export async function processJobMatchNotify(payload: JobMatchPayload): Promise<void> {
+  return processJobMatchNotifyWithDeps({ prisma, sendExpoPush, payload });
 }
 
 function computeScore(params: {

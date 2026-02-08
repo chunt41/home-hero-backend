@@ -3,6 +3,9 @@ export type NotificationKind = "JOB_MATCH" | "BID" | "MESSAGE";
 export type NotificationPreferenceLike = {
   userId: number;
   jobMatchEnabled: boolean;
+  jobMatchDigestEnabled: boolean;
+  jobMatchDigestIntervalMinutes: number;
+  jobMatchDigestLastSentAt: Date | null;
   bidEnabled: boolean;
   messageEnabled: boolean;
   quietHoursStart: string | null;
@@ -14,6 +17,9 @@ export const DEFAULT_TIMEZONE = "UTC";
 
 export const DEFAULT_NOTIFICATION_PREFERENCE = {
   jobMatchEnabled: true,
+  jobMatchDigestEnabled: false,
+  jobMatchDigestIntervalMinutes: 15,
+  jobMatchDigestLastSentAt: null,
   bidEnabled: true,
   messageEnabled: true,
   quietHoursStart: null,
@@ -26,6 +32,12 @@ export function normalizePreference(
 ): Omit<NotificationPreferenceLike, "userId"> {
   return {
     jobMatchEnabled: pref?.jobMatchEnabled ?? DEFAULT_NOTIFICATION_PREFERENCE.jobMatchEnabled,
+    jobMatchDigestEnabled: pref?.jobMatchDigestEnabled ?? DEFAULT_NOTIFICATION_PREFERENCE.jobMatchDigestEnabled,
+    jobMatchDigestIntervalMinutes:
+      typeof pref?.jobMatchDigestIntervalMinutes === "number" && Number.isFinite(pref.jobMatchDigestIntervalMinutes)
+        ? pref.jobMatchDigestIntervalMinutes
+        : DEFAULT_NOTIFICATION_PREFERENCE.jobMatchDigestIntervalMinutes,
+    jobMatchDigestLastSentAt: (pref as any)?.jobMatchDigestLastSentAt ?? DEFAULT_NOTIFICATION_PREFERENCE.jobMatchDigestLastSentAt,
     bidEnabled: pref?.bidEnabled ?? DEFAULT_NOTIFICATION_PREFERENCE.bidEnabled,
     messageEnabled: pref?.messageEnabled ?? DEFAULT_NOTIFICATION_PREFERENCE.messageEnabled,
     quietHoursStart: pref?.quietHoursStart ?? DEFAULT_NOTIFICATION_PREFERENCE.quietHoursStart,
@@ -98,6 +110,38 @@ export function isWithinQuietHours(
   return localMinutes >= start || localMinutes < end;
 }
 
+export function getNextAllowedSendAt(
+  prefInput: Partial<NotificationPreferenceLike> | null | undefined,
+  now: Date = new Date()
+): Date {
+  const pref = normalizePreference(prefInput);
+  const start = pref.quietHoursStart ? toMinutesSinceMidnight(pref.quietHoursStart) : null;
+  const end = pref.quietHoursEnd ? toMinutesSinceMidnight(pref.quietHoursEnd) : null;
+  if (start == null || end == null) return now;
+  if (start === end) return now;
+
+  let localMinutes: number;
+  try {
+    localMinutes = getLocalMinutesSinceMidnight(now, pref.timezone || DEFAULT_TIMEZONE);
+  } catch {
+    localMinutes = getLocalMinutesSinceMidnight(now, DEFAULT_TIMEZONE);
+  }
+
+  const within = isWithinQuietHours(pref, now);
+  if (!within) return now;
+
+  let minutesUntilEnd = 0;
+  if (start < end) {
+    minutesUntilEnd = Math.max(0, end - localMinutes);
+  } else {
+    // Wraps midnight.
+    minutesUntilEnd = localMinutes >= start ? (1440 - localMinutes) + end : Math.max(0, end - localMinutes);
+  }
+
+  // Add a small buffer to avoid edge flapping.
+  return new Date(now.getTime() + minutesUntilEnd * 60_000 + 5_000);
+}
+
 export function isKindEnabled(pref: Omit<NotificationPreferenceLike, "userId">, kind: NotificationKind): boolean {
   switch (kind) {
     case "JOB_MATCH":
@@ -149,6 +193,9 @@ export async function getNotificationPreferencesMap(deps: {
       map.set(r.userId, {
         userId: r.userId,
         jobMatchEnabled: !!r.jobMatchEnabled,
+        jobMatchDigestEnabled: !!(r as any).jobMatchDigestEnabled,
+        jobMatchDigestIntervalMinutes: Number((r as any).jobMatchDigestIntervalMinutes ?? DEFAULT_NOTIFICATION_PREFERENCE.jobMatchDigestIntervalMinutes),
+        jobMatchDigestLastSentAt: ((r as any).jobMatchDigestLastSentAt as any) ?? null,
         bidEnabled: !!r.bidEnabled,
         messageEnabled: !!r.messageEnabled,
         quietHoursStart: (r as any).quietHoursStart ?? null,

@@ -13,6 +13,7 @@ import { useLocalSearchParams, router, useFocusEffect } from "expo-router";
 import { api } from "../../src/lib/apiClient";
 import { addEventToDeviceCalendar } from "../../src/lib/calendarIntegration";
 import { useAuth } from "../../src/context/AuthContext";
+import { JobTimeline } from "../../src/components/JobTimeline";
 
 type JobDetail = {
   id: number;
@@ -23,8 +24,12 @@ type JobDetail = {
   status: string;
   location: string | null;
   createdAt: string;
+  awardedAt?: string | null;
   completionPendingForUserId?: number | null;
   completedAt?: string | null;
+  cancelledAt?: string | null;
+  cancellationReasonCode?: string | null;
+  cancellationReasonDetails?: string | null;
 };
 
 type CounterOffer = {
@@ -443,6 +448,18 @@ export default function ProviderJobDetailScreen() {
         <ScrollView contentContainerStyle={styles.content}>
           <Text style={styles.title}>{job.title}</Text>
 
+          <JobTimeline
+            job={{
+              status: job.status,
+              createdAt: job.createdAt,
+              awardedAt: job.awardedAt ?? null,
+              completedAt: job.completedAt ?? null,
+              cancelledAt: job.cancelledAt ?? null,
+              cancellationReasonCode: job.cancellationReasonCode ?? null,
+              cancellationReasonDetails: job.cancellationReasonDetails ?? null,
+            }}
+          />
+
           <View style={styles.row}>
             <View style={styles.badge}>
               <Text style={styles.badgeText}>{job.status}</Text>
@@ -698,6 +715,15 @@ export default function ProviderJobDetailScreen() {
             >
               <Text style={styles.dangerText}>Report Job</Text>
             </Pressable>
+
+            {(job.status === "AWARDED" || job.status === "IN_PROGRESS") && myBid?.status === "ACCEPTED" ? (
+              <Pressable
+                style={styles.dangerBtn}
+                onPress={() => router.push(`/job/${job.id}/cancel`)}
+              >
+                <Text style={styles.dangerText}>Cancel Job</Text>
+              </Pressable>
+            ) : null}
           </View>
 
           <View style={styles.actionsRow}>

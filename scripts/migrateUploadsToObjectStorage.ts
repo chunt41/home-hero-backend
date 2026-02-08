@@ -8,22 +8,61 @@ import { getStorageProviderOrThrow } from "../src/storage/storageFactory";
 type Flags = {
   dryRun: boolean;
   limit: number | null;
+  concurrency: number;
+  help: boolean;
 };
 
 function parseFlags(argv: string[]): Flags {
   const flags: Flags = {
     dryRun: false,
     limit: null,
+    concurrency: 5,
+    help: false,
   };
 
   for (const arg of argv) {
+    if (arg === "--help" || arg === "-h") flags.help = true;
     if (arg === "--dry-run") flags.dryRun = true;
     else if (arg.startsWith("--limit=")) {
       const n = Number(arg.slice("--limit=".length));
       flags.limit = Number.isFinite(n) && n > 0 ? Math.floor(n) : null;
+    } else if (arg.startsWith("--concurrency=")) {
+      const n = Number(arg.slice("--concurrency=".length));
+      flags.concurrency = Number.isFinite(n) && n > 0 ? Math.floor(n) : 5;
     }
   }
   return flags;
+}
+
+function printHelp() {
+  console.log(`Usage: node --import tsx scripts/migrateUploadsToObjectStorage.ts [--dry-run] [--limit=<n>] [--concurrency=<n>]
+
+Migrates legacy disk-backed attachment rows (diskPath) into object storage (storageKey).
+
+Flags:
+  --dry-run            Do not upload or write DB updates; only log intended actions
+  --limit=<n>          Stop after migrating <n> rows (across all attachment tables)
+  --concurrency=<n>    Parallelism for uploads/updates (default: 5)
+  -h, --help           Show this help
+`);
+}
+
+async function mapWithConcurrency<T, R>(items: T[], concurrency: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const limit = Number.isFinite(concurrency) && concurrency > 0 ? Math.floor(concurrency) : 5;
+  const results: R[] = new Array(items.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (true) {
+      const idx = nextIndex++;
+      if (idx >= items.length) return;
+      results[idx] = await fn(items[idx]);
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(limit, Math.max(items.length, 1)) }, () => worker());
+  await Promise.all(workers);
+  return results;
 }
 
 async function fileExists(p: string): Promise<boolean> {
@@ -62,6 +101,11 @@ function makeDeterministicStorageKey(args: {
 async function main() {
   const flags = parseFlags(process.argv.slice(2));
 
+  if (flags.help) {
+    printHelp();
+    process.exit(0);
+  }
+
   const storage = getStorageProviderOrThrow();
 
   const uploadsDir = path.join(process.cwd(), "uploads");
@@ -69,6 +113,7 @@ async function main() {
   console.log("[migrate] starting", {
     dryRun: flags.dryRun,
     limit: flags.limit,
+    concurrency: flags.concurrency,
     uploadsDir,
   });
 
@@ -127,13 +172,13 @@ async function main() {
       if (!rows.length) break;
       lastId = rows[rows.length - 1].id;
 
-      for (const row of rows) {
+      await mapWithConcurrency(rows, flags.concurrency, async (row) => {
         processed += 1;
         logProgress();
 
         if (!row.diskPath) {
           skippedNoDiskPath += 1;
-          continue;
+          return;
         }
 
         try {
@@ -142,13 +187,13 @@ async function main() {
             abs = resolveDiskPathInsideUploadsDir(uploadsDir, row.diskPath);
           } catch {
             skippedInvalidPath += 1;
-            continue;
+            return;
           }
 
           if (!(await fileExists(abs))) {
             skippedMissingFile += 1;
             console.warn("[migrate] missing_file", { kind: "job", id: row.id, diskPath: row.diskPath });
-            continue;
+            return;
           }
 
           const filename = row.filename || path.posix.basename(row.diskPath);
@@ -181,9 +226,8 @@ async function main() {
             diskPath: row.diskPath,
             message: String(e?.message ?? e),
           });
-          continue;
         }
-      }
+      });
     }
   }
 
@@ -214,13 +258,13 @@ async function main() {
       if (!rows.length) break;
       lastId = rows[rows.length - 1].id;
 
-      for (const row of rows) {
+      await mapWithConcurrency(rows, flags.concurrency, async (row) => {
         processed += 1;
         logProgress();
 
         if (!row.diskPath) {
           skippedNoDiskPath += 1;
-          continue;
+          return;
         }
 
         try {
@@ -229,13 +273,13 @@ async function main() {
             abs = resolveDiskPathInsideUploadsDir(uploadsDir, row.diskPath);
           } catch {
             skippedInvalidPath += 1;
-            continue;
+            return;
           }
 
           if (!(await fileExists(abs))) {
             skippedMissingFile += 1;
             console.warn("[migrate] missing_file", { kind: "message", id: row.id, diskPath: row.diskPath });
-            continue;
+            return;
           }
 
           const filename = row.filename || path.posix.basename(row.diskPath);
@@ -268,9 +312,8 @@ async function main() {
             diskPath: row.diskPath,
             message: String(e?.message ?? e),
           });
-          continue;
         }
-      }
+      });
     }
   }
 
@@ -301,13 +344,13 @@ async function main() {
       if (!rows.length) break;
       lastId = rows[rows.length - 1].id;
 
-      for (const row of rows) {
+      await mapWithConcurrency(rows, flags.concurrency, async (row) => {
         processed += 1;
         logProgress();
 
         if (!row.diskPath) {
           skippedNoDiskPath += 1;
-          continue;
+          return;
         }
 
         try {
@@ -316,7 +359,7 @@ async function main() {
             abs = resolveDiskPathInsideUploadsDir(uploadsDir, row.diskPath);
           } catch {
             skippedInvalidPath += 1;
-            continue;
+            return;
           }
 
           if (!(await fileExists(abs))) {
@@ -326,7 +369,7 @@ async function main() {
               id: row.id,
               diskPath: row.diskPath,
             });
-            continue;
+            return;
           }
 
           const filename = row.filename || path.posix.basename(row.diskPath);
@@ -359,9 +402,8 @@ async function main() {
             diskPath: row.diskPath,
             message: String(e?.message ?? e),
           });
-          continue;
         }
-      }
+      });
     }
   }
 

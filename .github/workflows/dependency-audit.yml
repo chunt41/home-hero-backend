@@ -1,0 +1,30 @@
+name: dependency-audit
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  npm-audit:
+    runs-on: ubuntu-latest
+    env:
+      # Configure via GitHub repo/org variable: Settings → Secrets and variables → Actions → Variables
+      # Allowed values: low | moderate | high | critical
+      NPM_AUDIT_LEVEL: ${{ vars.NPM_AUDIT_LEVEL || 'high' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: npm audit (fails at configured severity)
+        run: npm audit --audit-level=${NPM_AUDIT_LEVEL}
