@@ -197,3 +197,28 @@ test("moderation: repeated blocks can trigger restriction", async () => {
   assert.ok(minutes > 20 && minutes < 40);
   assert.ok(calls.events.some((e: any) => e.actionType === "user.restricted"));
 });
+
+test("moderation: repeated messages can be shadow-hidden", async () => {
+  const prisma = {
+    contactExchangeRequest: { findFirst: async () => null },
+    securityEvent: { count: async () => 0 },
+    user: { update: async () => ({}) },
+  };
+
+  const req = { user: { userId: 10, role: "CONSUMER", riskScore: 0 } };
+
+  const out = await moderateJobMessageSend({
+    prisma,
+    req,
+    isAdmin: false,
+    jobId: 1,
+    jobStatus: "OPEN",
+    senderId: 10,
+    messageText: "Hello again, same message",
+    appealUrl: "https://example.com/appeal",
+    logSecurityEvent: async () => {},
+    assessRepeatedMessageRisk: async () => makeRisk([{ code: "REPEATED_MESSAGE", score: 35 }]),
+  });
+
+  assert.equal(out.action, "HIDE");
+});

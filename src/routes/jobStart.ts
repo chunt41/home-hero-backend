@@ -1,5 +1,6 @@
 import type { Request, Response } from "express";
 import { z } from "zod";
+import { logger } from "../services/logger";
 
 type UserRole = "CONSUMER" | "PROVIDER" | "ADMIN";
 
@@ -99,7 +100,7 @@ export function createPostJobStartHandler(deps: {
         job: updatedJob,
       });
     } catch (err) {
-      console.error("POST /jobs/:id/start error:", err);
+      logger.error("jobs.start_error", { message: String((err as any)?.message ?? err) });
       return res.status(500).json({ error: "Internal server error while starting job." });
     }
   };

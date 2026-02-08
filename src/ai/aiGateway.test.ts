@@ -148,6 +148,53 @@ test("model selection: PRO + allowlisted task uses premium model", async () => {
   }
 });
 
+test("model selection: PRO + non-allowlisted task uses cheap model", async () => {
+  const prevPremium = process.env.AI_MODEL_PREMIUM;
+  const prevCheap = process.env.AI_MODEL_CHEAP;
+  process.env.AI_MODEL_PREMIUM = "premium-model-test";
+  process.env.AI_MODEL_CHEAP = "cheap-model-test";
+
+  try {
+    const monthKey = getCurrentMonthKeyUtc();
+    const users = new Map<number, AiQuotaState>([
+      [
+        1,
+        {
+          aiMonthlyTokenLimit: 1000,
+          aiTokensUsedThisMonth: 0,
+          aiUsageMonthKey: monthKey,
+          tier: "PRO",
+        },
+      ],
+    ]);
+
+    let lastModel: string | null = null;
+    const provider: AiProvider = {
+      generateText: async ({ model }) => {
+        lastModel = model;
+        return { text: "ok" };
+      },
+    };
+
+    const gateway = createInMemoryAiGatewayForTest({ users, provider });
+    const out = await gateway.runAiTask({
+      userId: 1,
+      taskType: "summarize.thread",
+      input: "Summarize this",
+      estimatedTokens: 50,
+    });
+
+    assert.equal(out.model, "cheap");
+    assert.equal(lastModel, "cheap-model-test");
+  } finally {
+    if (typeof prevPremium === "undefined") delete process.env.AI_MODEL_PREMIUM;
+    else process.env.AI_MODEL_PREMIUM = prevPremium;
+
+    if (typeof prevCheap === "undefined") delete process.env.AI_MODEL_CHEAP;
+    else process.env.AI_MODEL_CHEAP = prevCheap;
+  }
+});
+
 test("model selection: non-PRO never uses premium model", async () => {
   const prevPremium = process.env.AI_MODEL_PREMIUM;
   const prevCheap = process.env.AI_MODEL_CHEAP;

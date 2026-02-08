@@ -12,21 +12,27 @@ Expected output:
 - `npm run lint` succeeds (TypeScript noEmit)
 - `npm test` passes
 - `npm run verify:gate` passes
+- Smoke suite passes (`[rc:smoke] OK`)
 - Final line includes `[rc:verify] OK`
 
-Optional smoke (against a running local server):
-- `RC_SMOKE=1 npm run rc:verify`
-- Optional URL override: `RC_SMOKE_URL=http://127.0.0.1:4000 RC_SMOKE=1 npm run rc:verify`
+Smoke configuration (optional):
+- URL override: `RC_SMOKE_URL=http://127.0.0.1:4000 npm run rc:verify`
+- If you already have the server running: `RC_SMOKE_START_SERVER=0 npm run rc:verify`
+- Allow DB down (only for API-only verification): `RC_SMOKE_ALLOW_DB_DOWN=1 npm run rc:verify`
+- Emergency skip: `RC_SMOKE_SKIP=1 npm run rc:verify`
 
-Expected output:
-- `[rc:smoke] ... OK`
-
-Notes:
-- Smoke checks call `GET /healthz` and `GET /readyz` and expect JSON `{ ok: true }` and `{ ok: true, db: true }`.
+Smoke coverage:
+- `GET /healthz`, `GET /readyz`
+- Auth: `POST /auth/signup` → `POST /auth/verify-email` → `POST /auth/login`
+- Provider search: `GET /providers/search?zip=...`
+- Job flow: `POST /jobs` → `POST /jobs/:jobId/bids` → `POST /jobs/:jobId/messages`
+- Notifications: `GET /notifications` and `GET /me/notifications`
 
 ---
 
 ## RC items (commands + expected results)
+
+The single command `npm run rc:verify` covers the automated items below.
 
 ### 1) CI workflows
 
@@ -34,6 +40,10 @@ Notes:
 - Local equivalent:
   - `npm run ci`
   - Expected: exits `0`.
+
+Automated (RC one-command):
+- `npm run rc:verify`
+- Expected: exits `0`.
 
 ### 2) Env validation (production gates)
 
@@ -43,6 +53,9 @@ Notes:
 
 What this covers:
 - Production-required env var validation, readiness endpoints, and safety gates.
+
+Note:
+- `npm run rc:verify` includes `npm run verify:gate`, but does not run `npm run readiness`.
 
 ### 3) Database migrations
 
@@ -54,6 +67,9 @@ What this covers:
 Deploy-time command (target environment):
 - `npm run migrate:deploy`
 - Expected: `No pending migrations` or successful application of pending migrations.
+
+Note:
+- The smoke suite in `npm run rc:verify` expects a working DB (unless `RC_SMOKE_ALLOW_DB_DOWN=1`).
 
 ### 4) Storage migration (attachments)
 

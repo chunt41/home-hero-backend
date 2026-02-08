@@ -21,3 +21,16 @@ test("new upload stores storageKey in production", () => {
   assert.equal(out.diskPath, null);
   assert.equal(out.storageKey, "attachments/message/123/file.png");
 });
+
+test("new upload throws in production when storage is not configured", () => {
+  assert.throws(
+    () =>
+      computeNewUploadTargets({
+        namespace: "message",
+        ownerId: 123,
+        basename: "file.png",
+        nodeEnv: "production",
+      }),
+    /Attachment storage is not configured for production/
+  );
+});

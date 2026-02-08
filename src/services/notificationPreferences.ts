@@ -1,11 +1,34 @@
 export type NotificationKind = "JOB_MATCH" | "BID" | "MESSAGE";
 
+export type JobMatchDeliveryMode = "INSTANT" | "DIGEST";
+
+const ALLOWED_DIGEST_INTERVAL_MINUTES = new Set([15, 30, 60]);
+
+function normalizeDigestIntervalMinutes(value: unknown): number {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 15;
+  const i = Math.floor(n);
+  if (ALLOWED_DIGEST_INTERVAL_MINUTES.has(i)) return i;
+  return 15;
+}
+
+function normalizeDeliveryMode(value: unknown): JobMatchDeliveryMode | null {
+  if (value === "INSTANT" || value === "DIGEST") return value;
+  return null;
+}
+
 export type NotificationPreferenceLike = {
   userId: number;
   jobMatchEnabled: boolean;
+  // Legacy fields (mobile v1)
   jobMatchDigestEnabled: boolean;
   jobMatchDigestIntervalMinutes: number;
   jobMatchDigestLastSentAt: Date | null;
+
+  // New fields (mobile v2): preferred API contract
+  matchDeliveryMode: JobMatchDeliveryMode;
+  digestIntervalMinutes: number;
+
   bidEnabled: boolean;
   messageEnabled: boolean;
   quietHoursStart: string | null;
@@ -20,6 +43,10 @@ export const DEFAULT_NOTIFICATION_PREFERENCE = {
   jobMatchDigestEnabled: false,
   jobMatchDigestIntervalMinutes: 15,
   jobMatchDigestLastSentAt: null,
+
+  matchDeliveryMode: "INSTANT" as const,
+  digestIntervalMinutes: 15,
+
   bidEnabled: true,
   messageEnabled: true,
   quietHoursStart: null,
@@ -30,14 +57,25 @@ export const DEFAULT_NOTIFICATION_PREFERENCE = {
 export function normalizePreference(
   pref: Partial<NotificationPreferenceLike> | null | undefined
 ): Omit<NotificationPreferenceLike, "userId"> {
+  const explicitMode = normalizeDeliveryMode((pref as any)?.matchDeliveryMode);
+  const legacyDigestEnabled = !!(pref as any)?.jobMatchDigestEnabled;
+
+  const matchDeliveryMode: JobMatchDeliveryMode =
+    explicitMode ?? (legacyDigestEnabled ? "DIGEST" : "INSTANT");
+
+  const digestIntervalMinutes = normalizeDigestIntervalMinutes(
+    (pref as any)?.digestIntervalMinutes ?? (pref as any)?.jobMatchDigestIntervalMinutes
+  );
+
   return {
     jobMatchEnabled: pref?.jobMatchEnabled ?? DEFAULT_NOTIFICATION_PREFERENCE.jobMatchEnabled,
-    jobMatchDigestEnabled: pref?.jobMatchDigestEnabled ?? DEFAULT_NOTIFICATION_PREFERENCE.jobMatchDigestEnabled,
-    jobMatchDigestIntervalMinutes:
-      typeof pref?.jobMatchDigestIntervalMinutes === "number" && Number.isFinite(pref.jobMatchDigestIntervalMinutes)
-        ? pref.jobMatchDigestIntervalMinutes
-        : DEFAULT_NOTIFICATION_PREFERENCE.jobMatchDigestIntervalMinutes,
+    jobMatchDigestEnabled: matchDeliveryMode === "DIGEST",
+    jobMatchDigestIntervalMinutes: digestIntervalMinutes,
     jobMatchDigestLastSentAt: (pref as any)?.jobMatchDigestLastSentAt ?? DEFAULT_NOTIFICATION_PREFERENCE.jobMatchDigestLastSentAt,
+
+    matchDeliveryMode,
+    digestIntervalMinutes,
+
     bidEnabled: pref?.bidEnabled ?? DEFAULT_NOTIFICATION_PREFERENCE.bidEnabled,
     messageEnabled: pref?.messageEnabled ?? DEFAULT_NOTIFICATION_PREFERENCE.messageEnabled,
     quietHoursStart: pref?.quietHoursStart ?? DEFAULT_NOTIFICATION_PREFERENCE.quietHoursStart,
@@ -196,6 +234,10 @@ export async function getNotificationPreferencesMap(deps: {
         jobMatchDigestEnabled: !!(r as any).jobMatchDigestEnabled,
         jobMatchDigestIntervalMinutes: Number((r as any).jobMatchDigestIntervalMinutes ?? DEFAULT_NOTIFICATION_PREFERENCE.jobMatchDigestIntervalMinutes),
         jobMatchDigestLastSentAt: ((r as any).jobMatchDigestLastSentAt as any) ?? null,
+
+        matchDeliveryMode: normalizePreference(r as any).matchDeliveryMode,
+        digestIntervalMinutes: normalizePreference(r as any).digestIntervalMinutes,
+
         bidEnabled: !!r.bidEnabled,
         messageEnabled: !!r.messageEnabled,
         quietHoursStart: (r as any).quietHoursStart ?? null,

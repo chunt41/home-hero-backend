@@ -1,9 +1,13 @@
 import os from "os";
+import crypto from "node:crypto";
 import { prisma } from "../prisma";
 import { BackgroundJobStatus } from "@prisma/client";
 import { processJobMatchNotify } from "../services/jobMatchNotifier";
 import { processJobMatchDigest } from "../services/jobMatchDigest";
 import { isRescheduleJobError } from "./jobErrors";
+import { withLogContext } from "../services/logContext";
+import { logger } from "../services/logger";
+import { captureException, captureMessage } from "../observability/sentry";
 import {
   getNextDailyRunAtUtc,
   recomputeProviderStatsForAllProviders,
@@ -82,28 +86,62 @@ async function claimDueJobs(workerId: string) {
   });
 }
 
-async function markSuccess(jobId: number) {
-  await prisma.backgroundJob.update({
-    where: { id: jobId },
+async function markSuccess(
+  jobId: number,
+  workerId: string,
+  deps?: {
+    prisma?: any;
+    now?: () => Date;
+  }
+) {
+  const prismaClient = deps?.prisma ?? prisma;
+  const nowFn = deps?.now ?? (() => new Date());
+  const now = nowFn();
+  await prismaClient.backgroundJob.updateMany({
+    where: {
+      id: jobId,
+      status: BackgroundJobStatus.PROCESSING,
+      lockedBy: workerId,
+    },
     data: {
       status: BackgroundJobStatus.SUCCESS,
       lockedAt: null,
       lockedBy: null,
       lastError: null,
+      lastAttemptAt: now,
     },
   });
 }
 
-async function markFailure(jobId: number, attempts: number, maxAttempts: number, err: unknown) {
+async function markFailure(
+  jobId: number,
+  attempts: number,
+  maxAttempts: number,
+  err: unknown,
+  workerId: string,
+  deps?: {
+    prisma?: any;
+    now?: () => Date;
+    captureMessage?: typeof captureMessage;
+    logger?: typeof logger;
+  }
+) {
+  const prismaClient = deps?.prisma ?? prisma;
+  const nowFn = deps?.now ?? (() => new Date());
+  const captureMessageFn = deps?.captureMessage ?? captureMessage;
+  const log = deps?.logger ?? logger;
+  const now = nowFn();
+
   if (isRescheduleJobError(err)) {
-    await prisma.backgroundJob.update({
-      where: { id: jobId },
+    await prismaClient.backgroundJob.updateMany({
+      where: { id: jobId, status: BackgroundJobStatus.PROCESSING, lockedBy: workerId },
       data: {
         status: BackgroundJobStatus.PENDING,
         attempts,
         lockedAt: null,
         lockedBy: null,
         lastError: null,
+        lastAttemptAt: now,
         runAt: err.runAt,
       },
     });
@@ -114,33 +152,60 @@ async function markFailure(jobId: number, attempts: number, maxAttempts: number,
   const nextAttempts = attempts + 1;
 
   if (nextAttempts >= maxAttempts) {
-    await prisma.backgroundJob.update({
-      where: { id: jobId },
+    const updated = await prismaClient.backgroundJob.updateMany({
+      where: { id: jobId, status: BackgroundJobStatus.PROCESSING, lockedBy: workerId },
       data: {
-        status: BackgroundJobStatus.FAILED,
+        status: "DEAD",
         attempts: nextAttempts,
         lockedAt: null,
         lockedBy: null,
         lastError: message,
-        runAt: new Date(),
+        lastAttemptAt: now,
+        runAt: now,
       },
     });
+
+    if (updated.count > 0) {
+      const sent = captureMessageFn("Background job dead-lettered", {
+        level: "error",
+        kind: "jobs.dead_lettered",
+        jobId,
+        attempts: nextAttempts,
+        maxAttempts,
+        lastError: message.slice(0, 500),
+      });
+
+      if (!sent) {
+        log.error("jobs.dead_lettered", {
+          jobId,
+          attempts: nextAttempts,
+          maxAttempts,
+          lastError: message.slice(0, 500),
+        });
+      }
+    }
     return;
   }
 
   const delayMs = computeBackoffMs(nextAttempts);
-  await prisma.backgroundJob.update({
-    where: { id: jobId },
+  await prismaClient.backgroundJob.updateMany({
+    where: { id: jobId, status: BackgroundJobStatus.PROCESSING, lockedBy: workerId },
     data: {
       status: BackgroundJobStatus.PENDING,
       attempts: nextAttempts,
       lockedAt: null,
       lockedBy: null,
       lastError: message,
+      lastAttemptAt: now,
       runAt: new Date(Date.now() + delayMs),
     },
   });
 }
+
+export const __testOnly = {
+  markFailure,
+  markSuccess,
+};
 
 async function processOne(job: any) {
   switch (job.type) {
@@ -274,16 +339,45 @@ export function startBackgroundJobWorker() {
         }
 
         for (const job of jobs) {
-          try {
-            await processOne(job);
-            await markSuccess(job.id);
-          } catch (e) {
-            await markFailure(job.id, job.attempts ?? 0, job.maxAttempts ?? 8, e);
-          }
+          const payloadAny = job?.payload as any;
+          const inheritedRequestId =
+            payloadAny && typeof payloadAny === "object" && !Array.isArray(payloadAny)
+              ? payloadAny.requestId
+              : undefined;
+          const requestId =
+            typeof inheritedRequestId === "string" && inheritedRequestId.trim()
+              ? inheritedRequestId.trim()
+              : `job-${job.id}-${crypto.randomUUID()}`;
+
+          await withLogContext(
+            { requestId, jobId: job.id, jobType: String(job.type ?? "unknown") },
+            async () => {
+              try {
+                await processOne(job);
+                await markSuccess(job.id, workerId);
+                logger.info("jobs.job_success", { attempts: job.attempts ?? 0 });
+              } catch (e) {
+                logger.warn("jobs.job_failed", {
+                  attempts: job.attempts ?? 0,
+                  maxAttempts: job.maxAttempts ?? 8,
+                  message: String((e as any)?.message ?? e),
+                });
+                captureException(e, {
+                  kind: "job_failed",
+                  jobId: job.id,
+                  jobType: String(job.type ?? "unknown"),
+                  attempts: job.attempts ?? 0,
+                  maxAttempts: job.maxAttempts ?? 8,
+                });
+                await markFailure(job.id, job.attempts ?? 0, job.maxAttempts ?? 8, e, workerId);
+              }
+            }
+          );
         }
       } catch (e: any) {
         const msg = String(e?.message ?? e);
-        console.error("[jobs] worker loop error:", msg);
+        logger.error("jobs.worker_loop_error", { message: msg });
+        captureException(e, { kind: "jobs.worker_loop_error" });
 
         // Deploy-safe: if the migration hasn't been applied yet, don't spin hot.
         if (/relation/i.test(msg) && /BackgroundJob/i.test(msg) && /does not exist/i.test(msg)) {
@@ -300,12 +394,14 @@ export function startBackgroundJobWorker() {
   // Best-effort schedule (safe to call even if migration isn't applied yet).
   ensureProviderStatsRecomputeScheduled().catch((e) => {
     const msg = String((e as any)?.message ?? e);
-    console.error("[jobs] failed to schedule PROVIDER_STATS_RECOMPUTE:", msg);
+    logger.error("jobs.schedule_failed", { jobType: "PROVIDER_STATS_RECOMPUTE", message: msg });
+    captureException(e, { kind: "jobs.schedule_failed", jobType: "PROVIDER_STATS_RECOMPUTE" });
   });
 
   ensureAiMonthlyResetScheduled().catch((e) => {
     const msg = String((e as any)?.message ?? e);
-    console.error("[jobs] failed to schedule AI_MONTHLY_RESET:", msg);
+    logger.error("jobs.schedule_failed", { jobType: "AI_MONTHLY_RESET", message: msg });
+    captureException(e, { kind: "jobs.schedule_failed", jobType: "AI_MONTHLY_RESET" });
   });
 
   return () => {

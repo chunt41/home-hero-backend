@@ -1,6 +1,8 @@
 import type { Request, Response } from "express";
 import { z } from "zod";
 
+import { logger } from "../services/logger";
+
 import { canReviewJob } from "../services/jobFlowGuards";
 
 type UserRole = "CONSUMER" | "PROVIDER" | "ADMIN";
@@ -170,7 +172,7 @@ export function createPostJobReviewsHandler(deps: {
         ratingSummary,
       });
     } catch (err) {
-      console.error("Create/update review error:", err);
+      logger.error("jobs.reviews_upsert_error", { message: String((err as any)?.message ?? err) });
       return res.status(500).json({ error: "Internal server error while creating/updating review." });
     }
   };

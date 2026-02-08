@@ -47,6 +47,14 @@ export function JobTimeline(props: { job: JobTimelineJob }) {
     const isCancelled = status === "CANCELLED";
     const isDisputed = status === "DISPUTED";
 
+    const hasAwarded =
+      !!job.awardedAt ||
+      status === "AWARDED" ||
+      status === "IN_PROGRESS" ||
+      status === "COMPLETED_PENDING_CONFIRMATION" ||
+      status === "COMPLETED" ||
+      isDisputed;
+
     const createdWhen = formatWhen(job.createdAt);
     const awardedWhen = formatWhen(job.awardedAt);
     const completedWhen = formatWhen(job.completedAt);
@@ -55,7 +63,7 @@ export function JobTimeline(props: { job: JobTimelineJob }) {
     const base: Step[] = [
       {
         key: "created",
-        label: "Posted",
+        label: "Open",
         done: true,
         active: status === "OPEN",
         note: createdWhen ?? undefined,
@@ -63,7 +71,7 @@ export function JobTimeline(props: { job: JobTimelineJob }) {
       {
         key: "awarded",
         label: "Awarded",
-        done: status !== "OPEN" && !isCancelled,
+        done: hasAwarded,
         active: status === "AWARDED",
         note: awardedWhen ?? undefined,
       },

@@ -10,6 +10,7 @@ import {
   computeRiskScoreExcludingOffPlatformVectors,
   shouldBypassOffPlatformContactBlock,
 } from "./contactExchangeGate";
+import { decideRestrictionFromRecentSecurityEvents } from "../safety/policy";
 
 function isMissingDbColumnError(err: any): boolean {
   const code = String(err?.code ?? "");
@@ -26,6 +27,12 @@ export type AssessRepeatedMessageRisk = (params: {
 
 export type JobMessageSendModerationResult =
   | { action: "ALLOW" }
+  | {
+      action: "HIDE";
+      reason: "repeated_message";
+      riskTotalScore: number;
+      riskSignals: RiskAssessment["signals"];
+    }
   | {
       action: "BLOCK";
       status: 400;
@@ -179,26 +186,29 @@ export async function moderateJobMessageSend(params: {
     });
 
     try {
-      // Repeat offender logic:
-      // after 3 blocked attempts in 10 minutes → restrict messaging for 30 minutes
-      const windowMinutes = 10;
-      const restrictMinutes = 30;
-      const since = new Date(Date.now() - windowMinutes * 60_000);
-      const recentBlocks = await params.prisma.securityEvent.count({
-        where: {
-          actorUserId: params.senderId,
-          actionType: "message.blocked",
-          createdAt: { gt: since },
-        },
+      const decision = await decideRestrictionFromRecentSecurityEvents({
+        prisma: params.prisma,
+        actorUserId: params.senderId,
+        actionType: "message.blocked",
+        windowMinutes: 10,
+        reason: "repeated_message_blocks",
+        // Escalate quickly for persistent offenders.
+        steps: [
+          { atOrAbove: 3, minutes: 30 },
+          { atOrAbove: 5, minutes: 6 * 60 },
+          { atOrAbove: 8, minutes: 24 * 60 },
+        ],
       });
 
-      if (recentBlocks >= 3) {
-        const until = computeRestrictedUntil(restrictMinutes / 60);
+      if (decision.action === "RESTRICT") {
         const restrictionRiskBump = 50;
         try {
           await params.prisma.user.update({
             where: { id: params.senderId },
-            data: { restrictedUntil: until, riskScore: { increment: restrictionRiskBump } },
+            data: {
+              restrictedUntil: decision.restrictedUntil,
+              riskScore: { increment: restrictionRiskBump },
+            },
           });
         } catch (e: any) {
           if (!isMissingDbColumnError(e)) throw e;
@@ -207,18 +217,17 @@ export async function moderateJobMessageSend(params: {
         await params.logSecurityEvent(params.req, "user.restricted", {
           targetType: "USER",
           targetId: params.senderId,
-          reason: "repeated_message_blocks",
-          restrictedUntil: until.toISOString(),
-          recentBlocks,
-          windowMinutes,
-          restrictMinutes,
+          reason: decision.reason,
+          restrictedUntil: decision.restrictedUntil.toISOString(),
+          restrictMinutes: decision.minutes,
           restrictionRiskBump,
+          ...(decision.metadata ?? {}),
         });
 
         return {
           action: "RESTRICTED",
           status: 403,
-          restrictedUntil: until,
+          restrictedUntil: decision.restrictedUntil,
           message:
             "Your account is temporarily restricted due to repeated blocked messages. Please wait a bit and try again.",
         };
@@ -281,6 +290,17 @@ export async function moderateJobMessageSend(params: {
     } catch (e: any) {
       if (!isMissingDbColumnError(e)) throw e;
     }
+  }
+
+  // Soft action: shadow-hide repeated spammy messages pending review.
+  // (Message is still persisted so the author can see it, but it won't be visible to others.)
+  if (risk.signals.some((s) => s.code === "REPEATED_MESSAGE")) {
+    return {
+      action: "HIDE",
+      reason: "repeated_message",
+      riskTotalScore: risk.totalScore,
+      riskSignals: risk.signals,
+    };
   }
 
   return { action: "ALLOW" };

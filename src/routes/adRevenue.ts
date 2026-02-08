@@ -9,6 +9,7 @@ import {
 import { z } from "zod";
 import { validate } from "../middleware/validate";
 import { createAsyncRouter } from "../middleware/asyncWrap";
+import { logger } from "../services/logger";
 
 const router = createAsyncRouter(express);
 
@@ -44,7 +45,7 @@ router.post("/record", authMiddleware, validate(recordAdRevenueSchema), async (r
       adRevenue: result,
     });
   } catch (error: any) {
-    console.error("Ad revenue recording error:", error);
+    logger.error("adRevenue.record_error", { message: String(error?.message ?? error) });
     res.status(500).json({ error: error.message });
   }
 });
@@ -144,7 +145,7 @@ router.post("/webhook/admob", validate(admobWebhookSchema), async (req, res) => 
 
     res.json({ success: true });
   } catch (error: any) {
-    console.error("AdMob webhook error:", error);
+    logger.error("adRevenue.admob_webhook_error", { message: String(error?.message ?? error) });
     res.status(500).json({ error: error.message });
   }
 });

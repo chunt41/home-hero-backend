@@ -1,6 +1,8 @@
 import type { Request, Response } from "express";
 import { z } from "zod";
 
+import { logger } from "../services/logger";
+
 type UserRole = "CONSUMER" | "PROVIDER" | "ADMIN";
 
 type AuthUser = {
@@ -223,7 +225,7 @@ export function createGetAdminOpsKpisHandler(deps: {
         },
       });
     } catch (err) {
-      console.error("GET /admin/ops/kpis error:", err);
+      logger.error("admin.ops.kpis_error", { message: String((err as any)?.message ?? err) });
       return res.status(500).json({ error: "Internal server error while computing KPIs." });
     }
   };

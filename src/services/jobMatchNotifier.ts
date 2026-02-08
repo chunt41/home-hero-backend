@@ -411,7 +411,7 @@ export async function processJobMatchNotifyWithDeps(deps: {
   for (const item of toNotify) {
     const pref = normalizePreference(prefMap.get(item.provider.id) as any);
     if (!isKindEnabled(pref, "JOB_MATCH")) continue;
-    if (pref.jobMatchDigestEnabled) digestList.push(item);
+    if (pref.matchDeliveryMode === "DIGEST") digestList.push(item);
     else immediateList.push(item);
   }
 
@@ -536,7 +536,7 @@ export async function processJobMatchNotifyWithDeps(deps: {
   if (digestList.length) {
     for (const item of digestList) {
       const pref = normalizePreference(prefMap.get(item.provider.id) as any);
-      const intervalMinutes = clampIntervalMinutes(pref.jobMatchDigestIntervalMinutes);
+      const intervalMinutes = clampIntervalMinutes(pref.digestIntervalMinutes);
       const last = pref.jobMatchDigestLastSentAt ? new Date(pref.jobMatchDigestLastSentAt) : null;
       const byNow = new Date(notifyNow.getTime() + intervalMinutes * 60_000);
       const byLast = last ? new Date(last.getTime() + intervalMinutes * 60_000) : byNow;

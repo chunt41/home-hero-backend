@@ -47,9 +47,9 @@ export async function processJobMatchDigestWithDeps(deps: {
   const pref = normalizePreference(prefRow as any);
 
   if (!pref.jobMatchEnabled) return;
-  if (!pref.jobMatchDigestEnabled) return;
+  if (pref.matchDeliveryMode !== "DIGEST") return;
 
-  const intervalMinutes = clampIntervalMinutes(pref.jobMatchDigestIntervalMinutes);
+  const intervalMinutes = clampIntervalMinutes(pref.digestIntervalMinutes);
   const lastSentAt = pref.jobMatchDigestLastSentAt ? new Date(pref.jobMatchDigestLastSentAt) : null;
 
   const nextIntervalAt = computeNextIntervalAt({ now, lastSentAt, intervalMinutes });

@@ -32,7 +32,8 @@ test("global error handler returns consistent JSON for sync throws", async () =>
   const json = await res.json();
 
   assert.equal(res.status, 500);
-  assert.deepEqual(json, { error: "Internal server error" });
+  assert.equal(json.error, "Internal server error");
+  assert.equal(typeof json.requestId, "string");
 
   await close();
   process.env.NODE_ENV = prev;
@@ -54,7 +55,8 @@ test("global error handler returns consistent JSON for async throws", async () =
   const json = await res.json();
 
   assert.equal(res.status, 500);
-  assert.deepEqual(json, { error: "Internal server error" });
+  assert.equal(json.error, "Internal server error");
+  assert.equal(typeof json.requestId, "string");
 
   await close();
   process.env.NODE_ENV = prev;
@@ -76,6 +78,7 @@ test("dev includes stack", async () => {
 
   assert.equal(res.status, 500);
   assert.equal(json.error, "Internal server error");
+  assert.equal(typeof json.requestId, "string");
   assert.equal(typeof json.stack, "string");
   assert.ok(json.stack.length >= 0);
 

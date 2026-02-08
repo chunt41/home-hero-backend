@@ -1,5 +1,11 @@
 import crypto from "node:crypto";
 import { prisma } from "../prisma";
+import { captureMessage } from "../observability/sentry";
+import {
+  AI_PREMIUM_MODEL_ALLOWLIST_TASK_TYPES,
+  getAiMonthlyUserAlertThresholdTokens,
+  getAiTierDefaultMonthlyTokenLimit,
+} from "./aiConfig";
 
 export type SubscriptionTierLike = "FREE" | "BASIC" | "PRO" | string;
 
@@ -12,6 +18,33 @@ export type AiTaskType =
   | "other";
 
 export type AiModel = "cheap" | "premium";
+
+export type AiTelemetryEventType = "ai.cache_hit" | "ai.provider_call" | "ai.blocked_quota";
+
+export type AiTelemetryAdapter = {
+  recordEvent: (event: {
+    type: AiTelemetryEventType;
+    userId: number;
+    monthKey: string;
+    taskType: AiTaskType;
+    model?: AiModel;
+    tier?: SubscriptionTierLike;
+    estimatedTokens?: number;
+    usedTokens?: number;
+    errorCode?: string;
+  }) => Promise<void>;
+};
+
+export type AiAlertsAdapter = {
+  alertUserMonthlyThresholdExceeded: (args: {
+    userId: number;
+    monthKey: string;
+    tier: SubscriptionTierLike;
+    thresholdTokens: number;
+    usedBefore: number;
+    usedAfter: number;
+  }) => Promise<void>;
+};
 
 export class AiQuotaExceededError extends Error {
   public readonly code = "AI_QUOTA_EXCEEDED";
@@ -42,22 +75,6 @@ function normalizeInputForCache(input: string): string {
 
 function sha256Hex(input: string): string {
   return crypto.createHash("sha256").update(input).digest("hex");
-}
-
-function getTierDefaultMonthlyLimit(tier: SubscriptionTierLike | null | undefined): number {
-  const t = String(tier ?? "FREE").toUpperCase();
-
-  const envOverride = (name: string) => {
-    const raw = process.env[name];
-    if (!raw) return null;
-    const n = Number(raw);
-    if (!Number.isFinite(n)) return null;
-    return Math.max(0, Math.floor(n));
-  };
-
-  if (t === "PRO") return envOverride("AI_TOKENS_LIMIT_PRO") ?? 250_000;
-  if (t === "BASIC") return envOverride("AI_TOKENS_LIMIT_BASIC") ?? 75_000;
-  return envOverride("AI_TOKENS_LIMIT_FREE") ?? 0;
 }
 
 function getCacheTtlMs(): number {
@@ -106,6 +123,8 @@ export function createAiGateway(deps: {
   quota: AiQuotaAdapter;
   cache: AiCacheAdapter;
   provider: AiProvider;
+  telemetry?: AiTelemetryAdapter;
+  alerts?: AiAlertsAdapter;
 }) {
   const consume = async (userId: number, estimatedTokens: number): Promise<void> => {
     const uid = Number(userId);
@@ -115,12 +134,19 @@ export function createAiGateway(deps: {
 
     const nowKey = monthKeyUtc();
 
+    let usedBefore = 0;
+    let usedAfter = 0;
+    let tier: SubscriptionTierLike = "FREE";
+
     await deps.quota.transaction(async () => {
       const user = await deps.quota.getUserAiState(uid);
       if (!user) throw new Error("User not found");
 
+      tier = user.tier ?? "FREE";
+
       const sameMonth = (user.aiUsageMonthKey ?? null) === nowKey;
       const used = sameMonth ? Number(user.aiTokensUsedThisMonth ?? 0) : 0;
+      usedBefore = used;
 
       if (!sameMonth) {
         await deps.quota.updateUserAiState(uid, {
@@ -132,7 +158,7 @@ export function createAiGateway(deps: {
       const limit =
         typeof user.aiMonthlyTokenLimit === "number"
           ? Math.max(0, Math.floor(user.aiMonthlyTokenLimit))
-          : getTierDefaultMonthlyLimit(user.tier);
+          : getAiTierDefaultMonthlyTokenLimit(user.tier);
 
       if (req === 0) return;
 
@@ -140,11 +166,25 @@ export function createAiGateway(deps: {
         throw new AiQuotaExceededError({ limit, used, requested: req });
       }
 
+      usedAfter = used + req;
+
       await deps.quota.updateUserAiState(uid, {
         aiTokensUsedThisMonth: used + req,
         aiUsageMonthKey: nowKey,
       });
     });
+
+    const threshold = getAiMonthlyUserAlertThresholdTokens();
+    if (deps.alerts && threshold && threshold > 0) {
+      void deps.alerts.alertUserMonthlyThresholdExceeded({
+        userId: uid,
+        monthKey: nowKey,
+        tier,
+        thresholdTokens: threshold,
+        usedBefore,
+        usedAfter,
+      });
+    }
   };
 
   const run = async (
@@ -153,14 +193,38 @@ export function createAiGateway(deps: {
     const taskType = args.taskType ?? "other";
     const normalizedInput = normalizeInputForCache(args.input);
     const key = sha256Hex(`${taskType}\n${normalizedInput}`);
+    const nowKey = monthKeyUtc();
 
     const cached = await deps.cache.get(key);
     if (cached && (!cached.expiresAt || cached.expiresAt.getTime() > Date.now())) {
+      if (deps.telemetry) {
+        void deps.telemetry.recordEvent({
+          type: "ai.cache_hit",
+          userId: args.userId,
+          monthKey: nowKey,
+          taskType,
+          model: cached.model,
+        });
+      }
       return { text: cached.text, cached: true, model: cached.model };
     }
 
     // Enforce quota BEFORE any provider call
-    await consume(args.userId, args.estimatedTokens);
+    try {
+      await consume(args.userId, args.estimatedTokens);
+    } catch (e: any) {
+      if (deps.telemetry && e instanceof AiQuotaExceededError) {
+        void deps.telemetry.recordEvent({
+          type: "ai.blocked_quota",
+          userId: args.userId,
+          monthKey: nowKey,
+          taskType,
+          estimatedTokens: args.estimatedTokens,
+          errorCode: e.code,
+        });
+      }
+      throw e;
+    }
 
     const state = await deps.quota.getUserAiState(args.userId);
     const tier = state?.tier ?? "FREE";
@@ -172,6 +236,19 @@ export function createAiGateway(deps: {
       prompt: args.input,
       maxOutputTokens: args.maxOutputTokens,
     });
+
+    if (deps.telemetry) {
+      void deps.telemetry.recordEvent({
+        type: "ai.provider_call",
+        userId: args.userId,
+        monthKey: nowKey,
+        taskType,
+        model: modelSel.label,
+        tier,
+        estimatedTokens: args.estimatedTokens,
+        usedTokens: typeof out.usedTokens === "number" ? out.usedTokens : undefined,
+      });
+    }
 
     const ttlMs = getCacheTtlMs();
     const expiresAt = ttlMs > 0 ? new Date(Date.now() + ttlMs) : null;
@@ -204,8 +281,7 @@ export type RunAiTaskArgs = {
 function selectModel(args: { tier: SubscriptionTierLike; taskType: AiTaskType }): { label: AiModel; sdkModel: string } {
   const tier = String(args.tier ?? "FREE").toUpperCase();
 
-  const premiumAllowlist: AiTaskType[] = ["draft.bid"];
-  const wantsPremium = premiumAllowlist.includes(args.taskType);
+  const wantsPremium = (AI_PREMIUM_MODEL_ALLOWLIST_TASK_TYPES as readonly string[]).includes(args.taskType);
 
   if (tier === "PRO" && wantsPremium) {
     return {
@@ -234,7 +310,13 @@ export async function runAiTask(
   args: RunAiTaskArgs,
   provider: AiProvider
 ): Promise<{ text: string; cached: boolean; model: AiModel }> {
-  const gateway = createAiGateway({ quota: prismaQuotaAdapter, cache: prismaCacheAdapter, provider });
+  const gateway = createAiGateway({
+    quota: prismaQuotaAdapter,
+    cache: prismaCacheAdapter,
+    provider,
+    telemetry: prismaTelemetryAdapter,
+    alerts: prismaAlertsAdapter,
+  });
   return gateway.runAiTask(args);
 }
 
@@ -337,9 +419,92 @@ const prismaCacheAdapter: AiCacheAdapter = {
   },
 };
 
+const prismaTelemetryAdapter: AiTelemetryAdapter = {
+  recordEvent: async (event) => {
+    try {
+      await prisma.securityEvent.create({
+        data: {
+          actionType: event.type,
+          actorUserId: event.userId,
+          targetType: "AI_TASK",
+          targetId: String(event.taskType),
+          metadataJson: {
+            monthKey: event.monthKey,
+            model: event.model,
+            tier: event.tier,
+            estimatedTokens: event.estimatedTokens,
+            usedTokens: event.usedTokens,
+            errorCode: event.errorCode,
+          },
+        },
+      });
+    } catch {
+      // best-effort only
+    }
+  },
+};
+
+const prismaAlertsAdapter: AiAlertsAdapter = {
+  alertUserMonthlyThresholdExceeded: async (args) => {
+    try {
+      if (!Number.isFinite(args.thresholdTokens) || args.thresholdTokens <= 0) return;
+      if (args.usedAfter < args.thresholdTokens) return;
+      if (args.usedBefore >= args.thresholdTokens) return;
+
+      const [yStr, mStr] = String(args.monthKey).split("-");
+      const y = Number(yStr);
+      const m = Number(mStr);
+      if (!Number.isFinite(y) || !Number.isFinite(m) || m < 1 || m > 12) return;
+      const start = new Date(Date.UTC(y, m - 1, 1, 0, 0, 0, 0));
+      const end = new Date(Date.UTC(y, m, 1, 0, 0, 0, 0));
+
+      const existing = await prisma.securityEvent
+        .findFirst({
+          where: {
+            actionType: "ai.user_monthly_threshold_exceeded",
+            actorUserId: args.userId,
+            createdAt: { gte: start, lt: end },
+          },
+          select: { id: true },
+        })
+        .catch(() => null);
+
+      if (existing?.id) return;
+
+      await prisma.securityEvent.create({
+        data: {
+          actionType: "ai.user_monthly_threshold_exceeded",
+          actorUserId: args.userId,
+          targetType: "USER",
+          targetId: String(args.userId),
+          metadataJson: {
+            monthKey: args.monthKey,
+            tier: String(args.tier ?? "FREE"),
+            thresholdTokens: args.thresholdTokens,
+            usedAfter: args.usedAfter,
+          },
+        },
+      });
+
+      captureMessage("AI user exceeded monthly token threshold", {
+        level: "warning",
+        userId: args.userId,
+        monthKey: args.monthKey,
+        tier: String(args.tier ?? "FREE"),
+        thresholdTokens: args.thresholdTokens,
+        usedAfter: args.usedAfter,
+      });
+    } catch {
+      // best-effort only
+    }
+  },
+};
+
 const defaultAiGateway = createAiGateway({
   quota: prismaQuotaAdapter,
   cache: prismaCacheAdapter,
+  telemetry: prismaTelemetryAdapter,
+  alerts: prismaAlertsAdapter,
   provider: {
     generateText: async () => {
       throw new Error("AI provider not configured. Use runAiTask(args, provider). ");

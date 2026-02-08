@@ -15,8 +15,13 @@ import { router } from "expo-router";
 type Prefs = {
   userId: number;
   jobMatchEnabled: boolean;
-  jobMatchDigestEnabled: boolean;
-  jobMatchDigestIntervalMinutes: number;
+  // New API fields
+  matchDeliveryMode?: "INSTANT" | "DIGEST";
+  digestIntervalMinutes?: number;
+
+  // Legacy fields (backward compat)
+  jobMatchDigestEnabled?: boolean;
+  jobMatchDigestIntervalMinutes?: number;
   bidEnabled: boolean;
   messageEnabled: boolean;
   quietHoursStart: string | null;
@@ -40,8 +45,8 @@ export default function NotificationPreferencesScreen() {
   const [error, setError] = useState<string | null>(null);
 
   const [jobMatchEnabled, setJobMatchEnabled] = useState(true);
-  const [jobMatchDigestEnabled, setJobMatchDigestEnabled] = useState(false);
-  const [jobMatchDigestIntervalMinutes, setJobMatchDigestIntervalMinutes] = useState<string>("15");
+  const [matchDeliveryMode, setMatchDeliveryMode] = useState<"INSTANT" | "DIGEST">("INSTANT");
+  const [digestIntervalMinutes, setDigestIntervalMinutes] = useState<15 | 30 | 60>(15);
   const [bidEnabled, setBidEnabled] = useState(true);
   const [messageEnabled, setMessageEnabled] = useState(true);
   const [quietStart, setQuietStart] = useState<string>("");
@@ -55,8 +60,16 @@ export default function NotificationPreferencesScreen() {
     try {
       const data = await api.get<Prefs>("/me/notification-preferences");
       setJobMatchEnabled(!!data.jobMatchEnabled);
-      setJobMatchDigestEnabled(!!data.jobMatchDigestEnabled);
-      setJobMatchDigestIntervalMinutes(String(data.jobMatchDigestIntervalMinutes ?? 15));
+
+      const mode =
+        data.matchDeliveryMode ?? (data.jobMatchDigestEnabled ? "DIGEST" : "INSTANT");
+      setMatchDeliveryMode(mode);
+
+      const intervalRaw =
+        data.digestIntervalMinutes ?? data.jobMatchDigestIntervalMinutes ?? 15;
+      const interval = intervalRaw === 30 ? 30 : intervalRaw === 60 ? 60 : 15;
+      setDigestIntervalMinutes(interval);
+
       setBidEnabled(!!data.bidEnabled);
       setMessageEnabled(!!data.messageEnabled);
       setQuietStart(data.quietHoursStart ?? "");
@@ -90,25 +103,21 @@ export default function NotificationPreferencesScreen() {
       return;
     }
 
-    const digestInterval = Number(jobMatchDigestIntervalMinutes);
-    if (jobMatchDigestEnabled) {
-      if (!Number.isFinite(digestInterval) || !Number.isInteger(digestInterval)) {
-        setSaving(false);
-        setError("Digest interval must be a whole number of minutes (e.g. 15)");
-        return;
-      }
-      if (digestInterval < 5 || digestInterval > 1440) {
-        setSaving(false);
-        setError("Digest interval must be between 5 and 1440 minutes");
-        return;
-      }
+    if (matchDeliveryMode === "DIGEST" && ![15, 30, 60].includes(digestIntervalMinutes)) {
+      setSaving(false);
+      setError("Digest interval must be 15, 30, or 60 minutes");
+      return;
     }
 
     try {
       await api.put<Prefs>("/me/notification-preferences", {
         jobMatchEnabled,
-        jobMatchDigestEnabled,
-        jobMatchDigestIntervalMinutes: jobMatchDigestEnabled ? digestInterval : undefined,
+        matchDeliveryMode,
+        digestIntervalMinutes: matchDeliveryMode === "DIGEST" ? digestIntervalMinutes : undefined,
+
+        // Legacy fields (safe to include; server will keep them in sync)
+        jobMatchDigestEnabled: matchDeliveryMode === "DIGEST",
+        jobMatchDigestIntervalMinutes: matchDeliveryMode === "DIGEST" ? digestIntervalMinutes : undefined,
         bidEnabled,
         messageEnabled,
         quietHoursStart: bothEmpty ? null : start,
@@ -167,40 +176,75 @@ export default function NotificationPreferencesScreen() {
               }}
             >
               <Row label="Job matches" value={jobMatchEnabled} onChange={setJobMatchEnabled} />
-              <Row
-                label="Job match digest"
-                value={jobMatchDigestEnabled}
-                onChange={setJobMatchDigestEnabled}
-              />
 
-              {jobMatchDigestEnabled ? (
-                <View style={{ gap: 6 }}>
-                  <Text style={{ color: "#cbd5e1", fontWeight: "800" }}>
-                    Digest interval (minutes)
-                  </Text>
-                  <TextInput
-                    value={jobMatchDigestIntervalMinutes}
-                    onChangeText={setJobMatchDigestIntervalMinutes}
-                    placeholder="15"
-                    placeholderTextColor="#64748b"
-                    keyboardType="number-pad"
-                    autoCapitalize="none"
-                    autoCorrect={false}
-                    style={{
-                      backgroundColor: "#020617",
-                      borderColor: "#1e293b",
+              <View style={{ gap: 8, marginTop: 6 }}>
+                <Text style={{ color: "#cbd5e1", fontWeight: "800" }}>Job match delivery</Text>
+                <View style={{ flexDirection: "row", gap: 10 }}>
+                  <Pressable
+                    onPress={() => setMatchDeliveryMode("INSTANT")}
+                    style={({ pressed }) => ({
+                      flex: 1,
+                      padding: 12,
+                      borderRadius: 12,
                       borderWidth: 1,
-                      padding: 10,
-                      borderRadius: 10,
-                      color: "#e2e8f0",
-                      fontWeight: "800",
-                    }}
-                  />
-                  <Text style={{ color: "#94a3b8" }}>
-                    We’ll group job matches and send one summary.
-                  </Text>
+                      borderColor: matchDeliveryMode === "INSTANT" ? "#38bdf8" : "#1e293b",
+                      backgroundColor: pressed ? "#0b1220" : "#020617",
+                      alignItems: "center",
+                    })}
+                  >
+                    <Text style={{ color: "#e2e8f0", fontWeight: "900" }}>Instant</Text>
+                    <Text style={{ color: "#94a3b8", marginTop: 2, fontSize: 12 }}>One per match</Text>
+                  </Pressable>
+
+                  <Pressable
+                    onPress={() => setMatchDeliveryMode("DIGEST")}
+                    style={({ pressed }) => ({
+                      flex: 1,
+                      padding: 12,
+                      borderRadius: 12,
+                      borderWidth: 1,
+                      borderColor: matchDeliveryMode === "DIGEST" ? "#38bdf8" : "#1e293b",
+                      backgroundColor: pressed ? "#0b1220" : "#020617",
+                      alignItems: "center",
+                    })}
+                  >
+                    <Text style={{ color: "#e2e8f0", fontWeight: "900" }}>Digest</Text>
+                    <Text style={{ color: "#94a3b8", marginTop: 2, fontSize: 12 }}>Batch into summary</Text>
+                  </Pressable>
                 </View>
-              ) : null}
+
+                {matchDeliveryMode === "DIGEST" ? (
+                  <View style={{ gap: 8, marginTop: 6 }}>
+                    <Text style={{ color: "#cbd5e1", fontWeight: "800" }}>Digest interval</Text>
+                    <View style={{ flexDirection: "row", gap: 10 }}>
+                      {[15, 30, 60].map((m) => {
+                        const selected = digestIntervalMinutes === m;
+                        return (
+                          <Pressable
+                            key={String(m)}
+                            onPress={() => setDigestIntervalMinutes(m as any)}
+                            style={({ pressed }) => ({
+                              flex: 1,
+                              padding: 10,
+                              borderRadius: 12,
+                              borderWidth: 1,
+                              borderColor: selected ? "#38bdf8" : "#1e293b",
+                              backgroundColor: pressed ? "#0b1220" : "#020617",
+                              alignItems: "center",
+                            })}
+                          >
+                            <Text style={{ color: "#e2e8f0", fontWeight: "900" }}>{m}m</Text>
+                          </Pressable>
+                        );
+                      })}
+                    </View>
+                    <Text style={{ color: "#94a3b8" }}>
+                      We’ll group job matches and send one summary per interval.
+                    </Text>
+                  </View>
+                ) : null}
+              </View>
+
               <Row label="New bids" value={bidEnabled} onChange={setBidEnabled} />
               <Row label="Messages" value={messageEnabled} onChange={setMessageEnabled} />
             </View>

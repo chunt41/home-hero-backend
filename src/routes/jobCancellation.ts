@@ -3,6 +3,7 @@ import { z } from "zod";
 
 import { canCancelJob } from "../services/jobFlowGuards";
 import { cancellationReasonLabel } from "../services/jobCancellationReasons";
+import { logger } from "../services/logger";
 
 type UserRole = "CONSUMER" | "PROVIDER" | "ADMIN";
 
@@ -257,7 +258,7 @@ export function createPostJobCancelHandler(deps: {
         },
       });
     } catch (err) {
-      console.error("POST /jobs/:jobId/cancel error:", err);
+      logger.error("jobs.cancel_error", { message: String((err as any)?.message ?? err) });
       return res.status(500).json({ error: "Internal server error while cancelling job." });
     }
   };

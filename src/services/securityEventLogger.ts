@@ -119,7 +119,11 @@ export async function logSecurityEvent(
   metadata: SecurityEventMetadata = {}
 ): Promise<void> {
   try {
-    const { reserved, cleaned } = pickReserved(metadata);
+    const requestId = (req as any).requestId ?? (req as any).id;
+    const withCorrelation: SecurityEventMetadata =
+      requestId && typeof metadata?.requestId !== "string" ? { ...metadata, requestId } : metadata;
+
+    const { reserved, cleaned } = pickReserved(withCorrelation);
 
     const actorUserId =
       typeof reserved.actorUserId === "number"

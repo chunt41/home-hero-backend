@@ -1,4 +1,5 @@
 import type { NextFunction, Request, Response } from "express";
+import crypto from "node:crypto";
 
 type LoggerLike = {
   error: (event: string, meta?: Record<string, any>) => void;
@@ -40,8 +41,17 @@ export function createGlobalErrorHandler(deps?: {
     let status = getStatus(err);
     if (rawMessage === "CORS blocked") status = 403;
 
+    const requestId = (req as any).requestId ?? (req as any).id ?? crypto.randomUUID();
+
+    try {
+      res.setHeader("X-Request-Id", requestId);
+    } catch {
+      // ignore
+    }
+
     deps?.logger?.error?.("http.error", {
-      reqId: (req as any).id,
+      requestId,
+      reqId: requestId,
       route: String((req as any).originalUrl ?? req.url ?? ""),
       method: req.method,
       status,
@@ -50,7 +60,8 @@ export function createGlobalErrorHandler(deps?: {
     });
 
     deps?.captureException?.(err, {
-      reqId: (req as any).id,
+      requestId,
+      reqId: requestId,
       route: String((req as any).originalUrl ?? req.url ?? ""),
       method: req.method,
       status,
@@ -59,7 +70,7 @@ export function createGlobalErrorHandler(deps?: {
 
     const safeMessage = status >= 500 ? "Internal server error" : scrub(rawMessage || "Request failed");
 
-    const body: any = { error: safeMessage };
+    const body: any = { error: safeMessage, requestId };
     if (!isProd) {
       body.stack = scrub(String(err?.stack ?? ""));
     }

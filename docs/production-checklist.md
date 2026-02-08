@@ -13,21 +13,30 @@ Set these on the Railway service (do **not** commit to git):
 - `STRIPE_WEBHOOK_SECRET` (must be `whsec_...`)
 - `CORS_ORIGINS` (your real origins, comma-separated)
 
-Optional but recommended production guardrails:
+AI (optional, recommended if AI features are enabled):
 
-- Object storage for attachments (required in `NODE_ENV=production`):
-  - `OBJECT_STORAGE_PROVIDER=s3`
-  - `OBJECT_STORAGE_S3_BUCKET`
-  - `OBJECT_STORAGE_S3_REGION`
-  - `OBJECT_STORAGE_S3_ACCESS_KEY_ID`
-  - `OBJECT_STORAGE_S3_SECRET_ACCESS_KEY`
-  - `OBJECT_STORAGE_S3_ENDPOINT` (optional; required for Cloudflare R2)
-  - `OBJECT_STORAGE_S3_FORCE_PATH_STYLE` (optional)
-  - `ATTACHMENTS_SIGNED_URL_TTL_SECONDS` (optional; default `300`)
+- `AI_CACHE_TTL_DAYS` (default `30`)
+- `AI_TOKENS_LIMIT_FREE` (default `0`)
+- `AI_TOKENS_LIMIT_BASIC` (default `2000`)
+- `AI_TOKENS_LIMIT_PRO` (default `5000`)
+- `AI_MONTHLY_USER_ALERT_THRESHOLD_TOKENS` (optional; alerts on heavy users)
+- `AI_MODEL_CHEAP` (default `gpt-4o-mini`)
+- `AI_MODEL_PREMIUM` (default `gpt-4o`)
 
-  Recommended bucket policy:
-  - Keep the bucket **private** (block all public access).
-  - Serve attachments via short-lived **pre-signed URLs** only.
+Attachments object storage (required in `NODE_ENV=production`):
+
+- `OBJECT_STORAGE_PROVIDER=s3`
+- `OBJECT_STORAGE_S3_BUCKET`
+- `OBJECT_STORAGE_S3_REGION`
+- `OBJECT_STORAGE_S3_ACCESS_KEY_ID`
+- `OBJECT_STORAGE_S3_SECRET_ACCESS_KEY`
+- `OBJECT_STORAGE_S3_ENDPOINT` (optional; required for Cloudflare R2)
+- `OBJECT_STORAGE_S3_FORCE_PATH_STYLE` (optional)
+- `ATTACHMENTS_SIGNED_URL_TTL_SECONDS` (optional; default `300`)
+
+Recommended bucket policy:
+- Keep the bucket **private** (block all public access).
+- Serve attachments via short-lived **pre-signed URLs** only.
 
 ### 1b) Migrate legacy disk uploads to object storage
 

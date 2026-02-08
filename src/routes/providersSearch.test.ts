@@ -262,3 +262,51 @@ test("GET /providers/search cursor pagination returns stable continuation", asyn
   const secondId = secondBody.items[0].id;
   assert.notEqual(secondId, firstId);
 });
+
+test("GET /providers/search returns sanitized whyShown (no raw scoreBreakdown for consumers)", async (t) => {
+  const prev = process.env.RATE_LIMIT_REDIS_URL;
+  process.env.RATE_LIMIT_REDIS_URL = "";
+  t.after(() => {
+    process.env.RATE_LIMIT_REDIS_URL = prev;
+  });
+
+  const prisma = makePrismaStub({
+    profiles: [
+      makeProfile({
+        providerId: 50,
+        location: "San Francisco, CA 94105",
+        avgRating: 4.6,
+        ratingCount: 12,
+        verificationStatus: "VERIFIED",
+        tier: "PRO",
+        medianResponseTimeSeconds30d: 180,
+      }),
+    ],
+  });
+
+  const app = express();
+  app.use((req, _res, next) => {
+    (req as any).user = { userId: 1, role: "CONSUMER" };
+    next();
+  });
+  app.get("/providers/search", createGetProvidersSearchHandler({ prisma: prisma as any }));
+
+  const { server, baseUrl } = await listen(app);
+  t.after(() => server.close());
+
+  const res = await fetch(`${baseUrl}/providers/search?zip=94105&radiusMiles=25&limit=10`);
+  assert.equal(res.status, 200);
+  const body: any = await res.json();
+
+  assert.equal(body.items.length, 1);
+  const item = body.items[0];
+
+  assert.ok(item.whyShown);
+  assert.equal(item.whyShown.isVerified, true);
+  assert.equal(item.whyShown.rating, 4.6);
+  assert.equal(item.whyShown.ratingCount, 12);
+  assert.equal(item.whyShown.responseTimeSeconds30d, 180);
+  assert.ok(String(item.whyShown.tierBoost).toLowerCase().includes("pro"));
+
+  assert.equal(item.scoreBreakdown, undefined);
+});

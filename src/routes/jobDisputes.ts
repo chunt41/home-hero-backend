@@ -2,6 +2,7 @@ import type { Request, Response } from "express";
 import { z } from "zod";
 
 import { canOpenDispute } from "../services/jobFlowGuards";
+import { logger } from "../services/logger";
 
 type UserRole = "CONSUMER" | "PROVIDER" | "ADMIN";
 
@@ -190,7 +191,7 @@ export function createPostJobDisputesHandler(deps: {
 
       return res.status(201).json({ dispute });
     } catch (err) {
-      console.error("POST /jobs/:jobId/disputes error:", err);
+      logger.error("jobs.disputes_open_error", { message: String((err as any)?.message ?? err) });
       return res.status(500).json({ error: "Internal server error while opening dispute." });
     }
   };
@@ -340,7 +341,7 @@ export function createPostAdminResolveDisputeHandler(deps: {
 
       return res.json({ dispute: updatedDispute, job: updatedJob });
     } catch (err) {
-      console.error("POST /admin/disputes/:id/resolve error:", err);
+      logger.error("admin.disputes_resolve_error", { message: String((err as any)?.message ?? err) });
       return res.status(500).json({ error: "Internal server error while resolving dispute." });
     }
   };

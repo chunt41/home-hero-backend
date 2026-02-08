@@ -186,7 +186,13 @@ export default function ProviderJobDetailScreen() {
 
   const canOpenDispute = useMemo(() => {
     if (!job) return false;
-    if (job.status !== "COMPLETED" && job.status !== "COMPLETED_PENDING_CONFIRMATION") return false;
+    if (
+      job.status !== "IN_PROGRESS" &&
+      job.status !== "COMPLETED" &&
+      job.status !== "COMPLETED_PENDING_CONFIRMATION"
+    ) {
+      return false;
+    }
     return myBid?.status === "ACCEPTED";
   }, [job, myBid?.status]);
 

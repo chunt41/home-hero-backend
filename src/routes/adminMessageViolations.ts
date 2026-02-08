@@ -1,4 +1,5 @@
 import type { Request, Response } from "express";
+import { logger } from "../services/logger";
 
 function parsePositiveInt(v: unknown, fallback: number): number {
   const n = typeof v === "string" ? Number(v) : Array.isArray(v) ? Number(v[0]) : Number(v);
@@ -89,7 +90,9 @@ export function createGetAdminMessageViolationsHandler(params: {
         }),
       });
     } catch (err) {
-      console.error("GET /admin/messages/violations error:", err);
+      logger.error("admin.messages.violations_error", {
+        message: String((err as any)?.message ?? err),
+      });
       return res.status(500).json({ error: "Internal server error while fetching violations." });
     }
   };

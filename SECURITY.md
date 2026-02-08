@@ -131,6 +131,67 @@ Admins can review repeated violators via:
 
 This endpoint aggregates `message.blocked` events within the requested window and returns user details for moderation workflows.
 
+## AI margin protection (quotas + model routing)
+
+This backend includes guardrails to keep AI features profitable (especially at the $15 PRO tier).
+
+### Tier default quotas (central config)
+
+Tier defaults are centrally defined in [src/ai/aiConfig.ts](src/ai/aiConfig.ts):
+
+- FREE: `0` tokens / month
+- BASIC: `2000` tokens / month
+- PRO: `5000` tokens / month
+
+Operators can override defaults via env vars:
+
+- `AI_TOKENS_LIMIT_FREE`
+- `AI_TOKENS_LIMIT_BASIC`
+- `AI_TOKENS_LIMIT_PRO`
+
+### Cache-first behavior
+
+The AI gateway is cache-first: a cache hit returns immediately and **never** consumes monthly quota.
+
+### Cheap-by-default model selection
+
+Model routing is cheap-by-default: the premium model is only used for explicitly allowlisted “high value” tasks *and* only for PRO users.
+
+The premium allowlist is centrally defined in [src/ai/aiConfig.ts](src/ai/aiConfig.ts).
+
+### Telemetry (SecurityEvent)
+
+The gateway emits `SecurityEvent.actionType` values for ops visibility:
+
+- `ai.cache_hit`
+- `ai.provider_call`
+- `ai.blocked_quota`
+- `ai.user_monthly_threshold_exceeded` (see alerts below)
+
+Note: `SecurityEvent` metadata is scrubbed to avoid storing secrets/tokens.
+
+### Admin metrics endpoint
+
+Admins can query aggregate AI usage via:
+
+- `GET /admin/ai/metrics`
+
+Returns:
+
+- `tokensUsedPerTier`
+- `cacheHitRatio`
+- `topCostUsers` (ranked by tokens used)
+- `blockedCallsCount`
+
+### Monthly heavy-user alert
+
+Set `AI_MONTHLY_USER_ALERT_THRESHOLD_TOKENS` to emit an alert when a single user crosses a monthly token threshold.
+
+Behavior:
+
+- Logs one `SecurityEvent` (`ai.user_monthly_threshold_exceeded`) per user per UTC month (first crossing only).
+- Emits a Sentry warning (if `SENTRY_DSN` is configured).
+
 ## Admin operational UIs (web)
 
 This backend serves a small number of **single-file HTML admin dashboards** (no separate frontend build) intended for rapid ops triage.

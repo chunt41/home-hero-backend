@@ -4,6 +4,7 @@ import { authMiddleware } from "../middleware/authMiddleware";
 import { z } from "zod";
 import { validate } from "../middleware/validate";
 import { createAsyncRouter } from "../middleware/asyncWrap";
+import { logger } from "../services/logger";
 
 const router = createAsyncRouter(express);
 
@@ -30,7 +31,7 @@ router.get("/me", authMiddleware, async (req, res) => {
 
     res.json(payouts);
   } catch (error: any) {
-    console.error("Error fetching payouts:", error);
+    logger.error("payouts.fetch_error", { message: String(error?.message ?? error) });
     res.status(500).json({ error: error.message });
   }
 });
@@ -110,7 +111,7 @@ router.post("/request", authMiddleware, validate(requestPayoutSchema), async (re
       payout,
     });
   } catch (error: any) {
-    console.error("Payout request error:", error);
+    logger.error("payouts.request_error", { message: String(error?.message ?? error) });
     res.status(500).json({ error: error.message });
   }
 });

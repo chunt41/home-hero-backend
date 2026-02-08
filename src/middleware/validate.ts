@@ -34,6 +34,8 @@ export function validate<S extends SchemaBundle>(schemas: S): RequestHandler {
   return (req: Request, res: Response, next: NextFunction) => {
     const details: Array<{ path: (string | number)[]; message: string; code: string }> = [];
 
+    const requestId = (req as any).requestId ?? (req as any).id;
+
     const validated: any = {
       body: req.body,
       query: req.query,
@@ -59,7 +61,7 @@ export function validate<S extends SchemaBundle>(schemas: S): RequestHandler {
     }
 
     if (details.length) {
-      return res.status(400).json({ error: "Validation failed", details });
+      return res.status(400).json({ error: "Validation failed", requestId, details });
     }
 
     (req as any).validated = validated;

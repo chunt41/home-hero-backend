@@ -1,3 +1,5 @@
+import { getLogContext } from "./logContext";
+
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
 type LogFields = Record<string, unknown>;
@@ -7,10 +9,24 @@ function nowIso(): string {
 }
 
 function write(level: LogLevel, message: string, fields?: LogFields) {
+  const ctx = getLogContext();
+
+  const ctxFields: LogFields = {
+    ...(ctx?.requestId ? { requestId: ctx.requestId, reqId: ctx.requestId } : {}),
+    ...(ctx?.method ? { method: ctx.method } : {}),
+    ...(ctx?.path ? { path: ctx.path } : {}),
+    ...(typeof ctx?.userId === "number" ? { userId: ctx.userId } : {}),
+    ...(typeof ctx?.jobId === "number" ? { jobId: ctx.jobId } : {}),
+    ...(typeof ctx?.jobType === "string" ? { jobType: ctx.jobType } : {}),
+    ...(typeof ctx?.webhookDeliveryId === "number" ? { webhookDeliveryId: ctx.webhookDeliveryId } : {}),
+    ...(typeof ctx?.webhookAttemptId === "number" ? { webhookAttemptId: ctx.webhookAttemptId } : {}),
+  };
+
   const line = {
     timestamp: nowIso(),
     level,
     message,
+    ...ctxFields,
     ...(fields ?? {}),
   };
 

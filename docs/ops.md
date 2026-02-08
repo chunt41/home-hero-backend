@@ -32,6 +32,51 @@ If `SENTRY_DSN` is set, Sentry is initialized and:
 Env vars:
 - `SENTRY_DSN` (optional)
 
+## AI guardrails + metrics
+
+This backend includes AI quota and model-routing guardrails to keep AI features profitable.
+
+### Defaults and overrides
+
+Default monthly token quotas are defined centrally in [src/ai/aiConfig.ts](../src/ai/aiConfig.ts).
+
+Operators can override via env vars:
+
+- `AI_TOKENS_LIMIT_FREE`
+- `AI_TOKENS_LIMIT_BASIC`
+- `AI_TOKENS_LIMIT_PRO`
+
+### Cache-first
+
+AI calls are cache-first: cache hits return immediately and do **not** consume quota.
+
+### Admin metrics endpoint
+
+- `GET /admin/ai/metrics` (admin-only)
+
+Returns tokens used per tier, cache hit ratio, top cost users, and blocked calls.
+
+Tip: pass `monthKey=YYYY-MM` to inspect a specific month.
+
+### Telemetry (SecurityEvent)
+
+The AI gateway emits best-effort counters as `SecurityEvent.actionType`:
+
+- `ai.cache_hit`
+- `ai.provider_call`
+- `ai.blocked_quota`
+
+These allow computing cache hit ratio and blocked-call counts even without a metrics backend.
+
+### Heavy-user alert (optional)
+
+Set `AI_MONTHLY_USER_ALERT_THRESHOLD_TOKENS` (positive integer) to alert when a single user crosses a monthly token threshold.
+
+Behavior:
+
+- Writes a `SecurityEvent` `ai.user_monthly_threshold_exceeded` (first crossing per user per UTC month).
+- Emits a Sentry warning if `SENTRY_DSN` is configured.
+
 ## Health endpoints
 
 - `GET /healthz` → always returns 200 `{ ok: true }`

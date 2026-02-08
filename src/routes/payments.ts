@@ -16,6 +16,7 @@ import { logSecurityEvent } from "../services/securityEventLogger";
 import { createAsyncRouter } from "../middleware/asyncWrap";
 import { recordStripeWebhookEventOnce } from "../services/billing/stripeWebhookIdempotency";
 import crypto from "node:crypto";
+import { logger } from "../services/logger";
 
 const router = createAsyncRouter(express);
 
@@ -35,6 +36,7 @@ export function createStripeWebhookHandler(deps?: {
   const webhookSecret = deps?.webhookSecret ?? env.STRIPE_WEBHOOK_SECRET;
 
   return async (req: any, res: any) => {
+    const requestId = req?.requestId ?? req?.id;
     try {
       const sig = req.headers["stripe-signature"];
 
@@ -42,7 +44,7 @@ export function createStripeWebhookHandler(deps?: {
         await logSecurityEventImpl(req, "payment.webhook_failed", {
           reason: "missing_signature",
         });
-        return res.status(400).json({ error: "Missing stripe signature" });
+        return res.status(400).json({ error: "Missing stripe signature", requestId });
       }
 
       if (!webhookSecret) {
@@ -51,6 +53,7 @@ export function createStripeWebhookHandler(deps?: {
         });
         return res.status(500).json({
           error: "Stripe webhook secret not configured (set STRIPE_WEBHOOK_SECRET)",
+          requestId,
         });
       }
 
@@ -130,12 +133,15 @@ export function createStripeWebhookHandler(deps?: {
 
       return res.json({ received: true });
     } catch (error: any) {
-      console.error("Webhook error:", error);
+      logger.error("payment.webhook_exception", {
+        requestId,
+        message: String(error?.message ?? error),
+      });
       await logSecurityEventImpl(req, "payment.webhook_failed", {
         reason: "exception",
         message: String(error?.message ?? error),
       });
-      return res.status(400).json({ error: error.message });
+      return res.status(400).json({ error: String(error?.message ?? "Webhook error"), requestId });
     }
   };
 }
@@ -199,7 +205,7 @@ export function createConfirmPaymentHandler(deps?: {
         note: "Entitlements are applied via Stripe webhooks.",
       });
     } catch (error: any) {
-      console.error("Payment confirmation error:", error);
+      logger.error("payment.confirm_error", { message: String(error?.message ?? error) });
       return res.status(500).json({ error: error.message });
     }
   };
@@ -282,7 +288,7 @@ router.post(
       paymentIntentId,
     });
   } catch (error: any) {
-    console.error("Payment intent error:", error);
+      logger.error("payment.create_intent_error", { message: String(error?.message ?? error) });
     res.status(500).json({ error: error.message });
   }
 });

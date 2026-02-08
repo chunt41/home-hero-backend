@@ -60,9 +60,14 @@ import {
   createPostJobDisputesHandler,
 } from "./routes/jobDisputes";
 import { requestIdMiddleware, httpAccessLogMiddleware } from "./middleware/observability";
-import { initSentry, captureException, flushSentry } from "./observability/sentry";
+import { attachRequestIdToErrorJsonMiddleware } from "./middleware/attachRequestIdToErrorJson";
+import { initSentry, captureException, flushSentry, setSentryRequestTags } from "./observability/sentry";
 import { classifyJob } from "./services/jobClassifier";
 import { suggestJobPrice } from "./services/jobPriceSuggester";
+import {
+  createPostJobAttachmentUploadHandler,
+  createPostVerificationAttachmentUploadHandler,
+} from "./routes/attachmentUploadHandlers";
 import {
   assessJobPostRisk,
   assessRepeatedBidMessageRisk,
@@ -71,6 +76,14 @@ import {
   RISK_REVIEW_THRESHOLD,
 } from "./services/riskScoring";
 import { moderateJobMessageSend } from "./services/jobMessageSendModeration";
+import {
+  decideRestrictionFromRecentSecurityEvents,
+} from "./safety/policy";
+import {
+  jobWhereVisible as jobWhereVisibleSafety,
+  messageWhereVisible as messageWhereVisibleSafety,
+  userWhereVisible as userWhereVisibleSafety,
+} from "./safety/visibility";
 import { computeNewUploadTargets } from "./services/objectStorageUploads";
 import { z } from "zod";
 import { validate, type Validated, type ValidatedRequest } from "./middleware/validate";
@@ -79,6 +92,12 @@ import { patchAppForAsyncErrors } from "./middleware/asyncWrap";
 import { createGlobalErrorHandler } from "./middleware/globalErrorHandler";
 import { createBasicAuthForAdminUi, createRequireAdminUiEnabled } from "./routes/adminWebhooksUiGuard";
 import { createGetAdminOpsKpisHandler } from "./routes/adminOpsKpis";
+import { createGetAdminOpsSafetyEventsHandler } from "./routes/adminOpsSafetyEvents";
+import { createGetAdminAiMetricsHandler } from "./routes/adminAiMetrics";
+import {
+  createGetAdminOpsMatchDeadlettersHandler,
+  createGetAdminOpsWebhookDeadlettersHandler,
+} from "./routes/adminOpsDeadletters";
 import { normalizeZipForBoost } from "./services/providerDiscoveryRanking";
 import { extractZip5, rankProvider } from "./matching/rankProviders";
 import zipcodes from "zipcodes";
@@ -197,6 +216,15 @@ app.set("trust proxy", true);
 const PORT = env.PORT;
 const JWT_SECRET = env.JWT_SECRET;
 
+function errToString(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  return String((err as any)?.message ?? err);
+}
+
+function logServerError(message: string, err: unknown, fields?: Record<string, unknown>): void {
+  logger.error(message, { ...(fields ?? {}), error: errToString(err) });
+}
+
 const objectStorageProviderName = getObjectStorageProviderName();
 const attachmentStorageProvider = objectStorageProviderName === "s3" ? getStorageProviderOrThrow() : undefined;
 const attachmentsSignedUrlTtlSeconds = getAttachmentSignedUrlTtlSeconds();
@@ -223,7 +251,14 @@ app.use(helmet.xContentTypeOptions());
 
 // Request context (req.id + X-Request-Id) and access logs
 app.use(requestIdMiddleware);
+app.use((req, _res, next) => {
+  const requestId = (req as any).requestId ?? (req as any).id;
+  const route = `${req.method} ${(req as any).originalUrl ?? req.url ?? req.path}`;
+  setSentryRequestTags({ requestId, route });
+  next();
+});
 app.use(httpAccessLogMiddleware);
+app.use(attachRequestIdToErrorJsonMiddleware);
 
 // Scoped app attestation enforcement (no-op unless APP_ATTESTATION_ENFORCE=true)
 enforceAttestationForSensitiveRoutes(app);
@@ -458,7 +493,7 @@ function uploadSingleAttachment(req: any, res: any, next: any) {
       return res.status(415).json({ error: msg });
     }
 
-    console.error("Upload attachment middleware error:", err);
+    logServerError("Upload attachment middleware error", err);
     return res.status(400).json({
       error: "Invalid attachment upload.",
     });
@@ -501,7 +536,7 @@ function uploadSingleVerificationAttachment(req: any, res: any, next: any) {
       return res.status(415).json({ error: msg });
     }
 
-    console.error("Upload verification attachment middleware error:", err);
+    logServerError("Upload verification attachment middleware error", err);
     return res.status(400).json({
       error: "Invalid verification attachment upload.",
     });
@@ -746,7 +781,7 @@ async function createNotification(params: {
       },
     });
   } catch (err) {
-    console.error("Error creating notification:", err);
+    logServerError("Error creating notification", err);
     // We don't throw, because we don't want a notification failure
     // to break the main action (placing a bid, sending a message, etc.)
   }
@@ -909,7 +944,7 @@ async function enqueueWebhookEvent(args: { eventType: string; payload: Record<st
 
     console.log("[WEBHOOK deliveries created]", endpoints.length); // ✅ TEMP
   } catch (err) {
-    console.error("Failed to enqueue webhook event:", eventType, err);
+    logServerError("Failed to enqueue webhook event", err, { eventType });
   }
 }
 
@@ -1105,7 +1140,7 @@ app.get("/admin/ai-usage", authMiddleware, async (req: AuthRequest, res: Respons
       });
     }
 
-    console.error("GET /admin/ai-usage error:", err);
+    logServerError("GET /admin/ai-usage error", err);
     return res.status(500).json({ error: "Internal server error." });
   }
 });
@@ -1136,31 +1171,10 @@ function isAdmin(req: AuthRequest) {
 }
 
 function visibilityFilters(req: AuthRequest) {
-  // Only restrict visibility for non-admins
-  if (isAdmin(req)) {
-    return {
-      userWhereVisible: {},
-      jobWhereVisible: {},
-      messageWhereVisible: {},
-    };
-  }
-
   return {
-    // Users visible to the public
-    userWhereVisible: {
-      isSuspended: false,
-    },
-
-    // Jobs visible to the public
-    jobWhereVisible: {
-      isHidden: false,
-      consumer: { isSuspended: false },
-    },
-
-    // Messages visible to the public
-    messageWhereVisible: {
-      isHidden: false,
-    },
+    userWhereVisible: userWhereVisibleSafety(req as any),
+    jobWhereVisible: jobWhereVisibleSafety(req as any),
+    messageWhereVisible: messageWhereVisibleSafety(req as any),
   };
 }
 
@@ -1253,7 +1267,7 @@ app.get("/categories", async (req: Request, res: Response) => {
       }))
     );
   } catch (err) {
-    console.error("GET /categories error:", err);
+    logServerError("GET /categories error", err);
     return res.status(500).json({
       error: "Internal server error while fetching categories.",
     });
@@ -1267,7 +1281,7 @@ app.post("/dev/seed-categories", validate({}), async (req: Request, res: Respons
     await seedCategories();
     return res.json({ message: "Categories seeded." });
   } catch (err) {
-    console.error("seedCategories error:", err);
+    logServerError("seedCategories error", err);
     return res.status(500).json({ error: "Failed to seed categories." });
   }
 });
@@ -1327,7 +1341,7 @@ app.get("/me", authAllowSuspended, async (req: AuthRequest, res: Response) => {
         : null,
     });
   } catch (err) {
-    console.error("GET /me error:", err);
+    logServerError("GET /me error", err);
     return res.status(500).json({ error: "Internal server error while fetching /me." });
   }
 });
@@ -1370,7 +1384,7 @@ app.post(
 
       return res.json({ ok: true, stored: true });
     } catch (err) {
-      console.error("POST /me/push-token error:", err);
+      logServerError("POST /me/push-token error", err);
       return res.status(500).json({ error: "Internal server error while saving push token." });
     }
   }
@@ -1460,7 +1474,7 @@ async function handleGetSubscription(req: AuthRequest, res: Response) {
           : null,
     });
   } catch (err) {
-    console.error("GET /subscription error:", err);
+    logServerError("GET /subscription error", err);
     return res
       .status(500)
       .json({ error: "Internal server error while fetching subscription." });
@@ -1537,7 +1551,7 @@ app.post(
 
       return res.json({ clientSecret, paymentIntentId });
     } catch (err: any) {
-      console.error("POST /provider/addons/purchase error:", err);
+      logServerError("POST /provider/addons/purchase error", err);
       return res.status(500).json({ error: "Internal server error while creating add-on purchase intent." });
     }
   }
@@ -1582,7 +1596,7 @@ app.post(
           "Subscription changes are only applied by Stripe webhooks. Use /payments/create-intent and complete payment, then rely on webhook processing.",
       });
     } catch (err) {
-      console.error("POST /subscription/upgrade error:", err);
+      logServerError("POST /subscription/upgrade error", err);
       return res
         .status(500)
         .json({ error: "Internal server error while upgrading subscription." });
@@ -1619,7 +1633,7 @@ app.post(
           "Subscription changes are only applied by Stripe webhooks. Downgrades/cancellations must be processed via Stripe and reflected by webhook updates.",
       });
     } catch (err) {
-      console.error("POST /subscription/downgrade error:", err);
+      logServerError("POST /subscription/downgrade error", err);
       return res
         .status(500)
         .json({ error: "Internal server error while downgrading subscription." });
@@ -1653,7 +1667,7 @@ app.get(
         }))
       );
     } catch (err) {
-      console.error("GET /payments/subscriptions error:", err);
+      logServerError("GET /payments/subscriptions error", err);
       return res.status(500).json({
         error: "Internal server error while fetching subscription payments.",
       });
@@ -1789,9 +1803,13 @@ app.post(
         emailVerified: Boolean(user.emailVerifiedAt),
       },
       needsEmailVerification: !user.emailVerifiedAt,
+      ...(process.env.NODE_ENV !== "production" &&
+      String(process.env.EXPOSE_EMAIL_VERIFICATION_TOKEN || "").trim() === "1"
+        ? { debugEmailVerificationToken: verifyToken }
+        : {}),
     });
   } catch (err) {
-    console.error("Signup error:", err);
+    logServerError("Signup error", err);
     return res.status(500).json({ error: "Internal server error during signup." });
   }
 });
@@ -1845,7 +1863,7 @@ app.post(
 
     return res.json({ ok: true, emailVerifiedAt: updated.emailVerifiedAt });
   } catch (err) {
-    console.error("Verify email error:", err);
+    logServerError("Verify email error", err);
     return res.status(500).json({ error: "Internal server error during email verification." });
   }
 });
@@ -1940,7 +1958,7 @@ app.post(
 
     return res.json({ ok: true });
   } catch (err) {
-    console.error("Forgot password error:", err);
+    logServerError("Forgot password error", err);
     return res.status(500).json({ error: "Internal server error during forgot password." });
   }
 });
@@ -1998,7 +2016,7 @@ app.post(
 
     return res.json({ ok: true });
   } catch (err) {
-    console.error("Reset password error:", err);
+    logServerError("Reset password error", err);
     return res.status(500).json({ error: "Internal server error during reset password." });
   }
 });
@@ -2063,7 +2081,7 @@ app.post(
         suggestion,
       });
     } catch (err) {
-      console.error("POST /jobs/suggest-price error:", err);
+      logServerError("POST /jobs/suggest-price error", err);
       return res
         .status(500)
         .json({ error: "Internal server error while suggesting a price range." });
@@ -2151,12 +2169,34 @@ app.post(
     let reviewRequired = false;
     let restrictedUntil: Date | null = null;
     try {
+      const hasJobSpamSignal = risk.signals?.some((s: any) => s.code === "TOO_MANY_JOBS");
+      if (hasJobSpamSignal) {
+        await logSecurityEvent(req, "job.spam_signal", {
+          targetType: "JOB",
+          targetId: job.id,
+          jobId: job.id,
+          consumerId: req.user.userId,
+          riskTotalScore: risk.totalScore,
+          riskSignals: risk.signals,
+        });
+      }
+
       if (risk.totalScore >= RISK_REVIEW_THRESHOLD) {
         reviewRequired = true;
         // Hide from public browse; consumer can still view their own.
         await prisma.job.update({
           where: { id: job.id },
           data: { isHidden: true, hiddenAt: new Date() },
+        });
+
+        await logSecurityEvent(req, "job.shadow_hidden", {
+          targetType: "JOB",
+          targetId: job.id,
+          jobId: job.id,
+          consumerId: req.user.userId,
+          reason: "risk_review_threshold",
+          riskTotalScore: risk.totalScore,
+          riskSignals: risk.signals,
         });
       }
 
@@ -2169,6 +2209,16 @@ app.post(
             restrictedUntil,
           },
         });
+
+        await logSecurityEvent(req, "user.restricted", {
+          targetType: "USER",
+          targetId: req.user.userId,
+          reason: "job_post_risk_threshold",
+          jobId: job.id,
+          riskTotalScore: risk.totalScore,
+          riskSignals: risk.signals,
+          restrictedUntil: restrictedUntil.toISOString(),
+        });
       } else if (risk.totalScore > 0) {
         await prisma.user.update({
           where: { id: req.user.userId },
@@ -2176,6 +2226,40 @@ app.post(
             riskScore: { increment: risk.totalScore },
           },
         });
+      }
+
+      // Escalate for repeated job spam signals (independent of raw risk thresholds).
+      if (!restrictedUntil && hasJobSpamSignal && !isAdmin(req)) {
+        const decision = await decideRestrictionFromRecentSecurityEvents({
+          prisma,
+          actorUserId: req.user.userId,
+          actionType: "job.spam_signal",
+          windowMinutes: 60,
+          reason: "repeated_job_spam",
+          steps: [
+            { atOrAbove: 2, minutes: 30 },
+            { atOrAbove: 3, minutes: 6 * 60 },
+            { atOrAbove: 4, minutes: 24 * 60 },
+          ],
+        });
+
+        if (decision.action === "RESTRICT") {
+          restrictedUntil = decision.restrictedUntil;
+          await prisma.user.update({
+            where: { id: req.user.userId },
+            data: { restrictedUntil },
+          });
+
+          await logSecurityEvent(req, "user.restricted", {
+            targetType: "USER",
+            targetId: req.user.userId,
+            reason: decision.reason,
+            jobId: job.id,
+            restrictedUntil: restrictedUntil.toISOString(),
+            restrictMinutes: decision.minutes,
+            ...(decision.metadata ?? {}),
+          });
+        }
       }
     } catch (err: any) {
       if (!isMissingDbColumnError(err)) throw err;
@@ -2229,7 +2313,7 @@ app.post(
       createdAt: job.createdAt,
     });
   } catch (err) {
-    console.error("Create job error:", err);
+    logServerError("Create job error", err);
     return res.status(500).json({ error: "Internal server error while creating job." });
   }
 });
@@ -2405,7 +2489,7 @@ app.get("/jobs/browse", authMiddleware, async (req: AuthRequest, res: Response) 
       },
     });
   } catch (err) {
-    console.error("GET /jobs/browse error:", err);
+    logServerError("GET /jobs/browse error", err);
     return res.status(500).json({ error: "Internal server error while browsing jobs." });
   }
 });
@@ -2427,6 +2511,13 @@ app.post(
   try {
     if (!req.user) {
       return res.status(401).json({ error: "Not authenticated" });
+    }
+
+    if (isRestrictedUser(req) && !isAdmin(req)) {
+      return restrictedResponse(res, {
+        message: "Your account is temporarily restricted. Please try again later.",
+        restrictedUntil: req.user.restrictedUntil ?? null,
+      });
     }
 
     const { jobId } = (req as any).validated.params as { jobId: number };
@@ -2486,7 +2577,7 @@ app.post(
       attachment: attach,
     });
   } catch (err) {
-    console.error("POST /jobs/:jobId/attachments error:", err);
+    logServerError("POST /jobs/:jobId/attachments error", err);
     return res.status(500).json({
       error: "Internal server error while adding attachment.",
     });
@@ -2500,134 +2591,15 @@ app.post(
   authMiddleware,
   validate({ params: jobIdParamsSchema }),
   uploadSingleAttachment,
-  async (req: AuthRequest, res: Response) => {
-    try {
-      if (!req.user) {
-        return res.status(401).json({ error: "Not authenticated" });
-      }
-
-      const { jobId } = (req as any).validated.params as { jobId: number };
-
-      const file = (req as any).file as Express.Multer.File | undefined;
-      if (!file) {
-        return res.status(400).json({ error: "file is required" });
-      }
-
-      const job = await prisma.job.findUnique({
-        where: { id: jobId },
-        select: { id: true, consumerId: true, status: true, title: true, location: true },
-      });
-
-      if (!job) {
-        return res.status(404).json({ error: "Job not found" });
-      }
-
-      if (job.consumerId !== req.user.userId) {
-        return res.status(403).json({
-          error: "You may only add attachments to jobs you created.",
-        });
-      }
-
-      const publicBase =
-        (process.env.PUBLIC_BASE_URL ?? "").trim() ||
-        `${req.protocol}://${req.get("host")}`;
-
-      const kind = file.mimetype.startsWith("video/") ? "video" : "image";
-      const basename = makeUploadBasename(file.originalname);
-      const { storageKey, diskPath } = computeNewUploadTargets({
-        namespace: "job",
-        ownerId: jobId,
-        basename,
-        storageProvider: attachmentStorageProvider,
-      });
-
-      let cleanupOnDbFailure: null | (() => Promise<void>) = null;
-      if (attachmentStorageProvider && storageKey) {
-        await attachmentStorageProvider.putObject(storageKey, file.buffer, file.mimetype);
-        cleanupOnDbFailure = async () => {
-          await attachmentStorageProvider.deleteObject(storageKey).catch(() => null);
-        };
-      } else if (diskPath) {
-        const abs = path.join(UPLOADS_DIR, diskPath);
-        await fs.promises.mkdir(path.dirname(abs), { recursive: true });
-        await fs.promises.writeFile(abs, file.buffer);
-        cleanupOnDbFailure = async () => {
-          await fs.promises.unlink(abs).catch(() => null);
-        };
-      }
-
-      let attach: any;
-      try {
-        attach = await prisma.$transaction(async (tx) => {
-          const created = await tx.jobAttachment.create({
-            data: {
-              jobId,
-              url: "",
-              diskPath,
-              storageKey,
-              uploaderUserId: req.user!.userId,
-              type: kind,
-              mimeType: file.mimetype,
-              filename: file.originalname || null,
-              sizeBytes: file.size || null,
-            },
-          });
-
-          const url = `${publicBase}/attachments/${created.id}`;
-          return tx.jobAttachment.update({
-            where: { id: created.id },
-            data: { url },
-          });
-        });
-      } catch (e) {
-        await cleanupOnDbFailure?.();
-        throw e;
-      }
-
-      await enqueueWebhookEvent({
-        eventType: "job.attachment_added",
-        payload: {
-          attachmentId: attach.id,
-          jobId: attach.jobId,
-          addedByUserId: req.user.userId,
-          url: `${publicBase}/attachments/${attach.id}`,
-          type: attach.type,
-          mimeType: attach.mimeType,
-          filename: attach.filename,
-          sizeBytes: attach.sizeBytes,
-          createdAt: attach.createdAt,
-          job: {
-            title: job.title,
-            status: job.status,
-            location: job.location,
-          },
-        },
-      });
-
-      return res.status(201).json({
-        message: "Attachment uploaded.",
-        attachment: {
-          ...attach,
-          url: `${publicBase}/attachments/${attach.id}`,
-        },
-        limits: { maxBytes: MAX_ATTACHMENT_BYTES },
-      });
-    } catch (err: any) {
-      const msg = String(err?.message || "");
-      if (msg.includes("File too large")) {
-        return res.status(413).json({
-          error: `Attachment exceeds size limit (${MAX_ATTACHMENT_BYTES} bytes).`,
-        });
-      }
-      if (msg.includes("Unsupported file type")) {
-        return res.status(415).json({ error: msg });
-      }
-      console.error("POST /jobs/:jobId/attachments/upload error:", err);
-      return res.status(500).json({
-        error: "Internal server error while uploading attachment.",
-      });
-    }
-  }
+  createPostJobAttachmentUploadHandler({
+    prisma: prisma as any,
+    uploadsDir: UPLOADS_DIR,
+    maxAttachmentBytes: MAX_ATTACHMENT_BYTES,
+    storageProvider: attachmentStorageProvider,
+    makeUploadBasename,
+    enqueueWebhookEvent,
+    logServerError,
+  })
 );
 
 // --- Bids: place/update bid on a job (PROVIDER only) ---
@@ -3032,7 +3004,7 @@ app.get(
 
       return res.json({ items });
     } catch (err) {
-      console.error("GET /provider/quick-replies error:", err);
+      logServerError("GET /provider/quick-replies error", err);
       return res.status(500).json({ error: "Internal server error." });
     }
   }
@@ -3062,7 +3034,7 @@ app.post(
 
       return res.status(201).json({ item: created });
     } catch (err) {
-      console.error("POST /provider/quick-replies error:", err);
+      logServerError("POST /provider/quick-replies error", err);
       return res.status(500).json({ error: "Internal server error." });
     }
   }
@@ -3102,7 +3074,7 @@ app.put(
 
       return res.json({ item: updated });
     } catch (err) {
-      console.error("PUT /provider/quick-replies/:id error:", err);
+      logServerError("PUT /provider/quick-replies/:id error", err);
       return res.status(500).json({ error: "Internal server error." });
     }
   }
@@ -3131,7 +3103,7 @@ app.delete(
       await prisma.providerQuickReply.delete({ where: { id } });
       return res.json({ ok: true });
     } catch (err) {
-      console.error("DELETE /provider/quick-replies/:id error:", err);
+      logServerError("DELETE /provider/quick-replies/:id error", err);
       return res.status(500).json({ error: "Internal server error." });
     }
   }
@@ -3158,7 +3130,7 @@ app.get(
 
       return res.json({ items });
     } catch (err) {
-      console.error("GET /provider/saved-searches error:", err);
+      logServerError("GET /provider/saved-searches error", err);
       return res.status(500).json({ error: "Internal server error." });
     }
   }
@@ -3204,7 +3176,7 @@ app.post(
 
       return res.status(201).json({ item: created });
     } catch (err) {
-      console.error("POST /provider/saved-searches error:", err);
+      logServerError("POST /provider/saved-searches error", err);
       return res.status(500).json({ error: "Internal server error." });
     }
   }
@@ -3253,7 +3225,7 @@ app.put(
 
       return res.json({ item: updated });
     } catch (err) {
-      console.error("PUT /provider/saved-searches/:id error:", err);
+      logServerError("PUT /provider/saved-searches/:id error", err);
       return res.status(500).json({ error: "Internal server error." });
     }
   }
@@ -3285,7 +3257,7 @@ app.delete(
       await prisma.providerSavedSearch.delete({ where: { id } });
       return res.json({ ok: true });
     } catch (err) {
-      console.error("DELETE /provider/saved-searches/:id error:", err);
+      logServerError("DELETE /provider/saved-searches/:id error", err);
       return res.status(500).json({ error: "Internal server error." });
     }
   }
@@ -3311,7 +3283,7 @@ app.get(
 
       return res.json({ items });
     } catch (err) {
-      console.error("GET /provider/bid-templates error:", err);
+      logServerError("GET /provider/bid-templates error", err);
       return res.status(500).json({ error: "Internal server error." });
     }
   }
@@ -3345,7 +3317,7 @@ app.post(
 
       return res.status(201).json({ item: created });
     } catch (err) {
-      console.error("POST /provider/bid-templates error:", err);
+      logServerError("POST /provider/bid-templates error", err);
       return res.status(500).json({ error: "Internal server error." });
     }
   }
@@ -3372,7 +3344,7 @@ app.get(
 
       return res.json({ item });
     } catch (err) {
-      console.error("GET /provider/bid-templates/:id error:", err);
+      logServerError("GET /provider/bid-templates/:id error", err);
       return res.status(500).json({ error: "Internal server error." });
     }
   }
@@ -3419,7 +3391,7 @@ app.put(
 
       return res.json({ item: updated });
     } catch (err) {
-      console.error("PUT /provider/bid-templates/:id error:", err);
+      logServerError("PUT /provider/bid-templates/:id error", err);
       return res.status(500).json({ error: "Internal server error." });
     }
   }
@@ -3448,7 +3420,7 @@ app.delete(
       await prisma.bidTemplate.delete({ where: { id } });
       return res.json({ ok: true });
     } catch (err) {
-      console.error("DELETE /provider/bid-templates/:id error:", err);
+      logServerError("DELETE /provider/bid-templates/:id error", err);
       return res.status(500).json({ error: "Internal server error." });
     }
   }
@@ -3475,7 +3447,7 @@ app.get(
       const timezone = slots.length > 0 ? slots[0].timezone : null;
       return res.json({ timezone, slots });
     } catch (err) {
-      console.error("GET /provider/availability error:", err);
+      logServerError("GET /provider/availability error", err);
       return res.status(500).json({ error: "Internal server error." });
     }
   }
@@ -3521,7 +3493,7 @@ app.put(
 
       return res.json({ timezone: saved.length > 0 ? saved[0].timezone : null, slots: saved });
     } catch (err) {
-      console.error("PUT /provider/availability error:", err);
+      logServerError("PUT /provider/availability error", err);
       return res.status(500).json({ error: "Internal server error." });
     }
   }
@@ -3579,7 +3551,7 @@ app.get(
         });
       }
     } catch (err) {
-      console.error("GET /jobs/:jobId/appointments error:", err);
+      logServerError("GET /jobs/:jobId/appointments error", err);
       return res.status(500).json({ error: "Internal server error." });
     }
   }
@@ -3646,7 +3618,7 @@ app.post(
 
       return res.status(201).json({ item: created });
     } catch (err) {
-      console.error("POST /jobs/:jobId/appointments/propose error:", err);
+      logServerError("POST /jobs/:jobId/appointments/propose error", err);
       return res.status(500).json({ error: "Internal server error." });
     }
   }
@@ -3706,7 +3678,7 @@ app.post(
 
       return res.json({ item: updated });
     } catch (err) {
-      console.error("POST /appointments/:id/confirm error:", err);
+      logServerError("POST /appointments/:id/confirm error", err);
       return res.status(500).json({ error: "Internal server error." });
     }
   }
@@ -3741,7 +3713,7 @@ app.post(
 
       return res.json({ item: updated });
     } catch (err) {
-      console.error("POST /appointments/:id/cancel error:", err);
+      logServerError("POST /appointments/:id/cancel error", err);
       return res.status(500).json({ error: "Internal server error." });
     }
   }
@@ -3797,7 +3769,7 @@ app.post(
         throw err;
       }
     } catch (err) {
-      console.error("POST /appointments/:id/calendar-event error:", err);
+      logServerError("POST /appointments/:id/calendar-event error", err);
       return res.status(500).json({ error: "Internal server error." });
     }
   }
@@ -3872,6 +3844,58 @@ app.post(
             messageText,
           });
 
+          const hasRepeatedBidSignal = risk.signals?.some((s: any) => s.code === "REPEATED_BID_MESSAGE");
+          if (hasRepeatedBidSignal && !isAdmin(req)) {
+            await logSecurityEvent(req, "bid.spam_signal", {
+              targetType: "JOB",
+              targetId: jobId,
+              jobId,
+              providerId: req.user.userId,
+              riskTotalScore: risk.totalScore,
+              riskSignals: risk.signals,
+              messagePreview: messageText.slice(0, 200),
+            });
+
+            const decision = await decideRestrictionFromRecentSecurityEvents({
+              prisma,
+              actorUserId: req.user.userId,
+              actionType: "bid.spam_signal",
+              windowMinutes: 120,
+              reason: "repeated_bid_spam",
+              steps: [
+                { atOrAbove: 3, minutes: 30 },
+                { atOrAbove: 5, minutes: 6 * 60 },
+                { atOrAbove: 8, minutes: 24 * 60 },
+              ],
+            });
+
+            if (decision.action === "RESTRICT") {
+              try {
+                await prisma.user.update({
+                  where: { id: req.user.userId },
+                  data: { restrictedUntil: decision.restrictedUntil },
+                });
+              } catch (e: any) {
+                if (!isMissingDbColumnError(e)) throw e;
+              }
+
+              await logSecurityEvent(req, "user.restricted", {
+                targetType: "USER",
+                targetId: req.user.userId,
+                reason: decision.reason,
+                jobId,
+                restrictedUntil: decision.restrictedUntil.toISOString(),
+                restrictMinutes: decision.minutes,
+                ...(decision.metadata ?? {}),
+              });
+
+              return restrictedResponse(res, {
+                message: "Your account is temporarily restricted from bidding due to repeated spam.",
+                restrictedUntil: decision.restrictedUntil,
+              });
+            }
+          }
+
           if (risk.signals.some((s) => s.code === "CONTACT_INFO") && !isAdmin(req)) {
             try {
               await prisma.user.update({
@@ -3881,6 +3905,57 @@ app.post(
             } catch (e: any) {
               if (!isMissingDbColumnError(e)) throw e;
             }
+
+            await logSecurityEvent(req, "bid.blocked", {
+              targetType: "JOB",
+              targetId: jobId,
+              jobId,
+              providerId: req.user.userId,
+              reasonCodes: ["CONTACT_INFO"],
+              riskTotalScore: risk.totalScore,
+              riskSignals: risk.signals,
+              messagePreview: messageText.slice(0, 200),
+            });
+
+            const decision = await decideRestrictionFromRecentSecurityEvents({
+              prisma,
+              actorUserId: req.user.userId,
+              actionType: "bid.blocked",
+              windowMinutes: 30,
+              reason: "repeated_bid_blocks",
+              steps: [
+                { atOrAbove: 3, minutes: 30 },
+                { atOrAbove: 5, minutes: 6 * 60 },
+                { atOrAbove: 8, minutes: 24 * 60 },
+              ],
+            });
+
+            if (decision.action === "RESTRICT") {
+              try {
+                await prisma.user.update({
+                  where: { id: req.user.userId },
+                  data: { restrictedUntil: decision.restrictedUntil },
+                });
+              } catch (e: any) {
+                if (!isMissingDbColumnError(e)) throw e;
+              }
+
+              await logSecurityEvent(req, "user.restricted", {
+                targetType: "USER",
+                targetId: req.user.userId,
+                reason: decision.reason,
+                jobId,
+                restrictedUntil: decision.restrictedUntil.toISOString(),
+                restrictMinutes: decision.minutes,
+                ...(decision.metadata ?? {}),
+              });
+
+              return restrictedResponse(res, {
+                message: "Your account is temporarily restricted due to repeated blocked bids.",
+                restrictedUntil: decision.restrictedUntil,
+              });
+            }
+
             return res.status(400).json({
               error: "For your safety, sharing phone numbers or emails in bids is not allowed. Please use in-app messaging.",
               code: "CONTACT_INFO_NOT_ALLOWED",
@@ -3897,6 +3972,17 @@ app.post(
             } catch (e: any) {
               if (!isMissingDbColumnError(e)) throw e;
             }
+
+            await logSecurityEvent(req, "user.restricted", {
+              targetType: "USER",
+              targetId: req.user.userId,
+              reason: "bid_risk_threshold",
+              jobId,
+              riskTotalScore: risk.totalScore,
+              riskSignals: risk.signals,
+              restrictedUntil: until.toISOString(),
+            });
+
             return restrictedResponse(res, {
               message: "Your account is temporarily restricted due to suspicious activity.",
               restrictedUntil: until,
@@ -4071,7 +4157,7 @@ app.post(
         createdAt: bid.createdAt,
       });
     } catch (err) {
-      console.error("Place bid error:", err);
+      logServerError("Place bid error", err);
       return res.status(500).json({ error: "Internal server error while placing bid." });
     }
   }
@@ -4191,7 +4277,7 @@ app.get(
         }))
       );
     } catch (err) {
-      console.error("GET /jobs/:jobId/bids error:", err);
+      logServerError("GET /jobs/:jobId/bids error", err);
       return res.status(500).json({
         error: "Internal server error while fetching bids.",
       });
@@ -4333,7 +4419,7 @@ app.post(
         },
       });
     } catch (err) {
-      console.error("POST /bids/:bidId/counter error:", err);
+      logServerError("POST /bids/:bidId/counter error", err);
       return res
         .status(500)
         .json({ error: "Internal server error while countering bid." });
@@ -4432,7 +4518,7 @@ app.post(
 
       return res.json({ bid: updated });
     } catch (err) {
-      console.error("POST /bids/:bidId/counter/accept error:", err);
+      logServerError("POST /bids/:bidId/counter/accept error", err);
       return res
         .status(500)
         .json({ error: "Internal server error while accepting counter." });
@@ -4501,7 +4587,7 @@ app.post(
         },
       });
     } catch (err) {
-      console.error("POST /bids/:bidId/counter/decline error:", err);
+      logServerError("POST /bids/:bidId/counter/decline error", err);
       return res
         .status(500)
         .json({ error: "Internal server error while declining counter." });
@@ -4608,7 +4694,7 @@ app.get("/consumer/jobs", authMiddleware, async (req: AuthRequest, res: Response
 
     return res.json(items);
   } catch (err) {
-    console.error("Consumer My Jobs error:", err);
+    logServerError("Consumer My Jobs error", err);
     return res
       .status(500)
       .json({ error: "Internal server error while fetching consumer jobs." });
@@ -4762,7 +4848,7 @@ app.get("/consumer/jobs/:jobId", authMiddleware, async (req: AuthRequest, res: R
         : null,
     });
   } catch (err) {
-    console.error("Consumer Job Details error:", err);
+    logServerError("Consumer Job Details error", err);
     return res.status(500).json({ error: "Internal server error while fetching job details." });
   }
 });
@@ -4812,7 +4898,7 @@ app.get("/provider/bids", authMiddleware, async (req: AuthRequest, res: Response
       }))
     );
   } catch (err) {
-    console.error("Provider My Bids error:", err);
+    logServerError("Provider My Bids error", err);
     return res
       .status(500)
       .json({ error: "Internal server error while fetching provider bids." });
@@ -4842,7 +4928,7 @@ app.get("/debug/provider-bids", async (req, res) => {
 
     return res.json(bids);
   } catch (err) {
-    console.error("/debug/provider-bids error:", err);
+    logServerError("/debug/provider-bids error", err);
     return res.status(500).json({ error: "Failed to fetch debug provider bids." });
   }
 });
@@ -4866,7 +4952,7 @@ app.get("/debug/provider-job", async (req, res) => {
     if (!job) return res.status(404).json({ error: "Job not found" });
     return res.json(job);
   } catch (err) {
-    console.error("/debug/provider-job error:", err);
+    logServerError("/debug/provider-job error", err);
     return res.status(500).json({ error: "Failed to fetch debug job." });
   }
 });
@@ -5011,7 +5097,7 @@ app.get(
         myBid: myBid ?? null,
       });
     } catch (err) {
-      console.error("Provider Job Details error:", err);
+      logServerError("Provider Job Details error", err);
       return res
         .status(500)
         .json({ error: "Internal server error while fetching job details." });
@@ -5089,7 +5175,7 @@ app.get(
         reviews,
       });
     } catch (err) {
-      console.error("GET /jobs/:jobId/reviews error:", err);
+      logServerError("GET /jobs/:jobId/reviews error", err);
       return res.status(500).json({ error: "Internal server error while fetching job reviews." });
     }
   }
@@ -5187,7 +5273,7 @@ app.get(
         })),
       });
     } catch (err) {
-      console.error("GET /providers/:providerId/reviews error:", err);
+      logServerError("GET /providers/:providerId/reviews error", err);
       return res.status(500).json({
         error: "Internal server error while fetching provider reviews.",
       });
@@ -5283,7 +5369,7 @@ app.get("/admin/disputes", authMiddleware, async (req: AuthRequest, res: Respons
       disputes,
     });
   } catch (err) {
-    console.error("GET /admin/disputes error:", err);
+    logServerError("GET /admin/disputes error", err);
     return res.status(500).json({ error: "Internal server error while listing disputes." });
   }
 });
@@ -5336,7 +5422,7 @@ app.patch(
 
       return res.json({ dispute });
     } catch (err) {
-      console.error("PATCH /admin/disputes/:id error:", err);
+      logServerError("PATCH /admin/disputes/:id error", err);
       return res.status(500).json({ error: "Internal server error while updating dispute." });
     }
   }
@@ -5481,7 +5567,7 @@ app.get("/me/inbox", authMiddleware, async (req: AuthRequest, res: Response) => 
       threads,
     });
   } catch (err) {
-    console.error("GET /me/inbox error:", err);
+    logServerError("GET /me/inbox error", err);
     return res.status(500).json({ error: "Internal server error while fetching inbox." });
   }
 });
@@ -5565,7 +5651,7 @@ app.get("/me/inbox/unread-total", authMiddleware, async (req: AuthRequest, res: 
 
     return res.json({ totalUnread });
   } catch (err) {
-    console.error("GET /me/inbox/unread-total error:", err);
+    logServerError("GET /me/inbox/unread-total error", err);
     return res.status(500).json({ error: "Internal server error while fetching unread total." });
   }
 });
@@ -5727,7 +5813,7 @@ app.get("/me/inbox/threads", authMiddleware, async (req: AuthRequest, res: Respo
 
     return res.json({ threads, nextCursor });
   } catch (err) {
-    console.error("GET /me/inbox/threads error:", err);
+    logServerError("GET /me/inbox/threads error", err);
     return res.status(500).json({ error: "Internal server error while fetching inbox threads." });
   }
 });
@@ -5775,7 +5861,7 @@ app.get("/jobs/:id/messages/read-states", authMiddleware, async (req: AuthReques
 
     return res.json({ states });
   } catch (err) {
-    console.error("GET /jobs/:id/messages/read-states error:", err);
+    logServerError("GET /jobs/:id/messages/read-states error", err);
     return res.status(500).json({ error: "Internal server error while fetching read states." });
   }
 });
@@ -5849,7 +5935,7 @@ app.get("/me/reviews", authMiddleware, async (req: AuthRequest, res: Response) =
       })),
     });
   } catch (err) {
-    console.error("GET /me/reviews error:", err);
+    logServerError("GET /me/reviews error", err);
     return res
       .status(500)
       .json({ error: "Internal server error while fetching my reviews." });
@@ -6032,7 +6118,7 @@ app.get(
         }))
       );
     } catch (err) {
-      console.error("GET /providers/top error:", err);
+      logServerError("GET /providers/top error", err);
       return res
         .status(500)
         .json({ error: "Internal server error while fetching top providers." });
@@ -6194,7 +6280,7 @@ app.get("/providers/search/feed", authMiddleware, async (req: AuthRequest, res: 
       pageInfo: { limit: take, nextCursor },
     });
   } catch (err) {
-    console.error("GET /providers/search/feed error:", err);
+    logServerError("GET /providers/search/feed error", err);
     return res.status(500).json({ error: "Internal server error while fetching provider feed." });
   }
 });
@@ -6290,7 +6376,7 @@ app.get(
           })) ?? [],
       });
     } catch (err) {
-      console.error("GET /providers/me error:", err);
+      logServerError("GET /providers/me error", err);
       return res
         .status(500)
         .json({ error: "Internal server error while fetching profile." });
@@ -6358,7 +6444,7 @@ app.get("/provider/verification/status", authMiddleware, async (req: AuthRequest
       })),
     });
   } catch (err) {
-    console.error("GET /provider/verification/status error:", err);
+    logServerError("GET /provider/verification/status error", err);
     return res.status(500).json({ error: "Internal server error while fetching verification status." });
   }
 });
@@ -6370,89 +6456,13 @@ app.post(
   authMiddleware,
   requireVerifiedEmail,
   uploadSingleVerificationAttachment,
-  async (req: AuthRequest, res: Response) => {
-    try {
-      if (!req.user) return res.status(401).json({ error: "Not authenticated" });
-      if (req.user.role !== "PROVIDER") {
-        return res.status(403).json({ error: "Only providers can upload verification documents." });
-      }
-
-      const file = (req as any).file as Express.Multer.File | undefined;
-      if (!file) {
-        return res.status(400).json({ error: "file is required" });
-      }
-
-      // Ensure parent record exists so the FK can be satisfied
-      await prisma.providerVerification.upsert({
-        where: { providerId: req.user.userId },
-        create: { providerId: req.user.userId },
-        update: {},
-      });
-
-      const basename = makeUploadBasename(file.originalname);
-      const { storageKey, diskPath } = computeNewUploadTargets({
-        namespace: "verification",
-        ownerId: req.user.userId,
-        basename,
-        storageProvider: attachmentStorageProvider,
-      });
-
-      let cleanupOnDbFailure: null | (() => Promise<void>) = null;
-      if (attachmentStorageProvider && storageKey) {
-        await attachmentStorageProvider.putObject(storageKey, file.buffer, file.mimetype);
-        cleanupOnDbFailure = async () => {
-          await attachmentStorageProvider.deleteObject(storageKey).catch(() => null);
-        };
-      } else if (diskPath) {
-        const abs = path.join(UPLOADS_DIR, diskPath);
-        await fs.promises.mkdir(path.dirname(abs), { recursive: true });
-        await fs.promises.writeFile(abs, file.buffer);
-        cleanupOnDbFailure = async () => {
-          await fs.promises.unlink(abs).catch(() => null);
-        };
-      }
-
-      let attach: any;
-      try {
-        attach = await prisma.providerVerificationAttachment.create({
-          data: {
-            providerId: req.user.userId,
-            uploaderUserId: req.user.userId,
-            diskPath,
-            storageKey,
-            mimeType: file.mimetype,
-            filename: file.originalname || null,
-            sizeBytes: file.size || null,
-          },
-          select: {
-            id: true,
-            providerId: true,
-            mimeType: true,
-            filename: true,
-            sizeBytes: true,
-            createdAt: true,
-          },
-        });
-      } catch (e) {
-        await cleanupOnDbFailure?.();
-        throw e;
-      }
-
-      const publicBase =
-        (process.env.PUBLIC_BASE_URL ?? "").trim() ||
-        `${req.protocol}://${req.get("host")}`;
-
-      return res.json({
-        attachment: {
-          ...attach,
-          url: `${publicBase}/provider/verification/attachments/${attach.id}`,
-        },
-      });
-    } catch (err) {
-      console.error("POST /provider/verification/attachments/upload error:", err);
-      return res.status(500).json({ error: "Internal server error while uploading verification document." });
-    }
-  }
+  createPostVerificationAttachmentUploadHandler({
+    prisma: prisma as any,
+    uploadsDir: UPLOADS_DIR,
+    storageProvider: attachmentStorageProvider,
+    makeUploadBasename,
+    logServerError,
+  })
 );
 
 // GET /provider/verification/attachments/:id
@@ -6491,7 +6501,11 @@ app.get(
       }
 
       // New path: object storage -> signed URL
-      if (attach.storageKey && attachmentStorageProvider) {
+      if (attach.storageKey) {
+        if (!attachmentStorageProvider) {
+          return res.status(500).json({ error: "Attachment storage is not configured." });
+        }
+
         const url = await attachmentStorageProvider.getSignedReadUrl(
           attach.storageKey,
           attachmentsSignedUrlTtlSeconds
@@ -6535,13 +6549,13 @@ app.get(
 
       const stream = fs.createReadStream(absPath);
       stream.on("error", (e) => {
-        console.error("Verification attachment stream error:", e);
+        logServerError("Verification attachment stream error", e);
         if (!res.headersSent) res.status(500).json({ error: "Failed to stream attachment." });
         else res.end();
       });
       return stream.pipe(res);
     } catch (err) {
-      console.error("GET /provider/verification/attachments/:id error:", err);
+      logServerError("GET /provider/verification/attachments/:id error", err);
       return res.status(500).json({ error: "Internal server error fetching attachment." });
     }
   }
@@ -6614,7 +6628,7 @@ app.post(
 
       return res.json({ verification: updated });
     } catch (err) {
-      console.error("POST /provider/verification/submit error:", err);
+      logServerError("POST /provider/verification/submit error", err);
       return res.status(500).json({ error: "Internal server error while submitting verification." });
     }
   }
@@ -6662,7 +6676,7 @@ app.get("/admin/provider-verifications", authMiddleware, async (req: AuthRequest
       })),
     });
   } catch (err) {
-    console.error("GET /admin/provider-verifications error:", err);
+    logServerError("GET /admin/provider-verifications error", err);
     return res.status(500).json({ error: "Internal server error while listing provider verifications." });
   }
 });
@@ -6706,7 +6720,7 @@ app.post(
 
       return res.json({ verification: updated });
     } catch (err) {
-      console.error("POST /admin/provider-verifications/:providerId/approve error:", err);
+      logServerError("POST /admin/provider-verifications/:providerId/approve error", err);
       return res.status(500).json({ error: "Internal server error while approving verification." });
     }
   }
@@ -6743,7 +6757,7 @@ app.post(
 
       return res.json({ verification: updated });
     } catch (err) {
-      console.error("POST /admin/provider-verifications/:providerId/reject error:", err);
+      logServerError("POST /admin/provider-verifications/:providerId/reject error", err);
       return res.status(500).json({ error: "Internal server error while rejecting verification." });
     }
   }
@@ -6831,7 +6845,7 @@ app.put(
       reviewCount: updatedProfile.reviewCount,
     });
   } catch (err) {
-    console.error("PUT /providers/me/profile error:", err);
+    logServerError("PUT /providers/me/profile error", err);
     return res.status(500).json({
       error: "Internal server error while updating provider profile.",
     });
@@ -6909,7 +6923,7 @@ app.put(
       })),
     });
   } catch (err) {
-    console.error("PUT /providers/me/categories error:", err);
+    logServerError("PUT /providers/me/categories error", err);
     return res.status(500).json({
       error: "Internal server error while updating provider categories. Ensure categoryIds are valid.",
     });
@@ -6979,7 +6993,7 @@ app.get(
 
       return res.json(result);
     } catch (err) {
-      console.error("GET /categories/with-providers error:", err);
+      logServerError("GET /categories/with-providers error", err);
       return res.status(500).json({
         error:
           "Internal server error while fetching categories with providers.",
@@ -7049,7 +7063,7 @@ app.post(
 
     return res.status(201).json({ message: "Provider favorited." });
   } catch (err) {
-    console.error("POST /providers/:id/favorite error:", err);
+    logServerError("POST /providers/:id/favorite error", err);
     return res.status(500).json({
       error: "Internal server error while favoriting provider.",
     });
@@ -7091,7 +7105,7 @@ app.delete("/providers/:id/favorite", authMiddleware, async (req: AuthRequest, r
 
     return res.json({ message: "Provider unfavorited." });
   } catch (err) {
-    console.error("DELETE /providers/:id/favorite error:", err);
+    logServerError("DELETE /providers/:id/favorite error", err);
     return res.status(500).json({
       error: "Internal server error while unfavoriting provider.",
     });
@@ -7169,7 +7183,7 @@ app.get(
         }))
       );
     } catch (err) {
-      console.error("GET /me/favorites/providers error:", err);
+      logServerError("GET /me/favorites/providers error", err);
       return res.status(500).json({
         error: "Internal server error while fetching favorite providers.",
       });
@@ -7232,7 +7246,7 @@ app.get(
         }))
       );
     } catch (err) {
-      console.error("GET /me/favorites/jobs error:", err);
+      logServerError("GET /me/favorites/jobs error", err);
       return res.status(500).json({
         error: "Internal server error while fetching favorite jobs.",
       });
@@ -7330,7 +7344,7 @@ app.get(
           })) ?? [],
       });
     } catch (err) {
-      console.error("GET /providers/:id error:", err);
+      logServerError("GET /providers/:id error", err);
       return res
         .status(500)
         .json({ error: "Internal server error while fetching provider." });
@@ -7389,7 +7403,7 @@ app.get(
         },
       });
     } catch (err) {
-      console.error("GET /providers/:id/stats error:", err);
+      logServerError("GET /providers/:id/stats error", err);
       return res.status(500).json({ error: "Internal server error while fetching provider stats." });
     }
   }
@@ -7443,7 +7457,7 @@ function getUserFromAuthHeader(req: express.Request) {
     };
     return decoded;
   } catch (err) {
-    console.error("JWT verify error in messages route:", err);
+    logServerError("JWT verify error in messages route", err);
     return null;
   }
 }
@@ -7561,7 +7575,7 @@ app.get(
         },
       });
     } catch (err) {
-      console.error("GET /jobs/:jobId/messages error:", err);
+      logServerError("GET /jobs/:jobId/messages error", err);
       return res.status(500).json({ error: "Internal server error while fetching messages." });
     }
   }
@@ -7679,7 +7693,7 @@ app.post(
       readState: state,
     });
   } catch (err) {
-    console.error("POST /jobs/:jobId/messages/read error:", err);
+    logServerError("POST /jobs/:jobId/messages/read error", err);
     return res.status(500).json({ error: "Internal server error while marking messages read." });
   }
 });
@@ -7780,7 +7794,7 @@ app.get("/jobs/:jobId/messages/unread-count", authMiddleware, async (req: AuthRe
       unreadCount,
     });
   } catch (err) {
-    console.error("GET /jobs/:jobId/messages/unread-count error:", err);
+    logServerError("GET /jobs/:jobId/messages/unread-count error", err);
     return res.status(500).json({ error: "Internal server error while fetching unread count." });
   }
 });
@@ -7920,6 +7934,10 @@ app.post(
 
     const appealUrl = (process.env.PUBLIC_APPEAL_URL ?? "").trim() || `${publicBase}/support`;
 
+    let shadowHideMessage = false;
+    let shadowHideReason: string | null = null;
+    let shadowHideRisk: any = null;
+
     // Risk scoring / spam detection (best-effort)
     try {
       const outcome = await moderateJobMessageSend({
@@ -7943,6 +7961,15 @@ app.post(
 
       if (outcome.action === "BLOCK") {
         return res.status(outcome.status).json(outcome.body);
+      }
+
+      if (outcome.action === "HIDE") {
+        shadowHideMessage = true;
+        shadowHideReason = outcome.reason;
+        shadowHideRisk = {
+          riskTotalScore: outcome.riskTotalScore,
+          riskSignals: outcome.riskSignals,
+        };
       }
     } catch {
       // ignore scoring failures
@@ -7989,11 +8016,13 @@ app.post(
     let created: any;
     try {
       created = await prisma.$transaction(async (tx) => {
+        const hiddenAt = shadowHideMessage ? new Date() : null;
         const message = await tx.message.create({
           data: {
             jobId,
             senderId,
             text: messageText,
+            ...(shadowHideMessage ? { isHidden: true, hiddenAt } : {}),
           },
         });
 
@@ -8027,10 +8056,22 @@ app.post(
       throw e;
     }
 
+    if (shadowHideMessage) {
+      await logSecurityEvent(req, "message.shadow_hidden", {
+        targetType: "MESSAGE",
+        targetId: created.message.id,
+        messageId: created.message.id,
+        jobId,
+        senderId,
+        reason: shadowHideReason,
+        ...(shadowHideRisk ?? {}),
+      });
+    }
+
     // 🔔 Determine who to notify
     let notifiedUserIds: number[] = [];
 
-    if (senderId === job.consumerId) {
+    if (!shadowHideMessage && senderId === job.consumerId) {
       // Consumer → notify providers who have bids
       const bids = await prisma.bid.findMany({
         where: { jobId },
@@ -8059,7 +8100,7 @@ app.post(
           },
         });
       }
-    } else {
+    } else if (!shadowHideMessage) {
       // Provider → notify consumer
       const prefMap = await getNotificationPreferencesMap({
         prisma: prisma as any,
@@ -8091,6 +8132,9 @@ app.post(
         createdAt: created.message.createdAt,
         consumerId: job.consumerId,
         notifiedUserIds,
+        isHidden: !!created.message.isHidden,
+        hiddenAt: created.message.hiddenAt ?? null,
+        hiddenReason: shadowHideReason,
         attachments: created.attachments.map((a) => ({
           id: a.id,
           url: `${publicBase}/attachments/${a.id}`,
@@ -8119,7 +8163,7 @@ app.post(
     if (msg.includes("Unsupported file type")) {
       return res.status(415).json({ error: msg });
     }
-    console.error("Error creating message:", err);
+    logServerError("Error creating message", err);
     return res.status(500).json({
       error: "Internal server error while creating message.",
     });
@@ -8184,7 +8228,7 @@ app.get("/admin/risk/flagged", authMiddleware, async (req: AuthRequest, res: Res
       throw err;
     }
   } catch (err) {
-    console.error("GET /admin/risk/flagged error:", err);
+    logServerError("GET /admin/risk/flagged error", err);
     return res.status(500).json({ error: "Internal server error while fetching flagged items." });
   }
 });
@@ -8263,6 +8307,53 @@ app.post(
       },
     });
 
+    await logSecurityEvent(req, "report.created", {
+      targetType: "REPORT",
+      targetId: report.id,
+      reportId: report.id,
+      reporterId: report.reporterId,
+      targetTypeName: report.targetType,
+      targetUserId: report.targetUserId,
+      targetJobId: report.targetJobId,
+      targetMessageId: report.targetMessageId,
+      reason: report.reason,
+    });
+
+    let restrictedUntil: Date | null = null;
+    const decision = await decideRestrictionFromRecentSecurityEvents({
+      prisma,
+      actorUserId: req.user.userId,
+      actionType: "report.created",
+      windowMinutes: 10,
+      reason: "report_spam",
+      steps: [
+        { atOrAbove: 5, minutes: 30 },
+        { atOrAbove: 10, minutes: 6 * 60 },
+        { atOrAbove: 15, minutes: 24 * 60 },
+      ],
+    });
+
+    if (decision.action === "RESTRICT" && !isAdmin(req)) {
+      restrictedUntil = decision.restrictedUntil;
+      try {
+        await prisma.user.update({
+          where: { id: req.user.userId },
+          data: { restrictedUntil },
+        });
+      } catch (e: any) {
+        if (!isMissingDbColumnError(e)) throw e;
+      }
+
+      await logSecurityEvent(req, "user.restricted", {
+        targetType: "USER",
+        targetId: req.user.userId,
+        reason: decision.reason,
+        restrictedUntil: restrictedUntil.toISOString(),
+        restrictMinutes: decision.minutes,
+        ...(decision.metadata ?? {}),
+      });
+    }
+
     // ✅ Webhook: report created
     await enqueueWebhookEvent({
       eventType: "report.created",
@@ -8282,6 +8373,7 @@ app.post(
 
     return res.status(201).json({
       message: "Report submitted.",
+      restrictedUntil,
       report: {
         id: report.id,
         targetType: report.targetType,
@@ -8295,7 +8387,7 @@ app.post(
       },
     });
   } catch (err) {
-    console.error("POST /reports error:", err);
+    logServerError("POST /reports error", err);
     return res.status(500).json({
       error: "Internal server error while submitting report.",
     });
@@ -8332,7 +8424,7 @@ app.get(
         }))
       );
     } catch (err) {
-      console.error("GET /me/reports error:", err);
+      logServerError("GET /me/reports error", err);
       return res.status(500).json({
         error: "Internal server error while fetching your reports.",
       });
@@ -8490,7 +8582,7 @@ app.post(
       acceptedBid: result.accepted,
     });
   } catch (err) {
-    console.error("Accept bid error:", err);
+    logServerError("Accept bid error", err);
     return res.status(500).json({ error: "Internal server error while accepting bid." });
   }
 });
@@ -8701,7 +8793,7 @@ app.post("/jobs/:jobId/complete", validate({ params: jobIdParamsSchema }), async
       });
     }
   } catch (err) {
-    console.error("Error completing job:", err);
+    logServerError("Error completing job", err);
     return res.status(500).json({ error: "Internal server error while completing job." });
   }
 });
@@ -8782,7 +8874,7 @@ app.post(
 
     return res.status(201).json({ message: "Job favorited." });
   } catch (err) {
-    console.error("POST /jobs/:id/favorite error:", err);
+    logServerError("POST /jobs/:id/favorite error", err);
     return res.status(500).json({
       error: "Internal server error while favoriting job.",
     });
@@ -8822,7 +8914,7 @@ app.delete("/jobs/:id/favorite", authMiddleware, async (req: AuthRequest, res: R
 
     return res.json({ message: "Job unfavorited." });
   } catch (err) {
-    console.error("DELETE /jobs/:id/favorite error:", err);
+    logServerError("DELETE /jobs/:id/favorite error", err);
     return res.status(500).json({
       error: "Internal server error while unfavoriting job.",
     });
@@ -8863,7 +8955,7 @@ app.get("/notifications", authMiddleware, notificationsLimiter, async (req: Auth
       pageInfo: { limit: take, nextCursor },
     });
   } catch (err) {
-    console.error("List notifications error:", err);
+    logServerError("List notifications error", err);
     return res.status(500).json({ error: "Internal server error while fetching notifications." });
   }
 });
@@ -8899,7 +8991,7 @@ app.get("/me/notifications", authMiddleware, notificationsLimiter, async (req: A
       pageInfo: { limit: take, nextCursor },
     });
   } catch (err) {
-    console.error("List /me/notifications error:", err);
+    logServerError("List /me/notifications error", err);
     return res.status(500).json({ error: "Internal server error while fetching notifications." });
   }
 });
@@ -8958,7 +9050,7 @@ app.post(
       readAt: updated.readAt ?? null,
     });
   } catch (err) {
-    console.error("Mark notification read error:", err);
+    logServerError("Mark notification read error", err);
     return res.status(500).json({ error: "Internal server error while updating notification." });
   }
 });
@@ -8994,7 +9086,7 @@ app.post("/notifications/read-all", authMiddleware, validate({}), async (req: Au
       updatedCount: result.count,
     });
   } catch (err) {
-    console.error("Mark all notifications read error:", err);
+    logServerError("Mark all notifications read error", err);
     return res.status(500).json({ error: "Internal server error while updating notifications." });
   }
 });
@@ -9067,7 +9159,7 @@ app.post(
       },
     });
   } catch (err) {
-    console.error("POST /users/:id/block error:", err);
+    logServerError("POST /users/:id/block error", err);
     return res.status(500).json({ error: "Internal server error while blocking user." });
   }
 });
@@ -9105,7 +9197,7 @@ app.delete("/users/:id/block", authMiddleware, async (req: AuthRequest, res: Res
 
     return res.json({ message: "User unblocked (if they were blocked)." });
   } catch (err) {
-    console.error("DELETE /users/:id/block error:", err);
+    logServerError("DELETE /users/:id/block error", err);
     return res.status(500).json({
       error: "Internal server error while unblocking user.",
     });
@@ -9143,7 +9235,7 @@ app.get(
         }))
       );
     } catch (err) {
-      console.error("GET /me/blocks error:", err);
+      logServerError("GET /me/blocks error", err);
       return res.status(500).json({
         error: "Internal server error while fetching blocks.",
       });
@@ -9253,7 +9345,7 @@ app.get(
         })),
       });
     } catch (err) {
-      console.error("GET /admin/reports error:", err);
+      logServerError("GET /admin/reports error", err);
       return res.status(500).json({
         error: "Internal server error while fetching reports.",
       });
@@ -9344,7 +9436,7 @@ app.post(
     // ✅ Return secret ONCE, separate from endpoint object
     return res.json({ endpoint: publicWebhookEndpoint(ep), secret });
   } catch (err) {
-    console.error("Create webhook endpoint error:", err);
+    logServerError("Create webhook endpoint error", err);
     return res.status(500).json({ error: "Internal server error creating webhook endpoint." });
   }
 });
@@ -9361,7 +9453,7 @@ app.get("/admin/webhooks/endpoints", authMiddleware, async (req: AuthRequest, re
 
     return res.json({ endpoints: endpoints.map(publicWebhookEndpoint) });
   } catch (err) {
-    console.error("List webhook endpoints error:", err);
+    logServerError("List webhook endpoints error", err);
     return res.status(500).json({ error: "Internal server error listing webhook endpoints." });
   }
 });
@@ -9457,7 +9549,7 @@ app.patch(
 
     return res.json({ endpoint: publicWebhookEndpoint(ep) });
   } catch (err) {
-    console.error("Update webhook endpoint error:", err);
+    logServerError("Update webhook endpoint error", err);
     return res.status(500).json({ error: "Internal server error updating webhook endpoint." });
   }
 });
@@ -9507,7 +9599,7 @@ app.post(
     // ✅ Return secret ONCE here
     return res.json({ endpoint: publicWebhookEndpoint(updated), secret: newSecret });
   } catch (err) {
-    console.error("Rotate webhook secret error:", err);
+    logServerError("Rotate webhook secret error", err);
     return res.status(500).json({ error: "Internal server error rotating webhook secret." });
   }
 });
@@ -9597,7 +9689,7 @@ app.patch(
       },
     });
   } catch (err) {
-    console.error("PATCH /admin/reports/:id error:", err);
+    logServerError("PATCH /admin/reports/:id error", err);
     return res.status(500).json({ error: "Internal server error while updating report." });
   }
 });
@@ -9771,7 +9863,7 @@ app.get(
         topReportedUsers,
       });
     } catch (err) {
-      console.error("GET /admin/stats/reports error:", err);
+      logServerError("GET /admin/stats/reports error", err);
       return res.status(500).json({
         error: "Internal server error while fetching report stats.",
       });
@@ -9856,7 +9948,7 @@ app.post(
       },
     });
   } catch (err) {
-    console.error("POST /admin/users/:id/suspend error:", err);
+    logServerError("POST /admin/users/:id/suspend error", err);
     return res.status(500).json({ error: "Internal server error while suspending user." });
   }
 });
@@ -9930,7 +10022,7 @@ app.post(
       },
     });
   } catch (err) {
-    console.error("POST /admin/users/:id/unsuspend error:", err);
+    logServerError("POST /admin/users/:id/unsuspend error", err);
     return res.status(500).json({
       error: "Internal server error while unsuspending user.",
     });
@@ -10014,7 +10106,7 @@ app.post(
 
     return res.json({ message: "Job hidden.", job: updated });
   } catch (err) {
-    console.error("POST /admin/jobs/:id/hide error:", err);
+    logServerError("POST /admin/jobs/:id/hide error", err);
     return res.status(500).json({ error: "Internal server error while hiding job." });
   }
 });
@@ -10097,7 +10189,7 @@ app.post(
 
     return res.json({ message: "Job unhidden.", job: updated });
   } catch (err) {
-    console.error("POST /admin/jobs/:id/unhide error:", err);
+    logServerError("POST /admin/jobs/:id/unhide error", err);
     return res.status(500).json({ error: "Internal server error while unhiding job." });
   }
 });
@@ -10171,7 +10263,7 @@ app.post(
 
     return res.json({ message: "Message hidden.", messageObj: updated });
   } catch (err) {
-    console.error("POST /admin/messages/:id/hide error:", err);
+    logServerError("POST /admin/messages/:id/hide error", err);
     return res.status(500).json({ error: "Internal server error while hiding message." });
   }
 });
@@ -10246,7 +10338,7 @@ app.post(
 
     return res.json({ message: "Message unhidden.", messageObj: updated });
   } catch (err) {
-    console.error("POST /admin/messages/:id/unhide error:", err);
+    logServerError("POST /admin/messages/:id/unhide error", err);
     return res.status(500).json({ error: "Internal server error while unhiding message." });
   }
 });
@@ -10316,7 +10408,7 @@ app.get(
         })),
       });
     } catch (err) {
-      console.error("GET /admin/actions error:", err);
+      logServerError("GET /admin/actions error", err);
       return res.status(500).json({ error: "Internal server error while fetching admin actions." });
     }
   }
@@ -10491,7 +10583,7 @@ app.get(
         })),
       });
     } catch (err) {
-      console.error("GET /admin/dashboard/overview error:", err);
+      logServerError("GET /admin/dashboard/overview error", err);
       return res.status(500).json({ error: "Internal server error while fetching admin overview." });
     }
   }
@@ -10543,7 +10635,7 @@ app.post("/admin/impersonate/stop", authMiddleware, validate({}), async (req: Au
       message: "Impersonation stopped (logged). Discard the impersonation token and use the original admin token.",
     });
   } catch (err) {
-    console.error("Admin impersonate stop error:", err);
+    logServerError("Admin impersonate stop error", err);
     return res.status(500).json({ error: "Internal server error while stopping impersonation." });
   }
 });
@@ -10626,7 +10718,7 @@ app.post(
       expiresIn: "30m",
     });
   } catch (err) {
-    console.error("Admin impersonate start error:", err);
+    logServerError("Admin impersonate start error", err);
     return res.status(500).json({ error: "Internal server error while starting impersonation." });
   }
 });
@@ -10727,7 +10819,7 @@ app.get("/admin/webhooks/deliveries", authMiddleware, async (req: AuthRequest, r
       nextCursor: items.length === take ? items[items.length - 1].id : null,
     });
   } catch (err) {
-    console.error("List webhook deliveries error:", err);
+    logServerError("List webhook deliveries error", err);
     return res.status(500).json({
       error: "Internal server error listing webhook deliveries.",
     });
@@ -10802,7 +10894,7 @@ app.get("/admin/webhooks/deliveries/:id", authMiddleware, async (req: AuthReques
       attemptLogs: delivery.attemptLogs,
     });
   } catch (err) {
-    console.error("Get webhook delivery error:", err);
+    logServerError("Get webhook delivery error", err);
     return res.status(500).json({
       error: "Internal server error fetching webhook delivery.",
     });
@@ -10960,6 +11052,120 @@ app.get(
     </div>
   </div>
 
+  <div class="grid">
+    <div class="card" style="grid-column: 1 / -1;">
+      <h3 style="margin-top:0;">Safety automation</h3>
+      <div class="actions" style="margin-bottom:8px;">
+        <button class="small" id="refreshSafety">Refresh</button>
+      </div>
+
+      <h4 style="margin: 8px 0;">Restricted users</h4>
+      <table>
+        <thead>
+          <tr>
+            <th>User</th>
+            <th>Role</th>
+            <th>Restricted until</th>
+            <th>Risk</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="safetyRestricted"></tbody>
+      </table>
+
+      <h4 style="margin: 14px 0 8px;">Shadow-hidden jobs</h4>
+      <table>
+        <thead>
+          <tr>
+            <th>Job</th>
+            <th>Consumer</th>
+            <th>Hidden at</th>
+            <th>Risk</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="safetyHiddenJobs"></tbody>
+      </table>
+
+      <h4 style="margin: 14px 0 8px;">Shadow-hidden messages</h4>
+      <table>
+        <thead>
+          <tr>
+            <th>Msg</th>
+            <th>Job</th>
+            <th>Sender</th>
+            <th>Hidden at</th>
+            <th>Preview</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="safetyHiddenMessages"></tbody>
+      </table>
+
+      <h4 style="margin: 14px 0 8px;">Safety events</h4>
+      <div class="actions" style="margin-bottom:8px;">
+        <label>
+          Since (hours)
+          <input id="safetySinceHours" value="72" style="width:100px" />
+        </label>
+        <button class="small" id="refreshSafetyEvents">Refresh events</button>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>At</th>
+            <th>Action</th>
+            <th>Actor</th>
+            <th>Target</th>
+            <th>Request</th>
+            <th>Meta</th>
+          </tr>
+        </thead>
+        <tbody id="safetyEvents"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h3 style="margin-top:0;">Webhook deadletters</h3>
+      <div class="actions" style="margin-bottom:8px;">
+        <button class="small" id="refreshWebhookDeadletters">Refresh</button>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Event</th>
+            <th>Status</th>
+            <th>Attempts</th>
+            <th>Last error</th>
+          </tr>
+        </thead>
+        <tbody id="webhookDeadletters"></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h3 style="margin-top:0;">Match deadletters</h3>
+      <div class="actions" style="margin-bottom:8px;">
+        <button class="small" id="refreshMatchDeadletters">Refresh</button>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Type</th>
+            <th>Status</th>
+            <th>Attempts</th>
+            <th>Last error</th>
+          </tr>
+        </thead>
+        <tbody id="matchDeadletters"></tbody>
+      </table>
+    </div>
+  </div>
+
 <script>
   console.log("[admin ops ui] script loaded");
 
@@ -10967,8 +11173,17 @@ app.get(
   const windowDaysEl = document.getElementById("windowDays");
   const kpisEl = document.getElementById("kpis");
   const webhookFailuresEl = document.getElementById("webhookFailures");
+  const webhookDeadlettersEl = document.getElementById("webhookDeadletters");
+  const matchDeadlettersEl = document.getElementById("matchDeadletters");
   const flaggedEl = document.getElementById("flagged");
   const disputesEl = document.getElementById("disputes");
+  const safetyRestrictedEl = document.getElementById("safetyRestricted");
+  const safetyHiddenJobsEl = document.getElementById("safetyHiddenJobs");
+  const safetyHiddenMessagesEl = document.getElementById("safetyHiddenMessages");
+  const safetyEventsEl = document.getElementById("safetyEvents");
+  const safetySinceHoursEl = document.getElementById("safetySinceHours");
+
+  const safetyEventsById = new Map();
 
   function escapeHtml(s) {
     return String(s ?? "").replace(/[&<>"']/g, (c) => ({
@@ -11005,7 +11220,7 @@ app.get(
   }
 
   function pill(status) {
-    const cls = (status === "SUCCESS") ? "ok" : (status === "FAILED") ? "bad" : (status === "OPEN" || status === "INVESTIGATING") ? "warn" : "";
+    const cls = (status === "SUCCESS") ? "ok" : (status === "FAILED" || status === "DEAD") ? "bad" : (status === "OPEN" || status === "INVESTIGATING") ? "warn" : "";
     return "<span class='pill " + cls + "'>" + escapeHtml(status) + "</span>";
   }
 
@@ -11139,6 +11354,36 @@ app.get(
     webhookFailuresEl.innerHTML = rows || "<tr><td colspan='5' class='muted'>(none)</td></tr>";
   }
 
+  async function refreshWebhookDeadletters() {
+    webhookDeadlettersEl.innerHTML = "<tr><td colspan='5' class='muted'>Loading…</td></tr>";
+    const d = await api("GET", "/admin/ops/webhook-deadletters?take=50", null);
+    const rows = (d.items || []).map((x) => {
+      return "<tr>" +
+        "<td class='mono'>" + escapeHtml(x.id) + "</td>" +
+        "<td class='mono'>" + escapeHtml(x.event) + "</td>" +
+        "<td>" + pill(x.status) + "</td>" +
+        "<td>" + escapeHtml(x.attempts) + "</td>" +
+        "<td class='muted'>" + escapeHtml((x.lastError || "").slice(0, 160)) + "</td>" +
+      "</tr>";
+    }).join("");
+    webhookDeadlettersEl.innerHTML = rows || "<tr><td colspan='5' class='muted'>(none)</td></tr>";
+  }
+
+  async function refreshMatchDeadletters() {
+    matchDeadlettersEl.innerHTML = "<tr><td colspan='5' class='muted'>Loading…</td></tr>";
+    const d = await api("GET", "/admin/ops/match-deadletters?take=50", null);
+    const rows = (d.items || []).map((x) => {
+      return "<tr>" +
+        "<td class='mono'>" + escapeHtml(x.id) + "</td>" +
+        "<td class='mono'>" + escapeHtml(x.type) + "</td>" +
+        "<td>" + pill(x.status) + "</td>" +
+        "<td>" + escapeHtml((x.attempts || 0) + "/" + (x.maxAttempts || "")) + "</td>" +
+        "<td class='muted'>" + escapeHtml((x.lastError || "").slice(0, 160)) + "</td>" +
+      "</tr>";
+    }).join("");
+    matchDeadlettersEl.innerHTML = rows || "<tr><td colspan='5' class='muted'>(none)</td></tr>";
+  }
+
   async function refreshFlagged() {
     flaggedEl.innerHTML = "<tr><td colspan='6' class='muted'>Loading…</td></tr>";
     const d = await api("GET", "/admin/ops/flagged?take=50&status=OPEN", null);
@@ -11178,6 +11423,76 @@ app.get(
     disputesEl.innerHTML = rows || "<tr><td colspan='6' class='muted'>(none)</td></tr>";
   }
 
+  async function refreshSafety() {
+    safetyRestrictedEl.innerHTML = "<tr><td colspan='5' class='muted'>Loading…</td></tr>";
+    safetyHiddenJobsEl.innerHTML = "<tr><td colspan='5' class='muted'>Loading…</td></tr>";
+    safetyHiddenMessagesEl.innerHTML = "<tr><td colspan='6' class='muted'>Loading…</td></tr>";
+    const d = await api("GET", "/admin/ops/safety?take=50", null);
+
+    const uRows = (d.restrictedUsers || []).map((u) => {
+      return "<tr>" +
+        "<td class='mono'>" + escapeHtml(u.id) + "<div class='muted'>" + escapeHtml(u.email || "") + "</div></td>" +
+        "<td>" + escapeHtml(u.role || "") + "</td>" +
+        "<td class='muted'>" + escapeHtml(new Date(u.restrictedUntil).toLocaleString()) + "</td>" +
+        "<td class='mono'>" + escapeHtml(u.riskScore ?? "") + "</td>" +
+        "<td><div class='actions'><button class='small' data-act='restore-user' data-user='" + u.id + "'>Restore</button></div></td>" +
+      "</tr>";
+    }).join("");
+    safetyRestrictedEl.innerHTML = uRows || "<tr><td colspan='5' class='muted'>(none)</td></tr>";
+
+    const jRows = (d.hiddenJobs || []).map((j) => {
+      return "<tr>" +
+        "<td class='mono'>" + escapeHtml(j.id) + "<div class='muted'>" + escapeHtml((j.title || "").slice(0, 80)) + "</div></td>" +
+        "<td class='mono'>" + escapeHtml(j.consumerId) + "</td>" +
+        "<td class='muted'>" + escapeHtml(j.hiddenAt ? new Date(j.hiddenAt).toLocaleString() : "") + "</td>" +
+        "<td class='mono'>" + escapeHtml(j.riskScore ?? "") + "</td>" +
+        "<td><div class='actions'><button class='small' data-act='unhide-job' data-job='" + j.id + "'>Unhide</button></div></td>" +
+      "</tr>";
+    }).join("");
+    safetyHiddenJobsEl.innerHTML = jRows || "<tr><td colspan='5' class='muted'>(none)</td></tr>";
+
+    const mRows = (d.hiddenMessages || []).map((m) => {
+      return "<tr>" +
+        "<td class='mono'>" + escapeHtml(m.id) + "</td>" +
+        "<td class='mono'>" + escapeHtml(m.jobId) + "</td>" +
+        "<td class='mono'>" + escapeHtml(m.senderId) + "</td>" +
+        "<td class='muted'>" + escapeHtml(m.hiddenAt ? new Date(m.hiddenAt).toLocaleString() : "") + "</td>" +
+        "<td class='muted'>" + escapeHtml(String(m.text || "").slice(0, 120)) + "</td>" +
+        "<td><div class='actions'><button class='small' data-act='unhide-message' data-msg='" + m.id + "'>Unhide</button></div></td>" +
+      "</tr>";
+    }).join("");
+    safetyHiddenMessagesEl.innerHTML = mRows || "<tr><td colspan='6' class='muted'>(none)</td></tr>";
+  }
+
+  async function refreshSafetyEvents() {
+    const sinceHours = Number(safetySinceHoursEl?.value || 72);
+    const q = (Number.isFinite(sinceHours) ? sinceHours : 72);
+    safetyEventsEl.innerHTML = "<tr><td colspan='6' class='muted'>Loading…</td></tr>";
+    const d = await api("GET", "/admin/ops/safety-events?take=200&sinceHours=" + encodeURIComponent(q), null);
+    safetyEventsById.clear();
+    for (const e of (d.items || [])) {
+      if (e && (typeof e.id === "number" || typeof e.id === "string")) safetyEventsById.set(String(e.id), e);
+    }
+    const rows = (d.items || []).map((e) => {
+      const reqId = e?.metadata?.requestId || e?.metadata?.reqId || "";
+      const actor = (e.actorRole ? (e.actorRole + ":") : "") + (e.actorUserId ?? "");
+      const target = (e.targetType ? (e.targetType + ":") : "") + (e.targetId ?? "");
+      const meta = e.metadata ? JSON.stringify(e.metadata) : "";
+      const id = String(e.id ?? "");
+      const copyReqBtn = reqId ? ("<button class='small' data-act='copy-safety-req' data-ev='" + escapeHtml(id) + "'>Copy</button>") : "";
+      const copyMetaBtn = meta ? ("<button class='small' data-act='copy-safety-meta' data-ev='" + escapeHtml(id) + "'>Copy</button>") : "";
+      return "<tr>" +
+        "<td class='muted'>" + escapeHtml(new Date(e.createdAt).toLocaleString()) + "</td>" +
+        "<td class='mono'>" + escapeHtml(e.actionType) + "</td>" +
+        "<td class='mono'>" + escapeHtml(actor) + "</td>" +
+        "<td class='mono'>" + escapeHtml(target) + "</td>" +
+        "<td class='mono'>" + escapeHtml(reqId) + (copyReqBtn ? (" <span class='actions'>" + copyReqBtn + "</span>") : "") + "</td>" +
+        "<td class='muted'>" + escapeHtml(meta.slice(0, 220)) + (copyMetaBtn ? (" <span class='actions'>" + copyMetaBtn + "</span>") : "") + "</td>" +
+      "</tr>";
+    }).join("");
+    safetyEventsEl.innerHTML = rows || "<tr><td colspan='6' class='muted'>(none)</td></tr>";
+  }
+
   document.getElementById("saveToken").addEventListener("click", () => {
     const t = (tokenEl.value || "").trim();
     if (!t) { alert("Paste a token first."); return; }
@@ -11187,15 +11502,27 @@ app.get(
 
   document.getElementById("refreshAll").addEventListener("click", async () => {
     try {
-      await Promise.all([refreshKpis(), refreshWebhookFailures(), refreshFlagged(), refreshDisputes()]);
+      await Promise.all([
+        refreshKpis(),
+        refreshWebhookFailures(),
+        refreshWebhookDeadletters(),
+        refreshMatchDeadletters(),
+        refreshFlagged(),
+        refreshDisputes(),
+        refreshSafety(),
+        refreshSafetyEvents(),
+      ]);
     } catch (e) {
       alert(String(e?.message || e));
-      console.error(e);
     }
   });
   document.getElementById("refreshWebhooks").addEventListener("click", () => refreshWebhookFailures().catch((e) => alert(String(e))));
+  document.getElementById("refreshWebhookDeadletters").addEventListener("click", () => refreshWebhookDeadletters().catch((e) => alert(String(e))));
+  document.getElementById("refreshMatchDeadletters").addEventListener("click", () => refreshMatchDeadletters().catch((e) => alert(String(e))));
   document.getElementById("refreshFlagged").addEventListener("click", () => refreshFlagged().catch((e) => alert(String(e))));
   document.getElementById("refreshDisputes").addEventListener("click", () => refreshDisputes().catch((e) => alert(String(e))));
+  document.getElementById("refreshSafety").addEventListener("click", () => refreshSafety().catch((e) => alert(String(e))));
+  document.getElementById("refreshSafetyEvents").addEventListener("click", () => refreshSafetyEvents().catch((e) => alert(String(e))));
 
   kpisEl.addEventListener("click", async (ev) => {
     const btn = ev.target.closest("button");
@@ -11251,7 +11578,6 @@ app.get(
       }
     } catch (e) {
       alert(String(e?.message || e));
-      console.error(e);
     }
   });
 
@@ -11271,7 +11597,46 @@ app.get(
       await refreshDisputes();
     } catch (e) {
       alert(String(e?.message || e));
-      console.error(e);
+    }
+  });
+
+  document.body.addEventListener("click", async (ev) => {
+    const btn = ev.target.closest("button");
+    if (!btn) return;
+    const act = btn.getAttribute("data-act");
+    try {
+      if (act === "restore-user") {
+        const userId = Number(btn.getAttribute("data-user"));
+        const note = prompt("Restore user restriction note (optional):", "");
+        await api("POST", "/admin/safety/users/" + userId + "/restore", { note: note || null });
+        await refreshSafety();
+      } else if (act === "unhide-job") {
+        const jobId = Number(btn.getAttribute("data-job"));
+        const note = prompt("Unhide job note (optional):", "");
+        await api("POST", "/admin/safety/jobs/" + jobId + "/unhide", { note: note || null });
+        await refreshSafety();
+      } else if (act === "unhide-message") {
+        const msgId = Number(btn.getAttribute("data-msg"));
+        const note = prompt("Unhide message note (optional):", "");
+        await api("POST", "/admin/safety/messages/" + msgId + "/unhide", { note: note || null });
+        await refreshSafety();
+      } else if (act === "copy-safety-req") {
+        const evId = String(btn.getAttribute("data-ev") || "");
+        const e = safetyEventsById.get(evId);
+        const reqId = e?.metadata?.requestId || e?.metadata?.reqId || "";
+        if (!reqId) { alert("No requestId on this event."); return; }
+        const ok = await copyTextToClipboard(String(reqId));
+        if (!ok) prompt("Copy requestId:", String(reqId));
+      } else if (act === "copy-safety-meta") {
+        const evId = String(btn.getAttribute("data-ev") || "");
+        const e = safetyEventsById.get(evId);
+        const meta = e?.metadata ? JSON.stringify(e.metadata, null, 2) : "";
+        if (!meta) { alert("No metadata on this event."); return; }
+        const ok = await copyTextToClipboard(String(meta));
+        if (!ok) prompt("Copy metadata:", String(meta));
+      }
+    } catch (e) {
+      alert(String(e?.message || e));
     }
   });
 </script>
@@ -11282,6 +11647,160 @@ app.get(
 
 // --- Admin Ops JSON endpoints (admin-only) ---
 app.get("/admin/ops/kpis", authMiddleware, createGetAdminOpsKpisHandler({ prisma }));
+app.get("/admin/ai/metrics", authMiddleware, createGetAdminAiMetricsHandler({ prisma }));
+app.get(
+  "/admin/ops/safety-events",
+  authMiddleware,
+  createGetAdminOpsSafetyEventsHandler({ prisma })
+);
+
+// GET /admin/ops/safety
+// Recent safety automation outputs: restricted users + shadow-hidden jobs/messages.
+app.get("/admin/ops/safety", authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    if (!requireAdmin(req, res)) return;
+
+    const takeRaw = Number(req.query.take ?? 50);
+    const take = Number.isFinite(takeRaw) ? Math.min(Math.max(takeRaw, 1), 100) : 50;
+
+    const now = new Date();
+
+    const [restrictedUsers, hiddenJobs, hiddenMessages] = await Promise.all([
+      prisma.user.findMany({
+        where: { restrictedUntil: { gt: now } },
+        orderBy: { restrictedUntil: "desc" },
+        take,
+        select: { id: true, email: true, role: true, restrictedUntil: true, riskScore: true, isSuspended: true },
+      }),
+      prisma.job.findMany({
+        where: { isHidden: true },
+        orderBy: [{ hiddenAt: "desc" }, { id: "desc" }],
+        take,
+        select: {
+          id: true,
+          title: true,
+          status: true,
+          consumerId: true,
+          hiddenAt: true,
+          hiddenById: true,
+          riskScore: true,
+          createdAt: true,
+        },
+      }),
+      prisma.message.findMany({
+        where: { isHidden: true },
+        orderBy: [{ hiddenAt: "desc" }, { id: "desc" }],
+        take,
+        select: {
+          id: true,
+          jobId: true,
+          senderId: true,
+          text: true,
+          hiddenAt: true,
+          hiddenById: true,
+          createdAt: true,
+        },
+      }),
+    ]);
+
+    return res.json({ restrictedUsers, hiddenJobs, hiddenMessages });
+  } catch (err) {
+    logServerError("GET /admin/ops/safety error", err);
+    return res.status(500).json({ error: "Internal server error while fetching safety queue." });
+  }
+});
+
+// POST /admin/safety/users/:userId/restore
+app.post("/admin/safety/users/:userId/restore", authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    if (!requireAdmin(req, res)) return;
+
+    const userId = Number(req.params.userId);
+    if (!Number.isFinite(userId)) return res.status(400).json({ error: "Invalid userId." });
+
+    const note = typeof (req.body as any)?.note === "string" ? String((req.body as any).note).trim() : "";
+
+    const updated = await prisma.user.update({
+      where: { id: userId },
+      data: { restrictedUntil: null },
+      select: { id: true, restrictedUntil: true },
+    });
+
+    await logSecurityEvent(req, "admin.user_restriction_cleared", {
+      targetType: "USER",
+      targetId: userId,
+      note: note || null,
+    });
+
+    return res.json({ ok: true, user: updated });
+  } catch (err) {
+    logServerError("POST /admin/safety/users/:userId/restore error", err);
+    return res.status(500).json({ error: "Internal server error while restoring user." });
+  }
+});
+
+// POST /admin/safety/jobs/:jobId/unhide
+app.post("/admin/safety/jobs/:jobId/unhide", authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    if (!requireAdmin(req, res)) return;
+
+    const jobId = Number(req.params.jobId);
+    if (!Number.isFinite(jobId)) return res.status(400).json({ error: "Invalid jobId." });
+
+    const note = typeof (req.body as any)?.note === "string" ? String((req.body as any).note).trim() : "";
+
+    const updated = await prisma.job.update({
+      where: { id: jobId },
+      data: { isHidden: false, hiddenAt: null, hiddenById: null },
+      select: { id: true, isHidden: true, hiddenAt: true },
+    });
+
+    await logSecurityEvent(req, "admin.job_unhidden", {
+      targetType: "JOB",
+      targetId: jobId,
+      note: note || null,
+    });
+
+    return res.json({ ok: true, job: updated });
+  } catch (err) {
+    logServerError("POST /admin/safety/jobs/:jobId/unhide error", err);
+    return res.status(500).json({ error: "Internal server error while unhiding job." });
+  }
+});
+
+// POST /admin/safety/messages/:messageId/unhide
+app.post(
+  "/admin/safety/messages/:messageId/unhide",
+  authMiddleware,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      if (!requireAdmin(req, res)) return;
+
+      const messageId = Number(req.params.messageId);
+      if (!Number.isFinite(messageId)) return res.status(400).json({ error: "Invalid messageId." });
+
+      const note = typeof (req.body as any)?.note === "string" ? String((req.body as any).note).trim() : "";
+
+      const updated = await prisma.message.update({
+        where: { id: messageId },
+        data: { isHidden: false, hiddenAt: null, hiddenById: null },
+        select: { id: true, isHidden: true, hiddenAt: true, jobId: true },
+      });
+
+      await logSecurityEvent(req, "admin.message_unhidden", {
+        targetType: "MESSAGE",
+        targetId: messageId,
+        jobId: updated.jobId,
+        note: note || null,
+      });
+
+      return res.json({ ok: true, message: updated });
+    } catch (err) {
+      logServerError("POST /admin/safety/messages/:messageId/unhide error", err);
+      return res.status(500).json({ error: "Internal server error while unhiding message." });
+    }
+  }
+);
 
 // GET /admin/ops/flagged
 // Query: status=OPEN|IN_REVIEW|RESOLVED|DISMISSED (default OPEN), type=USER|JOB|MESSAGE, take (default 50, max 100)
@@ -11327,7 +11846,7 @@ app.get("/admin/ops/flagged", authMiddleware, async (req: AuthRequest, res: Resp
       })),
     });
   } catch (err) {
-    console.error("GET /admin/ops/flagged error:", err);
+    logServerError("GET /admin/ops/flagged error", err);
     return res.status(500).json({ error: "Internal server error while fetching flagged queue." });
   }
 });
@@ -11374,7 +11893,7 @@ app.get("/admin/ops/disputes", authMiddleware, async (req: AuthRequest, res: Res
       })),
     });
   } catch (err) {
-    console.error("GET /admin/ops/disputes error:", err);
+    logServerError("GET /admin/ops/disputes error", err);
     return res.status(500).json({ error: "Internal server error while fetching disputes queue." });
   }
 });
@@ -11407,10 +11926,24 @@ app.get("/admin/ops/webhook-failures", authMiddleware, async (req: AuthRequest, 
 
     return res.json({ items: failures });
   } catch (err) {
-    console.error("GET /admin/ops/webhook-failures error:", err);
+    logServerError("GET /admin/ops/webhook-failures error", err);
     return res.status(500).json({ error: "Internal server error while fetching webhook failures." });
   }
 });
+
+// GET /admin/ops/webhook-deadletters
+app.get(
+  "/admin/ops/webhook-deadletters",
+  authMiddleware,
+  createGetAdminOpsWebhookDeadlettersHandler({ prisma })
+);
+
+// GET /admin/ops/match-deadletters
+app.get(
+  "/admin/ops/match-deadletters",
+  authMiddleware,
+  createGetAdminOpsMatchDeadlettersHandler({ prisma })
+);
 
 app.get(
   "/admin/webhooks/ui",
@@ -11478,6 +12011,7 @@ app.get(
           <option value="PROCESSING">PROCESSING</option>
           <option value="SUCCESS">SUCCESS</option>
           <option value="FAILED">FAILED</option>
+          <option value="DEAD">DEAD</option>
         </select>
       </label>
 
@@ -11597,7 +12131,6 @@ app.get(
 
   if (!r.ok) {
     const text = await r.text();
-    console.error("Delivery detail fetch failed:", r.status, text);
     detailEl.innerHTML =
       "<div class='muted'>Failed to load detail (" + r.status + ")</div>" +
       "<pre>" + escapeHtml(text) + "</pre>";
@@ -11724,7 +12257,6 @@ app.get(
 
     if (!r.ok) {
       const text = await r.text();
-      console.error("Deliveries fetch failed:", r.status, text);
       alert("Failed to load deliveries: " + r.status + "\\n" + text);
       return;
     }
@@ -11807,7 +12339,7 @@ async function startWorkersOnce() {
 
 // Worker moved to dedicated Railway worker service
 // startWorkersOnce().catch((e) => {
-//   console.error("[startup] failed to start workers:", e);
+//   logServerError("[startup] failed to start workers", e);
 // });
 
 const server = app.listen(PORT, () => {

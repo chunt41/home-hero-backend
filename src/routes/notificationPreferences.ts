@@ -3,7 +3,9 @@ import { z } from "zod";
 import {
   DEFAULT_NOTIFICATION_PREFERENCE,
   DEFAULT_TIMEZONE,
+  normalizePreference,
 } from "../services/notificationPreferences";
+import { logger } from "../services/logger";
 
 type AuthUser = {
   userId: number;
@@ -33,6 +35,11 @@ const hhmm = z
 const updateSchema = z
   .object({
     jobMatchEnabled: z.boolean().optional(),
+    // New API fields
+    matchDeliveryMode: z.enum(["INSTANT", "DIGEST"]).optional(),
+    digestIntervalMinutes: z.union([z.literal(15), z.literal(30), z.literal(60)]).optional(),
+
+    // Legacy fields (backward compat)
     jobMatchDigestEnabled: z.boolean().optional(),
     jobMatchDigestIntervalMinutes: z.number().int().min(5).max(1440).optional(),
     bidEnabled: z.boolean().optional(),
@@ -79,29 +86,32 @@ const updateSchema = z
       });
     }
 
-    if (
-      typeof val.jobMatchDigestEnabled === "boolean" &&
-      val.jobMatchDigestEnabled &&
-      Object.prototype.hasOwnProperty.call(val, "jobMatchDigestIntervalMinutes") &&
-      typeof val.jobMatchDigestIntervalMinutes !== "number"
-    ) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["jobMatchDigestIntervalMinutes"],
-        message: "jobMatchDigestIntervalMinutes must be a number",
-      });
+    // New contract: if the client explicitly sets matchDeliveryMode=DIGEST, require an interval.
+    if (val.matchDeliveryMode === "DIGEST") {
+      const hasNewInterval = Object.prototype.hasOwnProperty.call(val, "digestIntervalMinutes");
+      const hasLegacyInterval = Object.prototype.hasOwnProperty.call(val, "jobMatchDigestIntervalMinutes");
+      if (!hasNewInterval && !hasLegacyInterval) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["digestIntervalMinutes"],
+          message: "digestIntervalMinutes is required when matchDeliveryMode is DIGEST",
+        });
+      }
     }
   });
 
 function toApiRow(row: any) {
+  const normalized = normalizePreference(row as any);
   return {
     userId: row.userId,
     jobMatchEnabled: !!row.jobMatchEnabled,
-    jobMatchDigestEnabled: !!row.jobMatchDigestEnabled,
-    jobMatchDigestIntervalMinutes:
-      Number.isFinite(Number(row.jobMatchDigestIntervalMinutes))
-        ? Number(row.jobMatchDigestIntervalMinutes)
-        : DEFAULT_NOTIFICATION_PREFERENCE.jobMatchDigestIntervalMinutes,
+    // New fields
+    matchDeliveryMode: normalized.matchDeliveryMode,
+    digestIntervalMinutes: normalized.digestIntervalMinutes,
+
+    // Legacy fields (keep returning for older clients)
+    jobMatchDigestEnabled: normalized.matchDeliveryMode === "DIGEST",
+    jobMatchDigestIntervalMinutes: normalized.digestIntervalMinutes,
     bidEnabled: !!row.bidEnabled,
     messageEnabled: !!row.messageEnabled,
     quietHoursStart: row.quietHoursStart ?? null,
@@ -148,7 +158,9 @@ export function createGetMeNotificationPreferencesHandler(deps: {
         );
       }
 
-      console.error("GET /me/notification-preferences error:", err);
+      logger.error("me.notification_preferences_get_error", {
+        message: String((err as any)?.message ?? err),
+      });
       return res.status(500).json({ error: "Internal server error while fetching notification preferences." });
     }
   };
@@ -177,14 +189,27 @@ export function createPutMeNotificationPreferencesHandler(deps: {
 
       const body = parsed.data;
 
+      const normalizedIncoming = normalizePreference({
+        ...DEFAULT_NOTIFICATION_PREFERENCE,
+        ...body,
+        // Allow legacy toggle to drive new mode.
+        matchDeliveryMode:
+          body.matchDeliveryMode ?? (body.jobMatchDigestEnabled ? "DIGEST" : "INSTANT"),
+        // Prefer new interval, else legacy.
+        digestIntervalMinutes:
+          (body as any).digestIntervalMinutes ?? (body as any).jobMatchDigestIntervalMinutes,
+      } as any);
+
+      const jobMatchDigestEnabled = normalizedIncoming.matchDeliveryMode === "DIGEST";
+      const jobMatchDigestIntervalMinutes = normalizedIncoming.digestIntervalMinutes;
+
       const updated = await prisma.notificationPreference.upsert({
         where: { userId: req.user.userId },
         create: {
           userId: req.user.userId,
           jobMatchEnabled: body.jobMatchEnabled ?? DEFAULT_NOTIFICATION_PREFERENCE.jobMatchEnabled,
-          jobMatchDigestEnabled: body.jobMatchDigestEnabled ?? DEFAULT_NOTIFICATION_PREFERENCE.jobMatchDigestEnabled,
-          jobMatchDigestIntervalMinutes:
-            body.jobMatchDigestIntervalMinutes ?? DEFAULT_NOTIFICATION_PREFERENCE.jobMatchDigestIntervalMinutes,
+          jobMatchDigestEnabled,
+          jobMatchDigestIntervalMinutes,
           bidEnabled: body.bidEnabled ?? DEFAULT_NOTIFICATION_PREFERENCE.bidEnabled,
           messageEnabled: body.messageEnabled ?? DEFAULT_NOTIFICATION_PREFERENCE.messageEnabled,
           quietHoursStart:
@@ -195,8 +220,13 @@ export function createPutMeNotificationPreferencesHandler(deps: {
         },
         update: {
           jobMatchEnabled: body.jobMatchEnabled,
-          jobMatchDigestEnabled: body.jobMatchDigestEnabled,
-          jobMatchDigestIntervalMinutes: body.jobMatchDigestIntervalMinutes,
+          // Persist new settings via legacy columns (deploy-safe)
+          jobMatchDigestEnabled: Object.prototype.hasOwnProperty.call(body, "matchDeliveryMode") || Object.prototype.hasOwnProperty.call(body, "digestIntervalMinutes")
+            ? jobMatchDigestEnabled
+            : body.jobMatchDigestEnabled,
+          jobMatchDigestIntervalMinutes: Object.prototype.hasOwnProperty.call(body, "matchDeliveryMode") || Object.prototype.hasOwnProperty.call(body, "digestIntervalMinutes")
+            ? jobMatchDigestIntervalMinutes
+            : body.jobMatchDigestIntervalMinutes,
           bidEnabled: body.bidEnabled,
           messageEnabled: body.messageEnabled,
           quietHoursStart:
@@ -218,7 +248,9 @@ export function createPutMeNotificationPreferencesHandler(deps: {
         );
       }
 
-      console.error("PUT /me/notification-preferences error:", err);
+      logger.error("me.notification_preferences_put_error", {
+        message: String((err as any)?.message ?? err),
+      });
       return res.status(500).json({ error: "Internal server error while updating notification preferences." });
     }
   };

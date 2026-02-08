@@ -6,6 +6,7 @@ import zipcodes from "zipcodes";
 import { extractZip5, rankProvider, type ProviderRankingBreakdown } from "../matching/rankProviders";
 import { normalizeZipForBoost } from "../services/providerDiscoveryRanking";
 import { ensureSharedRedisConnected, getSharedRedisUrlOrNull } from "../services/sharedRedisClient";
+import { logger } from "../services/logger";
 
 type UserRole = "CONSUMER" | "PROVIDER" | "ADMIN";
 
@@ -72,10 +73,20 @@ type ProviderCard = {
   } | null;
 };
 
+type ProviderWhyShown = {
+  distanceMiles: number | null;
+  rating: number | null;
+  ratingCount: number;
+  responseTimeSeconds30d: number | null;
+  isVerified: boolean;
+  tierBoost: string | null;
+};
+
 type SearchItem = {
   provider: ProviderCard;
   distanceMiles: number | null;
   scoreBreakdown: ProviderRankingBreakdown;
+  whyShown: ProviderWhyShown;
   // Fields for cursoring
   _score: number;
   _avgRating: number;
@@ -83,6 +94,13 @@ type SearchItem = {
   _distance: number; // Infinity if unknown
   _response: number; // Infinity if unknown
 };
+
+function tierBoostLabelFromTier(tier: string | null | undefined): string | null {
+  const t = String(tier ?? "").toUpperCase();
+  if (t === "PRO") return "Pro provider";
+  if (t === "BASIC") return "Basic provider";
+  return null;
+}
 
 type CursorV1 =
   | {
@@ -439,6 +457,15 @@ export function createGetProvidersSearchHandler(deps: {
 
             const responseTimeSeconds = stats?.medianResponseTimeSeconds30d ?? null;
 
+            const whyShown: ProviderWhyShown = {
+              distanceMiles,
+              rating: avgRating,
+              ratingCount,
+              responseTimeSeconds30d: responseTimeSeconds,
+              isVerified: p.provider.providerVerification?.status === "VERIFIED",
+              tierBoost: tierBoostLabelFromTier(subscriptionTier),
+            };
+
             const item: SearchItem = {
               provider: {
                 id: p.provider.id,
@@ -463,6 +490,7 @@ export function createGetProvidersSearchHandler(deps: {
               },
               distanceMiles,
               scoreBreakdown: ranking,
+              whyShown,
               _score: ranking.finalScore,
               _avgRating: Number(avgRating ?? 0),
               _ratingCount: Number(ratingCount ?? 0),
@@ -545,16 +573,21 @@ export function createGetProvidersSearchHandler(deps: {
           ...it.provider,
           isFavorited: authed.user?.role === "CONSUMER" ? favoriteIds.has(it.provider.id) : false,
           distanceMiles: it.distanceMiles,
-          scoreBreakdown: {
-            baseScore: it.scoreBreakdown.baseScore,
-            distanceScore: it.scoreBreakdown.distanceScore,
-            ratingScore: it.scoreBreakdown.ratingScore,
-            responseScore: it.scoreBreakdown.responseScore,
-            tierBoost: it.scoreBreakdown.tierBoost,
-            featuredBoost: it.scoreBreakdown.featuredBoost,
-            verifiedBoost: it.scoreBreakdown.verifiedBoost,
-            finalScore: it.scoreBreakdown.finalScore,
-          },
+          whyShown: it.whyShown,
+          ...(isAdmin
+            ? {
+                scoreBreakdown: {
+                  baseScore: it.scoreBreakdown.baseScore,
+                  distanceScore: it.scoreBreakdown.distanceScore,
+                  ratingScore: it.scoreBreakdown.ratingScore,
+                  responseScore: it.scoreBreakdown.responseScore,
+                  tierBoost: it.scoreBreakdown.tierBoost,
+                  featuredBoost: it.scoreBreakdown.featuredBoost,
+                  verifiedBoost: it.scoreBreakdown.verifiedBoost,
+                  finalScore: it.scoreBreakdown.finalScore,
+                },
+              }
+            : null),
         })),
         pageInfo: {
           limit,
@@ -562,8 +595,7 @@ export function createGetProvidersSearchHandler(deps: {
         },
       });
     } catch (err) {
-      // eslint-disable-next-line no-console
-      console.error("GET /providers/search error:", err);
+      logger.error("providers.search_error", { message: String((err as any)?.message ?? err) });
       return res.status(500).json({ error: "Internal server error while searching providers." });
     }
   };

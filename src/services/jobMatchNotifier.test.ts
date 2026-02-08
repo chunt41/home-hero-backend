@@ -151,6 +151,138 @@ test("processJobMatchNotify schedules JOB_MATCH_DIGEST for digest-enabled provid
   );
 });
 
+test("processJobMatchNotify sends immediate notification for instant providers", async () => {
+  await withEnv(
+    {
+      MATCH_NOTIFY_PROVIDER_WINDOW_MINUTES: "60",
+      MATCH_NOTIFY_PROVIDER_WINDOW_MAX: "5",
+    },
+    async () => {
+      const now = new Date("2026-02-07T12:00:00.000Z");
+
+      const calls: any = {
+        push: [],
+        txJobMatchCreates: [],
+        txNotifCreates: [],
+        digestJobCreates: [],
+      };
+
+      const prisma: any = {
+        job: {
+          findUnique: async () => ({
+            id: 123,
+            title: "Fix sink",
+            location: "New York, NY",
+            category: null,
+            budgetMin: 100,
+            budgetMax: 200,
+            consumerId: 999,
+            isHidden: false,
+            createdAt: now,
+          }),
+        },
+        providerSavedSearch: {
+          findMany: async () => {
+            throw new Error("providerSavedSearch should not be called in legacy fallback test");
+          },
+        },
+        user: {
+          findMany: async () => [
+            {
+              id: 200,
+              location: "New York, NY",
+              providerProfile: { rating: 5, reviewCount: 10, featuredZipCodes: [], verificationBadge: false },
+              providerEntitlement: { verificationBadge: false },
+              providerStats: {
+                jobsCompleted30d: 10,
+                cancellationRate30d: 0,
+                disputeRate30d: 0,
+                reportRate30d: 0,
+                medianResponseTimeSeconds30d: 60,
+              },
+              subscription: { tier: "FREE" },
+              pushTokens: [{ token: "ExponentPushToken[ok]", platform: "ios" }],
+            },
+          ],
+        },
+        jobMatchNotification: {
+          findMany: async () => [],
+          groupBy: async () => [],
+        },
+        notificationPreference: {
+          findMany: async () => [
+            {
+              userId: 200,
+              jobMatchEnabled: true,
+              jobMatchDigestEnabled: false,
+              jobMatchDigestIntervalMinutes: 15,
+              jobMatchDigestLastSentAt: null,
+              bidEnabled: true,
+              messageEnabled: true,
+              quietHoursStart: null,
+              quietHoursEnd: null,
+              timezone: "UTC",
+            },
+          ],
+        },
+        notification: {
+          groupBy: async () => [],
+        },
+        backgroundJob: {
+          findFirst: async () => null,
+          create: async (args: any) => {
+            calls.digestJobCreates.push(args);
+            return { id: 1 };
+          },
+          update: async () => {
+            calls.digestJobCreates.push({ update: true });
+            return { id: 1 };
+          },
+        },
+        $transaction: async (fn: any) => {
+          const tx = {
+            notification: {
+              create: async (args: any) => {
+                calls.txNotifCreates.push(args);
+                return { id: 1 };
+              },
+            },
+            jobMatchNotification: {
+              create: async (args: any) => {
+                calls.txJobMatchCreates.push(args);
+                return { id: 1 };
+              },
+            },
+          };
+          return fn(tx);
+        },
+      };
+
+      const sendExpoPush = async (...args: any[]) => {
+        calls.push.push(args);
+      };
+
+      await processJobMatchNotifyWithDeps({
+        prisma: prisma as any,
+        sendExpoPush: sendExpoPush as any,
+        payload: { jobId: 123 },
+        now,
+      });
+
+      // Immediate providers should receive a DB notification and a push.
+      assert.equal(calls.txNotifCreates.length, 1);
+      assert.equal(calls.push.length, 1);
+      assert.ok(Array.isArray(calls.push[0][0]));
+      assert.equal(calls.push[0][0][0].data.type, "job.match");
+      assert.equal(calls.push[0][0][0].data.jobId, 123);
+
+      // Immediate providers still create a match-row, but should not schedule a digest job.
+      assert.equal(calls.txJobMatchCreates.length, 1);
+      assert.equal(calls.digestJobCreates.length, 0);
+    }
+  );
+});
+
 test("processJobMatchNotify rolling cap filters digest accumulation", async () => {
   await withEnv(
     {

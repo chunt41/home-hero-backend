@@ -1,4 +1,5 @@
 import type { Request, Response } from "express";
+import { logger } from "../services/logger";
 
 type UserRole = "CONSUMER" | "PROVIDER" | "ADMIN";
 
@@ -40,7 +41,7 @@ export function createGetProviderEntitlementsHandler(deps: {
         },
       });
     } catch (err) {
-      console.error("GET /provider/entitlements error:", err);
+      logger.error("provider.entitlements_error", { message: String((err as any)?.message ?? err) });
       return res.status(500).json({ error: "Internal server error while fetching entitlements." });
     }
   };

@@ -1,6 +1,8 @@
 import type { Request, Response } from "express";
 import { z } from "zod";
 
+import { logger } from "../services/logger";
+
 type UserRole = "CONSUMER" | "PROVIDER" | "ADMIN";
 
 type AuthUser = {
@@ -192,7 +194,7 @@ export function createPostJobAwardHandler(deps: {
         acceptedBid: result.accepted,
       });
     } catch (err) {
-      console.error("POST /jobs/:jobId/award error:", err);
+      logger.error("jobs.award_error", { message: String((err as any)?.message ?? err) });
       return res.status(500).json({ error: "Internal server error while awarding provider." });
     }
   };

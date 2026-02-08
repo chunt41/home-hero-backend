@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -11,9 +11,10 @@ import {
   View,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { useLocalSearchParams, router } from "expo-router";
+import { useFocusEffect, useLocalSearchParams, router } from "expo-router";
 import { api } from "../../../src/lib/apiClient";
 import { useAuth } from "../../../src/context/AuthContext";
+import { JobTimeline } from "../../../src/components/JobTimeline";
 
 type Attachment = {
   id: number;
@@ -57,6 +58,12 @@ type ConsumerJobDetail = {
   createdAt: string;
   bidCount: number;
   attachments: Attachment[];
+
+  awardedAt: string | null;
+  cancelledAt: string | null;
+  cancellationReasonCode: string | null;
+  cancellationReasonDetails: string | null;
+  cancellationReasonLabel?: string | null;
 
   completionPendingForUserId: number | null;
   completedAt: string | null;
@@ -108,7 +115,7 @@ export default function ConsumerJobDetailScreen() {
 
   const [job, setJob] = useState<ConsumerJobDetail | null>(null);
   const [loading, setLoading] = useState(true);
-  const [busyAction, setBusyAction] = useState<null | "cancel" | "markComplete" | "confirmComplete">(null);
+  const [busyAction, setBusyAction] = useState<null | "markComplete" | "confirmComplete">(null);
   const [error, setError] = useState<string | null>(null);
 
   const [appointments, setAppointments] = useState<Appointment[]>([]);
@@ -162,10 +169,12 @@ export default function ConsumerJobDetailScreen() {
     }
   }, [jobId]);
 
-  useEffect(() => {
-    fetchJob();
-    fetchAppointments();
-  }, [fetchJob, fetchAppointments]);
+  useFocusEffect(
+    useCallback(() => {
+      fetchJob();
+      fetchAppointments();
+    }, [fetchJob, fetchAppointments])
+  );
 
   const budgetText =
     job?.budgetMin != null || job?.budgetMax != null
@@ -179,37 +188,19 @@ export default function ConsumerJobDetailScreen() {
     !!user?.id &&
     job?.completionPendingForUserId === user.id;
 
-  const doCancel = useCallback(() => {
-    if (!job) return;
-
-    Alert.alert(
-      "Cancel this job?",
-      "This will set the job to CANCELLED and decline all bids.",
-      [
-        { text: "No", style: "cancel" },
-        {
-          text: "Yes, cancel",
-          style: "destructive",
-          onPress: async () => {
-            try {
-              setBusyAction("cancel");
-
-              // optimistic UI (safe; fetchJob will normalize)
-              setJob((prev) => (prev ? { ...prev, status: "CANCELLED" } : prev));
-
-              await api.post(`/jobs/${job.id}/cancel`, {});
-              await fetchJob();
-            } catch (e: any) {
-              await fetchJob();
-              Alert.alert("Cancel failed", e?.message ?? "Could not cancel job.");
-            } finally {
-              setBusyAction(null);
-            }
-          },
-        },
-      ]
+  const canOpenDispute = useMemo(() => {
+    if (!job?.awardedBid) return false;
+    return (
+      job.status === "IN_PROGRESS" ||
+      job.status === "COMPLETED_PENDING_CONFIRMATION" ||
+      job.status === "COMPLETED"
     );
-  }, [job, fetchJob]);
+  }, [job]);
+
+  const goToCancelJob = useCallback(() => {
+    if (!job) return;
+    router.push(`/job/${job.id}/cancel`);
+  }, [job]);
 
   const doMarkComplete = useCallback(() => {
     if (!job) return;
@@ -438,9 +429,27 @@ export default function ConsumerJobDetailScreen() {
         <ScrollView contentContainerStyle={styles.content}>
           <Text style={styles.title}>{job.title}</Text>
 
+          <JobTimeline
+            job={{
+              status: job.status,
+              createdAt: job.createdAt,
+              awardedAt: job.awardedAt ?? null,
+              completedAt: job.completedAt ?? null,
+              cancelledAt: job.cancelledAt ?? null,
+              cancellationReasonCode: job.cancellationReasonCode ?? null,
+              cancellationReasonDetails: job.cancellationReasonDetails ?? null,
+            }}
+          />
+
           <View style={styles.card}>
             <Text style={styles.sectionTitle}>Status</Text>
             <Text style={styles.body}>{job.status}</Text>
+            {job.status === "CANCELLED" && (job.cancellationReasonLabel || job.cancellationReasonCode) ? (
+              <Text style={styles.bodyMuted}>
+                Reason: {job.cancellationReasonLabel ?? job.cancellationReasonCode}
+                {job.cancellationReasonDetails?.trim() ? ` — ${job.cancellationReasonDetails.trim()}` : ""}
+              </Text>
+            ) : null}
             <Text style={styles.metaSmall}>Created: {formatDate(job.createdAt)}</Text>
           </View>
 
@@ -658,8 +667,9 @@ export default function ConsumerJobDetailScreen() {
           <View style={styles.card}>
             <Text style={styles.sectionTitle}>Safety</Text>
 
-            {job.awardedBid &&
-            (job.status === "COMPLETED" || job.status === "COMPLETED_PENDING_CONFIRMATION") ? (
+            {job.status === "DISPUTED" ? (
+              <Text style={styles.bodyMuted}>A dispute has been opened for this job.</Text>
+            ) : canOpenDispute ? (
               <Pressable style={styles.dangerBtn} onPress={goToOpenDispute}>
                 <Text style={styles.dangerText}>Open Dispute</Text>
               </Pressable>
@@ -723,10 +733,10 @@ export default function ConsumerJobDetailScreen() {
                   canComplete || canConfirmComplete ? { marginTop: 10 } : { marginTop: 0 },
                 ]}
                 disabled={!!busyAction}
-                onPress={doCancel}
+                onPress={goToCancelJob}
               >
                 <Text style={styles.dangerText}>
-                  {busyAction === "cancel" ? "Cancelling…" : "Cancel Job"}
+                  Cancel Job
                 </Text>
               </Pressable>
             ) : null}

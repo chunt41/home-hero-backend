@@ -31,6 +31,14 @@ type ProviderItem = {
   verificationStatus?: "NONE" | "PENDING" | "VERIFIED" | "REJECTED";
   isVerified?: boolean;
   distanceMiles?: number | null;
+  whyShown?: {
+    distanceMiles: number | null;
+    rating: number | null;
+    ratingCount: number;
+    responseTimeSeconds30d: number | null;
+    isVerified: boolean;
+    tierBoost: string | null;
+  };
   scoreBreakdown?: {
     baseScore: number;
     distanceScore: number;
@@ -53,6 +61,42 @@ function formatMedianResponseTime(seconds: number): string {
   if (seconds < 60 * 60) return `${Math.round(seconds / 60)} min`;
   if (seconds < 24 * 60 * 60) return `${Math.round(seconds / 3600)} hr`;
   return `${Math.round(seconds / 86400)} day`;
+}
+
+function formatDistanceMiles(distanceMiles: number): string {
+  if (!Number.isFinite(distanceMiles) || distanceMiles < 0) return "";
+  if (distanceMiles < 0.1) return "<0.1 mi";
+  if (distanceMiles < 10) return `${distanceMiles.toFixed(1)} mi`;
+  return `${Math.round(distanceMiles)} mi`;
+}
+
+function whyMatchText(item: ProviderItem): string | null {
+  const w = item.whyShown;
+
+  const distanceMiles = w?.distanceMiles ?? item.distanceMiles ?? null;
+  const rating = w?.rating ?? item.rating ?? null;
+  const ratingCount = w?.ratingCount ?? item.reviewCount ?? 0;
+  const responseSeconds =
+    w?.responseTimeSeconds30d ?? item.stats?.medianResponseTimeSeconds30d ?? null;
+  const isVerified = w?.isVerified ?? Boolean(item.isVerified);
+  const tierBoost = w?.tierBoost ?? null;
+
+  const parts: string[] = [];
+  if (typeof distanceMiles === "number") {
+    const formatted = formatDistanceMiles(distanceMiles);
+    if (formatted) parts.push(formatted);
+  }
+  if (typeof rating === "number") {
+    parts.push(`${rating.toFixed(1)}★ (${ratingCount})`);
+  }
+  if (typeof responseSeconds === "number") {
+    const formatted = formatMedianResponseTime(responseSeconds);
+    if (formatted) parts.push(`Responds ~${formatted}`);
+  }
+  if (isVerified) parts.push("Verified");
+  if (tierBoost) parts.push(tierBoost);
+
+  return parts.length ? parts.join(" • ") : null;
 }
 
 type ProvidersResponse = {
@@ -454,6 +498,27 @@ export default function ProviderDiscoveryScreen() {
     setShowFiltersModal(true);
   }, [radiusMiles, verifiedOnly, selectedCategorySlugs, minRating, sort]);
 
+  const resetAppliedFilters = useCallback((opts?: { keepZip?: boolean }) => {
+    setShowFiltersModal(false);
+
+    if (!opts?.keepZip) setZip(DEFAULT_FILTERS.zip);
+    setRadiusMiles(DEFAULT_FILTERS.radiusMiles);
+    setVerifiedOnly(DEFAULT_FILTERS.verifiedOnly);
+    setSelectedCategorySlugs(DEFAULT_FILTERS.selectedCategorySlugs);
+    setMinRating(DEFAULT_FILTERS.minRating);
+    setSort(DEFAULT_FILTERS.sort);
+
+    // Keep drafts in sync.
+    setDraftRadiusMiles(DEFAULT_FILTERS.radiusMiles);
+    setDraftVerifiedOnly(DEFAULT_FILTERS.verifiedOnly);
+    setDraftSelectedCategorySlugs(DEFAULT_FILTERS.selectedCategorySlugs);
+    setDraftMinRating(DEFAULT_FILTERS.minRating);
+    setDraftSort(DEFAULT_FILTERS.sort);
+
+    setNextCursor(null);
+    // Fetch is triggered by the debounced useEffect.
+  }, []);
+
   const renderProviderCard = ({ item }: { item: ProviderItem }) => (
     <Pressable
       style={styles.card}
@@ -518,6 +583,15 @@ export default function ProviderDiscoveryScreen() {
           />
         </Pressable>
       </View>
+
+      {whyMatchText(item) ? (
+        <View style={styles.whyRow}>
+          <Text style={styles.whyLabel}>Why this match?</Text>
+          <Text style={styles.whyText} numberOfLines={2}>
+            {whyMatchText(item)}
+          </Text>
+        </View>
+      ) : null}
 
       {item.specialties && (
         <Text style={styles.specialties} numberOfLines={2}>
@@ -760,14 +834,10 @@ export default function ProviderDiscoveryScreen() {
               <Pressable
                 style={styles.clearBtn}
                 onPress={() => {
-                  setDraftRadiusMiles(DEFAULT_FILTERS.radiusMiles);
-                  setDraftVerifiedOnly(DEFAULT_FILTERS.verifiedOnly);
-                  setDraftSelectedCategorySlugs(DEFAULT_FILTERS.selectedCategorySlugs);
-                  setDraftMinRating(DEFAULT_FILTERS.minRating);
-                  setDraftSort(DEFAULT_FILTERS.sort);
+                  resetAppliedFilters({ keepZip: true });
                 }}
               >
-                <Text style={styles.clearBtnText}>Clear All Filters</Text>
+                <Text style={styles.clearBtnText}>Reset filters</Text>
               </Pressable>
             )}
           </ScrollView>
@@ -784,7 +854,7 @@ export default function ProviderDiscoveryScreen() {
               setSort(draftSort);
 
               setNextCursor(null);
-              fetchProviders("initial");
+              // Fetch is triggered by the debounced useEffect.
             }}
           >
             <Text style={styles.applyBtnText}>Apply Filters</Text>
@@ -954,11 +1024,27 @@ const styles = StyleSheet.create({
     color: "#cbd5e1",
     fontSize: 12,
     marginBottom: 10,
+  },
+
   responseTime: {
     color: "#94a3b8",
     fontSize: 12,
     marginTop: 2,
   },
+
+  whyRow: {
+    marginTop: 6,
+    marginBottom: 10,
+  },
+  whyLabel: {
+    color: "#94a3b8",
+    fontSize: 11,
+    fontWeight: "700",
+    marginBottom: 2,
+  },
+  whyText: {
+    color: "#cbd5e1",
+    fontSize: 12,
   },
 
   categoriesRow: {

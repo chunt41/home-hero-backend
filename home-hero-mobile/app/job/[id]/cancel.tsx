@@ -1,6 +1,7 @@
 import React, { useCallback, useMemo, useState } from "react";
 import {
   Alert,
+  Modal,
   Pressable,
   SafeAreaView,
   ScrollView,
@@ -33,50 +34,61 @@ export default function CancelJobScreen() {
   const [reasonCode, setReasonCode] = useState<ReasonCode | null>(null);
   const [details, setDetails] = useState("");
   const [acting, setActing] = useState(false);
+  const [confirmVisible, setConfirmVisible] = useState(false);
+
+  const selectedReasonLabel = useMemo(() => {
+    if (!reasonCode) return null;
+    const r = REASONS.find((x) => x.code === reasonCode);
+    return r?.label ?? reasonCode;
+  }, [reasonCode]);
+
+  const validate = useCallback((): { ok: true } | { ok: false; title: string; message: string } => {
+    if (!Number.isFinite(jobId)) {
+      return { ok: false, title: "Error", message: "Invalid job id." };
+    }
+    if (!reasonCode) {
+      return { ok: false, title: "Reason required", message: "Please select a reason." };
+    }
+    if (reasonCode === "OTHER" && details.trim().length < 3) {
+      return { ok: false, title: "Details required", message: "Please add a short explanation." };
+    }
+    return { ok: true };
+  }, [details, jobId, reasonCode]);
+
+  const confirmCancel = useCallback(async () => {
+    const v = validate();
+    if (!v.ok) {
+      Alert.alert(v.title, v.message);
+      return;
+    }
+
+    if (!reasonCode) return;
+
+    try {
+      setActing(true);
+      await api.post(`/jobs/${jobId}/cancel`, {
+        reasonCode,
+        reasonDetails: details.trim() ? details.trim() : undefined,
+      });
+      setConfirmVisible(false);
+      Alert.alert("Cancelled", "Job cancelled.");
+      router.back();
+    } catch (e: any) {
+      Alert.alert("Cancel failed", e?.message ?? "Could not cancel job.");
+    } finally {
+      setActing(false);
+    }
+  }, [details, jobId, reasonCode, validate]);
 
   const onSubmit = useCallback(async () => {
-    if (!Number.isFinite(jobId)) {
-      Alert.alert("Error", "Invalid job id.");
+    const v = validate();
+    if (!v.ok) {
+      Alert.alert(v.title, v.message);
       return;
     }
 
-    if (!reasonCode) {
-      Alert.alert("Reason required", "Please select a reason.");
-      return;
-    }
-
-    if (reasonCode === "OTHER" && details.trim().length < 3) {
-      Alert.alert("Details required", "Please add a short explanation.");
-      return;
-    }
-
-    Alert.alert(
-      "Cancel job?",
-      "This can’t be undone.",
-      [
-        { text: "Keep job", style: "cancel" },
-        {
-          text: "Cancel job",
-          style: "destructive",
-          onPress: async () => {
-            try {
-              setActing(true);
-              await api.post(`/jobs/${jobId}/cancel`, {
-                reasonCode,
-                reasonDetails: details.trim() ? details.trim() : undefined,
-              });
-              Alert.alert("Cancelled", "Job cancelled.");
-              router.back();
-            } catch (e: any) {
-              Alert.alert("Cancel failed", e?.message ?? "Could not cancel job.");
-            } finally {
-              setActing(false);
-            }
-          },
-        },
-      ]
-    );
-  }, [details, jobId, reasonCode]);
+    setConfirmVisible(true);
+  }, [validate]);
 
   return (
     <SafeAreaView style={styles.container}>
@@ -127,6 +139,45 @@ export default function CancelJobScreen() {
           </Pressable>
         </View>
       </ScrollView>
+
+      <Modal
+        visible={confirmVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => (acting ? null : setConfirmVisible(false))}
+      >
+        <View style={styles.modalBackdrop}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>Cancel job?</Text>
+            <Text style={styles.modalBody}>This can’t be undone.</Text>
+
+            {selectedReasonLabel ? (
+              <Text style={styles.modalBodyMuted}>
+                Reason: {selectedReasonLabel}
+                {details.trim() ? ` — ${details.trim()}` : ""}
+              </Text>
+            ) : null}
+
+            <View style={styles.modalActions}>
+              <Pressable
+                style={[styles.modalBtn, styles.modalBtnSecondary, acting && styles.btnDisabled]}
+                onPress={() => setConfirmVisible(false)}
+                disabled={acting}
+              >
+                <Text style={styles.modalBtnSecondaryText}>Keep job</Text>
+              </Pressable>
+
+              <Pressable
+                style={[styles.modalBtn, styles.modalBtnDanger, acting && styles.btnDisabled]}
+                onPress={confirmCancel}
+                disabled={acting}
+              >
+                <Text style={styles.modalBtnDangerText}>{acting ? "Cancelling…" : "Cancel job"}</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -192,4 +243,27 @@ const styles = StyleSheet.create({
   },
   dangerText: { color: "#0b1220", fontWeight: "900" },
   btnDisabled: { opacity: 0.6 },
+
+  modalBackdrop: {
+    flex: 1,
+    backgroundColor: "rgba(0,0,0,0.65)",
+    justifyContent: "center",
+    padding: 18,
+  },
+  modalCard: {
+    backgroundColor: "#0f172a",
+    borderRadius: 14,
+    padding: 14,
+    borderWidth: 1,
+    borderColor: "#1e293b",
+  },
+  modalTitle: { color: "#fff", fontWeight: "900", fontSize: 16 },
+  modalBody: { color: "#e2e8f0", marginTop: 8, lineHeight: 20 },
+  modalBodyMuted: { color: "#cbd5e1", marginTop: 10, lineHeight: 20 },
+  modalActions: { flexDirection: "row", gap: 10, marginTop: 14 },
+  modalBtn: { flex: 1, padding: 12, borderRadius: 12, alignItems: "center" },
+  modalBtnSecondary: { backgroundColor: "#1e293b" },
+  modalBtnSecondaryText: { color: "#e2e8f0", fontWeight: "900" },
+  modalBtnDanger: { backgroundColor: "#ef4444" },
+  modalBtnDangerText: { color: "#0b1220", fontWeight: "900" },
 });

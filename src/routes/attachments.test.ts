@@ -173,6 +173,47 @@ test("GET /attachments/:id does not sign URL when unauthorized (object storage)"
   assert.equal(signedCalls, 0);
 });
 
+test("GET /attachments/:id returns 500 when storageKey exists but storage is not configured", async (t) => {
+  const tmpUploads = await fs.promises.mkdtemp(path.join(os.tmpdir(), "hh-uploads-"));
+
+  const prisma = makePrismaStub({
+    jobAttachment: {
+      id: 12,
+      jobId: 100,
+      mimeType: "image/jpeg",
+      filename: "img.jpg",
+      sizeBytes: 5,
+      diskPath: null,
+      storageKey: "attachments/job/abc.jpg",
+    },
+    job: { id: 100, consumerId: 100 },
+    bid: null,
+  });
+
+  const app = express();
+  app.use((req, _res, next) => {
+    (req as any).user = { userId: 100, role: "CONSUMER" };
+    next();
+  });
+  app.get(
+    "/attachments/:id",
+    createGetAttachmentHandler({
+      prisma: prisma as any,
+      uploadsDir: tmpUploads,
+      // storageProvider intentionally omitted
+      signedUrlTtlSeconds: 60,
+    })
+  );
+
+  const { server, baseUrl } = await listen(app);
+  t.after(() => server.close());
+
+  const res = await fetch(`${baseUrl}/attachments/12`, { redirect: "manual" as any });
+  assert.equal(res.status, 500);
+  const body = await res.json();
+  assert.equal(body.error, "Attachment storage is not configured.");
+});
+
 test("GET /attachments/:id streams for job consumer", async (t) => {
   const tmpUploads = await fs.promises.mkdtemp(path.join(os.tmpdir(), "hh-uploads-"));
   const filePath = path.join(tmpUploads, "attachments", "doc.pdf");

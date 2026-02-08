@@ -40,12 +40,12 @@ async function main() {
   await runNpm(["test"]);
   await runNpm(["run", "verify:gate"]);
 
-  const smokeEnabled = String(process.env.RC_SMOKE || "").trim() === "1" || !!process.env.RC_SMOKE_URL;
-  if (smokeEnabled) {
-    console.log("[rc:verify] running smoke checks (RC_SMOKE enabled)");
-    await run("node", ["scripts/rcSmoke.mjs"], { env: process.env });
+  const smokeSkipped = String(process.env.RC_SMOKE_SKIP || "").trim() === "1";
+  if (smokeSkipped) {
+    console.log("[rc:verify] smoke checks skipped (RC_SMOKE_SKIP=1)");
   } else {
-    console.log("[rc:verify] smoke checks skipped (set RC_SMOKE=1 or RC_SMOKE_URL)");
+    console.log("[rc:verify] running smoke checks");
+    await run("node", ["scripts/rcSmoke.mjs"], { env: process.env });
   }
 
   console.log("[rc:verify] OK");

@@ -9,6 +9,7 @@ import { z } from "zod";
 import { validate, type ValidatedRequest } from "../middleware/validate";
 import { logSecurityEvent } from "../services/securityEventLogger";
 import { createAsyncRouter } from "../middleware/asyncWrap";
+import { logger } from "../services/logger";
 
 const router = createAsyncRouter(express);
 
@@ -25,7 +26,9 @@ router.get("/notifications", authMiddleware, requireAdmin, async (_req, res) => 
     });
     res.json(notifications);
   } catch (err) {
-    console.error("Failed to fetch notifications", err);
+    logger.error("admin.webhooks.notifications_fetch_failed", {
+      message: String((err as any)?.message ?? err),
+    });
     res.status(500).json({ error: "Failed to fetch notifications" });
   }
 });
@@ -43,7 +46,9 @@ router.get("/logs", authMiddleware, requireAdmin, async (_req, res) => {
     });
     res.json(logs);
   } catch (err) {
-    console.error("Failed to fetch logs", err);
+    logger.error("admin.webhooks.logs_fetch_failed", {
+      message: String((err as any)?.message ?? err),
+    });
     res.status(500).json({ error: "Failed to fetch logs" });
   }
 });
@@ -128,7 +133,9 @@ router.get("/users", authMiddleware, requireAdmin, async (req, res) => {
     });
     res.json(users);
   } catch (err) {
-    console.error("Failed to fetch users", err);
+    logger.error("admin.webhooks.users_fetch_failed", {
+      message: String((err as any)?.message ?? err),
+    });
     res.status(500).json({ error: "Failed to fetch users" });
   }
 });
@@ -152,7 +159,9 @@ router.get("/flagged-jobs", authMiddleware, requireAdmin, async (_req, res) => {
     });
     res.json(jobs);
   } catch (err) {
-    console.error("Failed to fetch flagged jobs", err);
+    logger.error("admin.webhooks.flagged_jobs_fetch_failed", {
+      message: String((err as any)?.message ?? err),
+    });
     res.status(500).json({ error: "Failed to fetch flagged jobs" });
   }
 });
@@ -255,7 +264,9 @@ router.get("/analytics", authMiddleware, requireAdmin, async (req, res) => {
       revenue: revenueByDay,
     });
   } catch (err) {
-    console.error("Failed to fetch analytics", err);
+    logger.error("admin.webhooks.analytics_fetch_failed", {
+      message: String((err as any)?.message ?? err),
+    });
     res.status(500).json({ error: "Failed to fetch analytics" });
   }
 });
@@ -292,7 +303,9 @@ router.get("/stats", authMiddleware, requireAdmin, async (req, res) => {
       pendingVerifications,
     });
   } catch (err) {
-    console.error("Failed to fetch admin stats", err);
+    logger.error("admin.webhooks.stats_fetch_failed", {
+      message: String((err as any)?.message ?? err),
+    });
     res.status(500).json({ error: "Failed to fetch admin stats" });
   }
 });

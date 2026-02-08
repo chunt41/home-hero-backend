@@ -32,6 +32,28 @@ async function ensureRedis(): Promise<RedisKV> {
   return client as unknown as RedisKV;
 }
 
+let _warnedNoRedis = false;
+const NOOP_REDIS: RedisKV = {
+  async get() {
+    return null;
+  },
+  async set() {
+    return undefined;
+  },
+  async del() {
+    return 0;
+  },
+  async incr() {
+    return 0;
+  },
+  async pExpire() {
+    return 0;
+  },
+  async pTTL() {
+    return 0;
+  },
+};
+
 function defaultPolicy(): LoginBruteForcePolicy {
   const windowMs = Number(process.env.LOGIN_BRUTE_FORCE_WINDOW_MS ?? 15 * 60_000);
   const cooldownMs = Number(process.env.LOGIN_BRUTE_FORCE_COOLDOWN_MS ?? 10 * 60_000);
@@ -75,7 +97,22 @@ export function createLoginBruteForceProtector(opts?: {
 
   async function getRedis(): Promise<RedisKV> {
     if (opts?.redis) return opts.redis;
-    return ensureRedis();
+
+    try {
+      return await ensureRedis();
+    } catch (err) {
+      // Fail-open in non-production when Redis isn't configured.
+      // Production startup guards should enforce Redis config when needed.
+      if (process.env.NODE_ENV === "production") throw err;
+
+      if (!_warnedNoRedis) {
+        _warnedNoRedis = true;
+        // eslint-disable-next-line no-console
+        console.error("RATE_LIMIT_REDIS_URL is not configured");
+      }
+
+      return NOOP_REDIS;
+    }
   }
 
   function keys(params: { req: Request; email: string }) {

@@ -1,5 +1,7 @@
 import type { Response } from "express";
 
+import { logger } from "../services/logger";
+
 export type AuthLoginRequest = {
   validated: {
     body: {
@@ -150,7 +152,7 @@ export function createAuthLoginHandler(deps: {
         },
       });
     } catch (err) {
-      console.error("Login error:", err);
+      logger.error("auth.login_error", { message: String((err as any)?.message ?? err) });
       return res.status(500).json({ error: "Internal server error during login." });
     }
   };

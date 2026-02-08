@@ -2,6 +2,7 @@ import type { Request, Response } from "express";
 import { z } from "zod";
 
 import { canConfirmComplete, canMarkComplete } from "../services/jobFlowGuards";
+import { logger } from "../services/logger";
 
 type UserRole = "CONSUMER" | "PROVIDER" | "ADMIN";
 
@@ -156,7 +157,7 @@ export function createPostJobMarkCompleteHandler(deps: {
         job: updatedJob,
       });
     } catch (err) {
-      console.error("POST /jobs/:id/mark-complete error:", err);
+      logger.error("jobs.mark_complete_error", { message: String((err as any)?.message ?? err) });
       return res.status(500).json({ error: "Internal server error while marking complete." });
     }
   };
@@ -282,7 +283,7 @@ export function createPostJobConfirmCompleteHandler(deps: {
         job: updatedJob,
       });
     } catch (err) {
-      console.error("POST /jobs/:id/confirm-complete error:", err);
+      logger.error("jobs.confirm_complete_error", { message: String((err as any)?.message ?? err) });
       return res.status(500).json({ error: "Internal server error while confirming completion." });
     }
   };

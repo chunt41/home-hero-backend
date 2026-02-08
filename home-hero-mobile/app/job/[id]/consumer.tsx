@@ -136,7 +136,7 @@ export default function ConsumerJobDetailScreen() {
             </Pressable>
           ) : null}
 
-          {(job.status === "COMPLETED" || job.status === "COMPLETED_PENDING_CONFIRMATION") ? (
+          {(job.status === "IN_PROGRESS" || job.status === "COMPLETED" || job.status === "COMPLETED_PENDING_CONFIRMATION") ? (
             <Pressable
               style={styles.dangerBtn}
               onPress={() => router.push({ pathname: "/open-dispute", params: { jobId: String(job.id) } } as any)}

@@ -456,6 +456,7 @@ enum BackgroundJobStatus {
   PROCESSING
   SUCCESS
   FAILED
+  DEAD
 }
 
 model BackgroundJob {
@@ -469,6 +470,7 @@ model BackgroundJob {
   lockedAt    DateTime?
   lockedBy    String?
   lastError   String?
+  lastAttemptAt DateTime?
   createdAt   DateTime           @default(now())
   updatedAt   DateTime           @updatedAt
 
@@ -951,6 +953,7 @@ enum WebhookDeliveryStatus {
   SUCCESS
   FAILED
   PROCESSING
+  DEAD
 }
 
 enum CounterStatus {

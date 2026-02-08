@@ -2,6 +2,9 @@
 import * as crypto from "crypto";
 import { WebhookDeliveryStatus } from "@prisma/client";
 import { prisma } from "../prisma";
+import { withLogContext } from "../services/logContext";
+import { logger } from "../services/logger";
+import { captureException, captureMessage } from "../observability/sentry";
 
 const WORKER_POLL_MS = Number(process.env.WEBHOOK_WORKER_POLL_MS ?? 1000);
 const BATCH_SIZE = Number(process.env.WEBHOOK_WORKER_BATCH_SIZE ?? 25);
@@ -132,6 +135,7 @@ async function failPermanent(deliveryId: number, err: string) {
     data: {
       status: WebhookDeliveryStatus.FAILED,
       lastError: err.slice(0, 2000),
+      lastAttemptAt: new Date(),
       nextAttempt: null,
     },
   });
@@ -203,48 +207,57 @@ async function finishAttempt(
 
 
 async function handleOne(delivery: any) {
-  const { endpoint } = delivery;
-
-  if (!endpoint?.enabled) {
-    await prisma.webhookDelivery.update({
-      where: { id: delivery.id },
-      data: {
-        status: WebhookDeliveryStatus.FAILED,
-        lastError: "Endpoint disabled",
-        nextAttempt: null,
-      },
-    });
-
-    console.warn(
-      `[webhooks] SKIP delivery=${delivery.id} endpoint=${endpoint?.id ?? "none"} event=${delivery.event} reason=disabled`
-    );
-    return;
-  }
-
   const attemptNumber = delivery.attempts ?? 1;
-  const attempt = await startAttempt(delivery.id, attemptNumber, {
-    endpointId: endpoint?.id,
-    endpointUrl: endpoint?.url,
-    event: delivery.event,
-  });
+  const requestId = `wh-${delivery.id}-${attemptNumber}-${crypto.randomUUID()}`;
 
+  return withLogContext(
+    { requestId, webhookDeliveryId: delivery.id },
+    async () => {
+      const { endpoint } = delivery;
 
-  const payloadString = JSON.stringify(delivery.payload ?? {});
-  const timestamp = Date.now().toString();
+      if (!endpoint?.enabled) {
+        await prisma.webhookDelivery.update({
+          where: { id: delivery.id },
+          data: {
+            status: WebhookDeliveryStatus.FAILED,
+            lastError: "Endpoint disabled",
+            lastAttemptAt: new Date(),
+            nextAttempt: null,
+          },
+        });
 
-  const signature = sign(endpoint.secret, `${timestamp}.${payloadString}`);
+        logger.warn("webhooks.delivery_skipped", {
+          endpointId: endpoint?.id ?? null,
+          event: delivery.event,
+          reason: "disabled",
+        });
+        return;
+      }
 
-  const headers = {
-    "X-GoGetter-Event": delivery.event,
-    "X-GoGetter-Delivery-Id": String(delivery.id),
-    "X-GoGetter-Timestamp": timestamp,
-    "X-GoGetter-Signature": `sha256=${signature}`,
-  };
+      const attempt = await startAttempt(delivery.id, attemptNumber, {
+        endpointId: endpoint?.id,
+        endpointUrl: endpoint?.url,
+        event: delivery.event,
+      });
 
-  try {
-    const result = await postWithTimeout(endpoint.url, payloadString, headers);
+      return withLogContext({ webhookAttemptId: attempt.id }, async () => {
+        const payloadString = JSON.stringify(delivery.payload ?? {});
+        const timestamp = Date.now().toString();
 
-    if (result.ok) {
+        const signature = sign(endpoint.secret, `${timestamp}.${payloadString}`);
+
+        const headers = {
+          "X-Request-Id": requestId,
+          "X-GoGetter-Event": delivery.event,
+          "X-GoGetter-Delivery-Id": String(delivery.id),
+          "X-GoGetter-Timestamp": timestamp,
+          "X-GoGetter-Signature": `sha256=${signature}`,
+        };
+
+        try {
+          const result = await postWithTimeout(endpoint.url, payloadString, headers);
+
+          if (result.ok) {
       await prisma.webhookDelivery.update({
         where: { id: delivery.id },
         data: {
@@ -264,21 +277,26 @@ async function handleOne(delivery: any) {
         retryAfter: result.retryAfter ?? null,
       });
 
-
-      console.log(
-        `[webhooks] SUCCESS delivery=${delivery.id} endpoint=${endpoint.id} event=${delivery.event} status=${result.status}`
-      );
-      return;
-    }
+            logger.info("webhooks.delivery_success", {
+              endpointId: endpoint.id,
+              event: delivery.event,
+              status: result.status,
+            });
+            return;
+          }
 
     const bodySnippet = result.responseText?.slice(0, 500) ?? "";
     const err = `HTTP ${result.status}: ${bodySnippet}`;
 
     const permanent = isPermanentHttp(result.status);
 
-    console.warn(
-      `[webhooks] FAIL delivery=${delivery.id} endpoint=${endpoint.id} event=${delivery.event} status=${result.status} permanent=${permanent} err=${err}`
-    );
+          logger.warn("webhooks.delivery_http_error", {
+            endpointId: endpoint.id,
+            event: delivery.event,
+            status: result.status,
+            permanent,
+            error: err,
+          });
 
     await prisma.webhookDelivery.update({
       where: { id: delivery.id },
@@ -297,10 +315,10 @@ async function handleOne(delivery: any) {
     });
 
 
-    if (permanent) {
-      await failPermanent(delivery.id, err);
-      return;
-    }
+          if (permanent) {
+            await failPermanent(delivery.id, err);
+            return;
+          }
 
     let overrideDelayMs: number | undefined;
 
@@ -309,15 +327,16 @@ async function handleOne(delivery: any) {
       if (ra !== null) overrideDelayMs = ra;
     }
 
-    await failAndReschedule(delivery.id, delivery.attempts, err, overrideDelayMs);
-    return;
+          await failAndReschedule(delivery.id, delivery.attempts, err, overrideDelayMs);
+          return;
+        } catch (e: any) {
+          const err = e?.name === "AbortError" ? "Request timeout" : (e?.message ?? "Unknown error");
 
-  } catch (e: any) {
-    const err = e?.name === "AbortError" ? "Request timeout" : (e?.message ?? "Unknown error");
-
-    console.warn(
-      `[webhooks] FAIL delivery=${delivery.id} endpoint=${endpoint.id} event=${delivery.event} err=${err}`
-    );
+          logger.warn("webhooks.delivery_exception", {
+            endpointId: endpoint.id,
+            event: delivery.event,
+            error: String(err),
+          });
 
     const permanent =
       /Failed to parse URL/i.test(err) ||
@@ -341,33 +360,72 @@ async function handleOne(delivery: any) {
     });
 
 
-    if (permanent) {
-      await failPermanent(delivery.id, err);
-      return;
-    }
+          if (permanent) {
+            await failPermanent(delivery.id, err);
+            return;
+          }
 
-    await failAndReschedule(delivery.id, delivery.attempts, err);
-    return;
-  }
+          await failAndReschedule(delivery.id, delivery.attempts, err);
+          return;
+        }
+      });
+    }
+  );
 }
 
 async function failAndReschedule(
   deliveryId: number,
   currentAttempts: number,
   err: string,
-  overrideDelayMs?: number
+  overrideDelayMs?: number,
+  deps?: {
+    prisma?: any;
+    maxAttempts?: number;
+    now?: () => Date;
+    captureMessage?: typeof captureMessage;
+    logger?: typeof logger;
+  }
 ) {
-  const attemptsUsed = currentAttempts ?? 1;
+  const prismaClient = deps?.prisma ?? prisma;
+  const maxAttempts = deps?.maxAttempts ?? MAX_ATTEMPTS;
+  const nowFn = deps?.now ?? (() => new Date());
+  const captureMessageFn = deps?.captureMessage ?? captureMessage;
+  const log = deps?.logger ?? logger;
 
-  if (attemptsUsed >= MAX_ATTEMPTS) {
-    await prisma.webhookDelivery.update({
-      where: { id: deliveryId },
+  const attemptsUsed = currentAttempts ?? 1;
+  const now = nowFn();
+
+  if (attemptsUsed >= maxAttempts) {
+    const result = await prismaClient.webhookDelivery.updateMany({
+      where: {
+        id: deliveryId,
+        status: WebhookDeliveryStatus.PROCESSING,
+      },
       data: {
-        status: WebhookDeliveryStatus.FAILED,
+        status: "DEAD",
         lastError: err.slice(0, 2000),
+        lastAttemptAt: now,
         nextAttempt: null,
       },
     });
+
+    if (result.count > 0) {
+      const sent = captureMessageFn("Webhook delivery dead-lettered", {
+        level: "error",
+        webhookDeliveryId: deliveryId,
+        attempts: attemptsUsed,
+        maxAttempts,
+        lastError: err.slice(0, 500),
+      });
+      if (!sent) {
+        log.error("webhooks.delivery_dead_lettered", {
+          webhookDeliveryId: deliveryId,
+          attempts: attemptsUsed,
+          maxAttempts,
+          lastError: err.slice(0, 500),
+        });
+      }
+    }
     return;
   }
 
@@ -378,15 +436,20 @@ async function failAndReschedule(
 
   const nextAttemptAt = new Date(Date.now() + Math.max(0, delayMs));
 
-  await prisma.webhookDelivery.update({
+  await prismaClient.webhookDelivery.update({
     where: { id: deliveryId },
     data: {
       status: WebhookDeliveryStatus.PENDING,
       lastError: err.slice(0, 2000),
+      lastAttemptAt: now,
       nextAttempt: nextAttemptAt,
     },
   });
 }
+
+export const __testOnly = {
+  failAndReschedule,
+};
 
 export function startWebhookWorker() {
   let stopped = false;
@@ -416,7 +479,11 @@ export function startWebhookWorker() {
           e?.code === "P1001" ||
           String(e?.message ?? "").includes("Can't reach database server");
 
-        console.error("[webhooks] worker loop error:", e?.code ?? "", e?.message ?? e);
+        logger.error("webhooks.worker_loop_error", {
+          code: String(e?.code ?? ""),
+          message: String(e?.message ?? e),
+        });
+        captureException(e, { kind: "webhooks.worker_loop_error", code: String(e?.code ?? "") });
 
         if (isDbDown) {
           // exponential-ish backoff up to 30s
